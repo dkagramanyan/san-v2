@@ -24,10 +24,10 @@ python train.py --outdir=./training-runs/wc-cv \
         --data=./datasets/imagenet_9to4_1024x1024_16x16.zip \
         --gpus=4 \
         --batch=384 \
-        --mirror=1 \
-        --snap 100 \
+        --mirror=0 \
+        --snap 500 \
         --batch-gpu 96 \
-        --kimg 10000 \
+        --kimg 20000 \
         --cond True \
         --syn_layers 6
 
