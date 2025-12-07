@@ -14,6 +14,30 @@ pip install -r requirements.txt
 ```
 
 
+Uninstall old anaconda and cuda
+
+```
+pip uninstall torch torchvision -y
+pip uninstall nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 -y
+```
+
+Install new versions
+
+```
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+```
+
+You should install only 1 version of ninja, using anaconda. Without it you will get errors
+```
+conda install anaconda::ninja -y
+```
+
+Check 
+```
+conda list | grep -E "torch|cuda"
+```
+
+
 ## FFHQ
 
 ### Data preparation  
