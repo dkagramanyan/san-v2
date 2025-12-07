@@ -14,6 +14,65 @@ pip install -r requirements.txt
 ```
 
 
+Uninstall old anaconda and cuda
+
+```
+pip uninstall torch torchvision -y
+pip uninstall nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 -y
+```
+
+Install new versions
+
+```
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+```
+
+You should install only 1 version of ninja, using anaconda. Without it you will get errors
+```
+conda install anaconda::ninja -y
+```
+
+Check 
+```
+conda list | grep -E "torch|cuda"
+```
+
+After it is neccesary to check the plugins
+
+```python
+
+# Pre-compile CUDA extensions (run this once before multi-GPU training)
+import os
+os.chdir('/home/dgkagramanyan/san-v2')
+print(f"Working directory: {os.getcwd()}")
+
+import torch
+from torch_utils import custom_ops
+
+# Set verbosity to see compilation progress
+custom_ops.verbosity = 'full'
+
+# Force compilation by importing the ops
+from torch_utils.ops import upfirdn2d
+from torch_utils.ops import bias_act
+from torch_utils.ops import filtered_lrelu
+
+# Trigger compilation
+print("Compiling upfirdn2d...")
+upfirdn2d._init()
+
+print("Compiling bias_act...")
+bias_act._init()
+
+print("Compiling filtered_lrelu...")
+filtered_lrelu._init()
+
+print("Pre-compilation complete!")
+```
+
+If there are no error, the training will be successful 
+
+
 ## FFHQ
 
 ### Data preparation  
