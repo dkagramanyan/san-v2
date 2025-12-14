@@ -107,3 +107,4 @@ distributed mode the workload is evenly partitioned and every GPU remains busy.
 During training the metric evaluators also inherit a dynamic per-GPU batch size
 from the current run (capped between 32 and 512), which keeps the detector
 queues full and cuts evaluation latency substantially.
+
