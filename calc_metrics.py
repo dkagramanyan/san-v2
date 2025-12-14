@@ -47,8 +47,10 @@ def subprocess_fn(rank, args, temp_dir):
 
     # Configure torch.
     device = torch.device('cuda', rank)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = bool(args.allow_tf32)
+    torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision('high' if args.allow_tf32 else 'highest')
     conv2d_gradfix.enabled = True
 
     # Print network summary.
@@ -64,7 +66,8 @@ def subprocess_fn(rank, args, temp_dir):
             print(f'Calculating {metric}...')
         progress = metric_utils.ProgressMonitor(verbose=args.verbose)
         result_dict = metric_main.calc_metric(metric=metric, G=G, G_kwargs=args.G_kwargs, dataset_kwargs=args.dataset_kwargs,
-            num_gpus=args.num_gpus, rank=rank, device=device, progress=progress)
+            num_gpus=args.num_gpus, rank=rank, device=device, progress=progress,
+            metric_batch_size=args.metric_batch_size, metric_batch_gen=args.metric_batch_gen)
         if rank == 0:
             metric_main.report_metric(result_dict, run_dir=args.run_dir, snapshot_pkl=args.network_pkl)
         if rank == 0 and args.verbose:
@@ -93,9 +96,12 @@ def parse_comma_separated_list(s):
 @click.option('--mirror', help='Enable dataset x-flips  [default: look up]', type=bool, metavar='BOOL')
 @click.option('--gpus', help='Number of GPUs to use', type=int, default=1, metavar='INT', show_default=True)
 @click.option('--verbose', help='Print optional information', type=bool, default=True, metavar='BOOL', show_default=True)
+@click.option('--tf32', help='Enable TF32 for matmul/conv (Ampere+). Faster, slightly different numerics.', type=bool, default=True, metavar='BOOL', show_default=True)
+@click.option('--batch', 'metric_batch_size', help='Per-GPU batch size used by metrics (0=auto from training run, else explicit)', type=int, default=0, metavar='INT', show_default=True)
+@click.option('--batch-gen', 'metric_batch_gen', help='Per-GPU generator microbatch for metrics (0=auto)', type=int, default=0, metavar='INT', show_default=True)
 @click.option('--truncation', help='Truncation', type=float, default=1.0, show_default=True)
 @click.option('--centroids-path', type=str, help='Pass path to precomputed centroids to enable multimodal truncation')
-def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose, truncation, centroids_path):
+def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose, tf32, metric_batch_size, metric_batch_gen, truncation, centroids_path):
     """Calculate quality metrics for previous training run or pretrained network pickle.
 
     Examples:
@@ -131,6 +137,7 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose, truncat
 
     # Validate arguments.
     args = dnnlib.EasyDict(metrics=metrics, num_gpus=gpus, network_pkl=network_pkl, verbose=verbose, G_kwargs=dnnlib.EasyDict())
+    args.allow_tf32 = tf32
     if not all(metric_main.is_valid_metric(metric) for metric in args.metrics):
         ctx.fail('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))
     if not args.num_gpus >= 1:
@@ -175,10 +182,41 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose, truncat
         if os.path.isfile(os.path.join(pkl_dir, 'training_options.json')):
             args.run_dir = pkl_dir
 
+    # Adaptive metric batch sizing.
+    def _auto_metric_batch_from_run_dir(run_dir):
+        try:
+            with open(os.path.join(run_dir, 'training_options.json'), 'rt') as f:
+                train_opts = json.load(f)
+            batch_gpu = train_opts.get('batch_gpu', None)
+            if batch_gpu is None:
+                bs = train_opts.get('batch_size', None)
+                ng = train_opts.get('num_gpus', None)
+                if bs is not None and ng:
+                    batch_gpu = int(bs) // int(ng)
+            if batch_gpu is None:
+                return None
+            return int(max(8, min(64, int(batch_gpu))))
+        except Exception:
+            return None
+
+    if int(metric_batch_size) > 0:
+        args.metric_batch_size = int(metric_batch_size)
+    else:
+        auto_bs = _auto_metric_batch_from_run_dir(args.run_dir) if args.run_dir is not None else None
+        args.metric_batch_size = int(auto_bs) if auto_bs is not None else 64
+
+    if int(metric_batch_gen) > 0:
+        args.metric_batch_gen = int(metric_batch_gen)
+    else:
+        args.metric_batch_gen = int(min(args.metric_batch_size, 16))
+
     # Launch processes.
     if args.verbose:
         print('Launching processes...')
-    torch.multiprocessing.set_start_method('spawn')
+    try:
+        torch.multiprocessing.set_start_method('spawn', force=True)
+    except TypeError:
+        torch.multiprocessing.set_start_method('spawn')
     with tempfile.TemporaryDirectory() as temp_dir:
         if args.num_gpus == 1:
             subprocess_fn(rank=0, args=args, temp_dir=temp_dir)
