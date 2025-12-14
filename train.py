@@ -47,7 +47,15 @@ def subprocess_fn(rank, c, temp_dir):
         custom_ops.verbosity = 'none'
 
     # Execute training loop.
-    training_loop.training_loop(rank=rank, **c)
+    try:
+        training_loop.training_loop(rank=rank, **c)
+    finally:
+        # Avoid NCCL resource leak warnings on exit (PyTorch 2.4+ prints a warning).
+        if c.num_gpus > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception:
+                pass
 
 #----------------------------------------------------------------------------
 
@@ -192,12 +200,20 @@ def main(**kwargs):
     # Prefer faster optimizer implementations when available (PyTorch 2.x).
     try:
         adam_sig = inspect.signature(torch.optim.Adam)
-        if 'foreach' in adam_sig.parameters:
-            c.G_opt_kwargs.foreach = True
-            c.D_opt_kwargs.foreach = True
-        if 'fused' in adam_sig.parameters:
+        has_foreach = 'foreach' in adam_sig.parameters
+        has_fused = 'fused' in adam_sig.parameters
+
+        # In PyTorch, `fused=True` and `foreach=True` cannot both be set.
+        # Prefer fused when available (fastest on CUDA), otherwise foreach.
+        if has_fused and torch.cuda.is_available():
             c.G_opt_kwargs.fused = True
             c.D_opt_kwargs.fused = True
+            if has_foreach:
+                c.G_opt_kwargs.foreach = False
+                c.D_opt_kwargs.foreach = False
+        elif has_foreach:
+            c.G_opt_kwargs.foreach = True
+            c.D_opt_kwargs.foreach = True
     except Exception:
         pass
 

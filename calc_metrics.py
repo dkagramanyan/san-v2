@@ -60,18 +60,26 @@ def subprocess_fn(rank, args, temp_dir):
         c = torch.empty([1, G.c_dim], device=device)
         misc.print_module_summary(G, [z, c])
 
-    # Calculate each metric.
-    for metric in args.metrics:
-        if rank == 0 and args.verbose:
-            print(f'Calculating {metric}...')
-        progress = metric_utils.ProgressMonitor(verbose=args.verbose)
-        result_dict = metric_main.calc_metric(metric=metric, G=G, G_kwargs=args.G_kwargs, dataset_kwargs=args.dataset_kwargs,
-            num_gpus=args.num_gpus, rank=rank, device=device, progress=progress,
-            metric_batch_size=args.metric_batch_size, metric_batch_gen=args.metric_batch_gen)
-        if rank == 0:
-            metric_main.report_metric(result_dict, run_dir=args.run_dir, snapshot_pkl=args.network_pkl)
-        if rank == 0 and args.verbose:
-            print()
+    try:
+        # Calculate each metric.
+        for metric in args.metrics:
+            if rank == 0 and args.verbose:
+                print(f'Calculating {metric}...')
+            progress = metric_utils.ProgressMonitor(verbose=args.verbose)
+            result_dict = metric_main.calc_metric(metric=metric, G=G, G_kwargs=args.G_kwargs, dataset_kwargs=args.dataset_kwargs,
+                num_gpus=args.num_gpus, rank=rank, device=device, progress=progress,
+                metric_batch_size=args.metric_batch_size, metric_batch_gen=args.metric_batch_gen)
+            if rank == 0:
+                metric_main.report_metric(result_dict, run_dir=args.run_dir, snapshot_pkl=args.network_pkl)
+            if rank == 0 and args.verbose:
+                print()
+    finally:
+        # Avoid NCCL resource leak warnings on exit.
+        if args.num_gpus > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception:
+                pass
 
     # Done.
     if rank == 0 and args.verbose:
