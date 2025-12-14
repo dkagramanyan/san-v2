@@ -34,7 +34,7 @@ conda install anaconda::ninja -y
 
 Check 
 ```
-conda list | grep -E "torch|cuda"
+conda list | grep -E "torch|cuda|cudnn"
 ```
 
 After it is neccesary to check the plugins
