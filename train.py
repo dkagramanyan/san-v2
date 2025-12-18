@@ -15,6 +15,7 @@ import re
 import json
 import tempfile
 import torch
+import inspect
 import legacy
 
 import dnnlib
@@ -46,7 +47,15 @@ def subprocess_fn(rank, c, temp_dir):
         custom_ops.verbosity = 'none'
 
     # Execute training loop.
-    training_loop.training_loop(rank=rank, **c)
+    try:
+        training_loop.training_loop(rank=rank, **c)
+    finally:
+        # Avoid NCCL resource leak warnings on exit (PyTorch 2.4+ prints a warning).
+        if c.num_gpus > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception:
+                pass
 
 #----------------------------------------------------------------------------
 
@@ -98,7 +107,10 @@ def launch_training(c, desc, outdir, dry_run):
 
     # Launch processes.
     print('Launching processes...')
-    torch.multiprocessing.set_start_method('spawn')
+    try:
+        torch.multiprocessing.set_start_method('spawn', force=True)
+    except TypeError:
+        torch.multiprocessing.set_start_method('spawn')
     with tempfile.TemporaryDirectory() as temp_dir:
         if c.num_gpus == 1:
             subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
@@ -161,6 +173,7 @@ def parse_comma_separated_list(s):
 @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--fp32',         help='Disable mixed-precision', metavar='BOOL',                 type=bool, default=False, show_default=True)
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
+@click.option('--tf32',         help='Enable TF32 for matmul/conv (Ampere+). Faster, slightly different numerics.', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
 @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
 
@@ -182,6 +195,27 @@ def main(**kwargs):
     c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0, 0.99], eps=1e-8)
     c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0, 0.99], eps=1e-8)
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
+    c.data_loader_kwargs.persistent_workers = True
+
+    # Prefer faster optimizer implementations when available (PyTorch 2.x).
+    try:
+        adam_sig = inspect.signature(torch.optim.Adam)
+        has_foreach = 'foreach' in adam_sig.parameters
+        has_fused = 'fused' in adam_sig.parameters
+
+        # In PyTorch, `fused=True` and `foreach=True` cannot both be set.
+        # Prefer fused when available (fastest on CUDA), otherwise foreach.
+        if has_fused and torch.cuda.is_available():
+            c.G_opt_kwargs.fused = True
+            c.D_opt_kwargs.fused = True
+            if has_foreach:
+                c.G_opt_kwargs.foreach = False
+                c.D_opt_kwargs.foreach = False
+        elif has_foreach:
+            c.G_opt_kwargs.foreach = True
+            c.D_opt_kwargs.foreach = True
+    except Exception:
+        pass
 
     # Training set.
     c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
@@ -204,6 +238,7 @@ def main(**kwargs):
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
+    c.allow_tf32 = opts.tf32
 
     # Sanity checks.
     if c.batch_size % c.num_gpus != 0:

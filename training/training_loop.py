@@ -128,6 +128,7 @@ def training_loop(
     resume_pkl              = None,     # Network pickle to resume training from.
     resume_kimg             = 0,        # First kimg to report when resuming training.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
+    allow_tf32              = True,     # Enable TF32 (Ampere+): faster matmul/conv, slightly different numerics.
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
     restart_every           = -1,       # Time interval in seconds to exit code
@@ -138,8 +139,10 @@ def training_loop(
     np.random.seed(random_seed * num_gpus + rank)
     torch.manual_seed(random_seed * num_gpus + rank)
     torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed.
-    torch.backends.cuda.matmul.allow_tf32 = False       # Improves numerical accuracy.
-    torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32  # Improves training speed (Ampere+).
+    torch.backends.cudnn.allow_tf32 = allow_tf32        # Improves training speed (Ampere+).
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision('high' if allow_tf32 else 'highest')
     conv2d_gradfix.enabled = True                       # Improves training speed.
     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
     __RESTART__ = torch.tensor(0., device=device)       # will be broadcasted to exit loop
@@ -488,9 +491,13 @@ def training_loop(
         if cur_tick and (snapshot_data is not None) and (len(metrics) > 0):
             if rank == 0:
                 print('Evaluating metrics...')
+            # Adaptive per-GPU metric batch sizes (safe caps).
+            metric_batch_size = int(np.clip(batch_gpu, 8, 64))
+            metric_batch_gen  = int(min(metric_batch_size, 16))
             for metric in metrics:
                 result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
-                                                      dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
+                                                      dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device,
+                                                      metric_batch_size=metric_batch_size, metric_batch_gen=metric_batch_gen)
                 if rank == 0:
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
                 stats_metrics.update(result_dict.results)
@@ -513,10 +520,13 @@ def training_loop(
         # Collect statistics.
         for phase in phases:
             value = []
-            if (phase.start_event is not None) and (phase.end_event is not None) and \
-                    not (phase.start_event.cuda_event == 0 and phase.end_event.cuda_event == 0):            # Both events were not initialized yet, can happen with restart
-                phase.end_event.synchronize()
-                value = phase.start_event.elapsed_time(phase.end_event)
+            if (phase.start_event is not None) and (phase.end_event is not None):
+                # Be robust to internal API changes across PyTorch versions.
+                try:
+                    phase.end_event.synchronize()
+                    value = phase.start_event.elapsed_time(phase.end_event)
+                except Exception:
+                    value = []
             training_stats.report0('Timing/' + phase.name, value)
         stats_collector.update()
         stats_dict = stats_collector.as_dict()

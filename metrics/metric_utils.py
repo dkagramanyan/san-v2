@@ -33,7 +33,7 @@ from torch_utils import gen_utils
 #----------------------------------------------------------------------------
 
 class MetricOptions:
-    def __init__(self, G=None, G_kwargs={}, dataset_kwargs={}, num_gpus=1, rank=0, device=None, progress=None, cache=True, feature_network=None):
+    def __init__(self, G=None, G_kwargs={}, dataset_kwargs={}, num_gpus=1, rank=0, device=None, progress=None, cache=True, feature_network=None, metric_batch_size=None, metric_batch_gen=None):
         assert 0 <= rank < num_gpus
         self.G              = G
         self.G_kwargs       = dnnlib.EasyDict(G_kwargs)
@@ -44,6 +44,9 @@ class MetricOptions:
         self.progress       = progress.sub() if progress is not None and rank == 0 else ProgressMonitor()
         self.cache          = cache
         self.feature_network = feature_network
+        # Performance knobs (per-process / per-GPU).
+        self.metric_batch_size = metric_batch_size
+        self.metric_batch_gen  = metric_batch_gen
 
 #----------------------------------------------------------------------------
 
@@ -126,12 +129,10 @@ class FeatureStats:
         assert isinstance(x, torch.Tensor) and x.ndim == 2
         assert 0 <= rank < num_gpus
         if num_gpus > 1:
-            ys = []
-            for src in range(num_gpus):
-                y = x.clone()
-                torch.distributed.broadcast(y, src=src)
-                ys.append(y)
-            x = torch.stack(ys, dim=1).flatten(0, 1) # interleave samples
+            # Efficient feature exchange across ranks (replaces per-rank broadcast loop).
+            ys = [torch.empty_like(x) for _ in range(num_gpus)]
+            torch.distributed.all_gather(ys, x)
+            x = torch.cat(ys, dim=0)
         self.append(x.cpu().numpy())
 
     def get_all(self):
@@ -215,9 +216,11 @@ def getActivation(name):
 
 #----------------------------------------------------------------------------
 
-def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_lo=0, rel_hi=1, batch_size=64, data_loader_kwargs=None, max_items=None, sfid=False, shuffle_size=None, **stats_kwargs):
+def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_lo=0, rel_hi=1, batch_size=None, data_loader_kwargs=None, max_items=None, sfid=False, shuffle_size=None, **stats_kwargs):
     if data_loader_kwargs is None:
         data_loader_kwargs = dict(pin_memory=True, num_workers=3, prefetch_factor=2)
+    if batch_size is None:
+        batch_size = int(opts.metric_batch_size) if opts.metric_batch_size is not None else 64
 
     # Try to lookup from cache.
     cache_file = None
@@ -277,13 +280,13 @@ def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_l
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
 
-        with torch.no_grad():
+        with torch.inference_mode():
             if opts.feature_network is None:
-                features = detector(images.to(opts.device), **detector_kwargs)
+                features = detector(images.to(opts.device, non_blocking=True), **detector_kwargs)
                 if sfid:
                     features = activation['mixed6_conv'][:, :7].flatten(1)
             else:
-                images = images.to(opts.device).to(torch.float32) / 127.5 - 1
+                images = images.to(opts.device, non_blocking=True).to(torch.float32) / 127.5 - 1
                 features = detector(images)
                 features = torch.nn.AdaptiveAvgPool2d(1)(features['3']).squeeze()
 
@@ -300,13 +303,26 @@ def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_l
 
 #----------------------------------------------------------------------------
 
-def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel_lo=0, rel_hi=1, batch_size=64, batch_gen=None, sfid=False, **stats_kwargs):
+def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel_lo=0, rel_hi=1, batch_size=None, batch_gen=None, sfid=False, **stats_kwargs):
+    if batch_size is None:
+        batch_size = int(opts.metric_batch_size) if opts.metric_batch_size is not None else 64
     if batch_gen is None:
-        batch_gen = min(batch_size, 4)
+        if opts.metric_batch_gen is not None:
+            batch_gen = int(opts.metric_batch_gen)
+        else:
+            batch_gen = min(batch_size, 4)
     assert batch_size % batch_gen == 0
 
     # Setup generator and labels.
-    G = copy.deepcopy(opts.G).eval().requires_grad_(False).to(opts.device)
+    G = opts.G
+    if isinstance(G, torch.nn.Module):
+        G.eval().requires_grad_(False)
+        try:
+            # Ensure on correct device (no-op if already there).
+            G = G.to(opts.device)
+        except Exception:
+            # Fall back (e.g., some wrapped modules may not support .to() cleanly).
+            G = copy.deepcopy(G).eval().requires_grad_(False).to(opts.device)
 
     # Initialize.
     stats = FeatureStats(**stats_kwargs)
@@ -337,13 +353,13 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
 
-        with torch.no_grad():
+        with torch.inference_mode():
             if opts.feature_network is None:
-                features = detector(images.to(opts.device), **detector_kwargs)
+                features = detector(images.to(opts.device, non_blocking=True), **detector_kwargs)
                 if sfid:
                     features = activation['mixed6_conv'][:, :7].flatten(1)
             else:
-                images = images.to(opts.device).to(torch.float32) / 127.5 - 1
+                images = images.to(opts.device, non_blocking=True).to(torch.float32) / 127.5 - 1
                 features = detector(images)
                 features = torch.nn.AdaptiveAvgPool2d(1)(features['3']).squeeze()
 
