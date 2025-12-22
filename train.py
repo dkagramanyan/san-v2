@@ -186,6 +186,10 @@ def parse_comma_separated_list(s):
 @click.option('--head_layers',  help='Layers of added superresolution head.', type=click.IntRange(min=1), default=7, show_default=True)
 @click.option('--cls_weight',   help='class guidance weight', type=float, default=0.0, show_default=True)
 @click.option('--up_factor',    help='Up sampling factor of superres head', type=click.IntRange(min=2), default=2, show_default=True)
+@click.option('--pl-weight',    help='Path length regularization weight (0 disables)', type=float, default=2.0, show_default=True)
+@click.option('--pl-start-kimg',help='Start path length regularization at this kimg (default 1000; avoids early overhead)', type=float, default=1000.0, show_default=True)
+@click.option('--pl-ramp-kimg', help='Linearly ramp PL weight over this many kimg after start (0=step)', type=float, default=0.0, show_default=True)
+@click.option('--pl-batch-shrink', help='PL microbatch shrink factor (higher=faster, less accurate)', type=int, default=2, show_default=True)
 
 def main(**kwargs):
     # Initialize config.
@@ -325,7 +329,10 @@ def main(**kwargs):
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.ProjectedGANLoss')
     c.loss_kwargs.blur_init_sigma = 2  # Blur the images seen by the discriminator.
     c.loss_kwargs.blur_fade_kimg = 300
-    c.loss_kwargs.pl_weight = 2.0
+    c.loss_kwargs.pl_weight = opts.pl_weight
+    c.loss_kwargs.pl_start_kimg = opts.pl_start_kimg
+    c.loss_kwargs.pl_ramp_kimg = opts.pl_ramp_kimg
+    c.loss_kwargs.pl_batch_shrink = opts.pl_batch_shrink
     c.loss_kwargs.pl_no_weight_grad = True
     c.loss_kwargs.style_mixing_prob = 0.0
     c.loss_kwargs.cls_weight = 0.0  # use classifier guidance only for superresolution training (i.e., with pretrained stem)

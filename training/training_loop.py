@@ -152,6 +152,7 @@ def training_loop(
     __AUGMENT_P__ = torch.tensor(augment_p, dtype=torch.float, device=device)
     __PL_MEAN__ = torch.zeros([], device=device)
     best_fid = 9999
+    _printed_plreg_start = False
 
     # Load training set.
     if rank == 0:
@@ -202,6 +203,14 @@ def training_loop(
             __AUGMENT_P__ = resume_data['progress'].get('augment_p', torch.tensor(0.)).to(device)
             __PL_MEAN__ = resume_data['progress'].get('pl_mean', torch.zeros([])).to(device)
             best_fid = resume_data['progress']['best_fid']       # only needed for rank == 0
+
+        if num_gpus > 1:
+            torch.distributed.broadcast(__CUR_NIMG__, 0)
+            torch.distributed.broadcast(__CUR_TICK__, 0)
+            torch.distributed.broadcast(__BATCH_IDX__, 0)
+            torch.distributed.broadcast(__AUGMENT_P__, 0)
+            torch.distributed.broadcast(__PL_MEAN__, 0)
+            torch.distributed.barrier()
 
     # this is relevant when you continue training a lower-res model
     # ie. train 16 model, start training 32 model but continue training 16 model
@@ -278,6 +287,9 @@ def training_loop(
         images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
 
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
+
+    if num_gpus > 1:
+        torch.distributed.barrier()
 
     # Initialize logs.
     if rank == 0:
@@ -420,6 +432,17 @@ def training_loop(
         if rank == 0:
             print(' '.join(fields))
 
+        # One-time note for expected speed change when PL regularization becomes active.
+        if (not _printed_plreg_start) and rank == 0:
+            try:
+                pl_start_kimg = float(getattr(loss, 'pl_start_kimg', 1000))
+                pl_weight = float(getattr(loss, 'pl_weight', 0.0))
+                if pl_weight > 0 and (cur_nimg / 1e3) >= pl_start_kimg:
+                    _printed_plreg_start = True
+                    print(f'Note: path length regularization is now active (pl_start_kimg={pl_start_kimg}, pl_weight={pl_weight}). This typically slows training.')
+            except Exception:
+                _printed_plreg_start = True
+
         # Check for abort.
         if (not done) and (abort_fn is not None) and abort_fn():
             done = True
@@ -433,6 +456,8 @@ def training_loop(
             __RESTART__ = torch.tensor(1., device=device)
         if num_gpus > 1:
             torch.distributed.broadcast(__RESTART__, 0)
+            torch.distributed.barrier()
+            
         if __RESTART__:
             done = True
             print(f'Process {rank} leaving...')

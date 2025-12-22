@@ -37,6 +37,7 @@ class Loss:
 class ProjectedGANLoss(Loss):
     def __init__(self, device, G, D, G_ema, blur_init_sigma=0, blur_fade_kimg=0,
                  train_head_only=False, style_mixing_prob=0.0, pl_weight=0.0,
+                 pl_start_kimg=1000, pl_ramp_kimg=0, pl_batch_shrink=2,
                  cls_model='efficientnet_b1', cls_weight=0.0, **kwargs):
         super().__init__()
         self.device = device
@@ -50,7 +51,9 @@ class ProjectedGANLoss(Loss):
         # SG2 techniques
         self.style_mixing_prob = style_mixing_prob
         self.pl_weight = pl_weight
-        self.pl_batch_shrink = 2
+        self.pl_batch_shrink = pl_batch_shrink
+        self.pl_start_kimg = pl_start_kimg
+        self.pl_ramp_kimg = pl_ramp_kimg
         self.pl_decay = 0.01
         self.pl_no_weight_grad = True
         self.pl_mean = torch.zeros([], device=device)
@@ -121,8 +124,17 @@ class ProjectedGANLoss(Loss):
                 loss_Gmain.backward()
 
         # Gpl: Apply path length regularization.
-        start_plreg = (cur_nimg >= 1e6)
-        if start_plreg and self.pl_weight and phase in ['Greg', 'Gboth']:
+        pl_weight = float(self.pl_weight)
+        if pl_weight and phase in ['Greg', 'Gboth']:
+            pl_start_nimg = float(self.pl_start_kimg) * 1e3
+            if cur_nimg >= pl_start_nimg:
+                if float(self.pl_ramp_kimg) > 0:
+                    pl_ramp_nimg = float(self.pl_ramp_kimg) * 1e3
+                    pl_scale = np.clip((cur_nimg - pl_start_nimg) / max(pl_ramp_nimg, 1.0), 0.0, 1.0)
+                    pl_weight = pl_weight * float(pl_scale)
+                # else: hard step at pl_start_kimg
+
+        if pl_weight and phase in ['Greg', 'Gboth'] and cur_nimg >= float(self.pl_start_kimg) * 1e3:
             with torch.autograd.profiler.record_function('Gpl_forward'):
                 batch_size = gen_z.shape[0] // self.pl_batch_shrink
                 gen_img, gen_ws = self.run_G(gen_z[:batch_size], gen_c[:batch_size])
@@ -134,7 +146,7 @@ class ProjectedGANLoss(Loss):
                 self.pl_mean.copy_(pl_mean.detach())
                 pl_penalty = (pl_lengths - pl_mean).square()
                 training_stats.report('Loss/pl_penalty', pl_penalty)
-                loss_Gpl = pl_penalty * self.pl_weight
+                loss_Gpl = pl_penalty * pl_weight
                 training_stats.report('Loss/G/reg', loss_Gpl)
             with torch.autograd.profiler.record_function('Gpl_backward'):
                 loss_Gpl.mean().backward()
