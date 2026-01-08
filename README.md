@@ -74,6 +74,14 @@ print("Pre-compilation complete!")
 
 If there are no error, the training will be successful 
 
+if there are errors
+1) clearn torch_extentions cache
+2) install nvcc
+
+```
+conda install -c nvidia cuda-nvcc=13.0
+```
+
 
 ## FFHQ
 
