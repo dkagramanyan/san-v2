@@ -20,7 +20,7 @@ Uninstall old anaconda and cuda
 
 ```
 pip uninstall torch torchvision -y
-pip uninstall nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 -y
+pip uninstall nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12  -y
 ```
 
 Install new versions
