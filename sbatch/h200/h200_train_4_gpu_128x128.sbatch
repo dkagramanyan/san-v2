@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=SAN-GAN-64
+#SBATCH --job-name=SAN-128
 #SBATCH --gpus=4
 #SBATCH --cpus-per-task=8
 #SBATCH --time=3-0:0
