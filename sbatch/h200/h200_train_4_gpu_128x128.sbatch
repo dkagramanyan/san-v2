@@ -7,12 +7,13 @@
 #SBATCH --partition=normal
 #SBATCH --account=proj_1661
 #SBATCH --reservation=rocky
-#SBATCH --nodelist=cn-049
+#SBATCH --nodelist=cn-050
+#SBATCH --gres-flags=enforce-binding
 
 module purge
 module load Python
 
-conda activate san_rocky
+conda activate san_rocky_50
 
 nvidia-smi
 gcc --version
