@@ -6,19 +6,163 @@ Please cite [[1](#citation)] in your work when using this code in your experimen
 ### [[Project Page]](https://ytakida.github.io/san/)
 
 
-> **Abstract:** Generative adversarial networks (GANs) learn a target probability distribution by optimizing a generator and a discriminator with minimax objectives. This paper addresses the question of whether such optimization actually provides the generator with gradients that make its distribution close to the target distribution. We derive metrizable conditions, sufficient conditions for the discriminator to serve as the distance between the distributions, by connecting the GAN formulation with the concept of sliced optimal transport. Furthermore, by leveraging these theoretical results, we propose a novel GAN training scheme called the Slicing Adversarial Network (SAN). With only simple modifications, a broad class of existing GANs can be converted to SANs. Experiments on synthetic and image datasets support our theoretical results and the effectiveness of SAN as compared to the usual GANs. We also apply SAN to StyleGAN-XL, which leads to a state-of-the-art FID score amongst GANs for class conditional generation on CIFAR10 and ImageNet 256$times$256. 
+## Installation
+
+```
+cd san
+pip install -r requirements.txt
+```
 
 
-# Citation
-[1] Takida, Y., Imaizumi, M., Shibuya, T., Lai, C., Uesaka, T., Murata, N. and Mitsufuji, Y.,
-"SAN: Inducing Metrizability of GAN with Discriminative Normalized Linear Layer,"
-ICLR 2024.
+Uninstall old anaconda and cuda
+
 ```
-@inproceedings{takida2024san,
-    title={{SAN}: Inducing Metrizability of {GAN} with Discriminative Normalized Linear Layer},
-    author={Takida, Yuhta and Imaizumi, Masaaki and Shibuya, Takashi and Lai, Chieh-Hsin and Uesaka, Toshimitsu and Murata, Naoki and Mitsufuji, Yuki},
-    booktitle={The Twelfth International Conference on Learning Representations},
-    year={2024},
-    url={https://openreview.net/forum?id=eiF7TU1E8E}
-}
+pip uninstall torch torchvision -y
+pip uninstall nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 -y
 ```
+
+Install new versions
+
+```
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+```
+
+You should install only 1 version of ninja, using anaconda. Without it you will get errors
+```
+conda install anaconda::ninja -y
+```
+
+Check 
+```
+conda list | grep -E "torch|cuda|cudnn"
+```
+
+After it is neccesary to check the plugins
+
+```python
+
+# Pre-compile CUDA extensions (run this once before multi-GPU training)
+import os
+os.chdir('/home/dgkagramanyan/san-v2')
+print(f"Working directory: {os.getcwd()}")
+
+import torch
+from torch_utils import custom_ops
+
+# Set verbosity to see compilation progress
+custom_ops.verbosity = 'full'
+
+# Force compilation by importing the ops
+from torch_utils.ops import upfirdn2d
+from torch_utils.ops import bias_act
+from torch_utils.ops import filtered_lrelu
+
+# Trigger compilation
+print("Compiling upfirdn2d...")
+upfirdn2d._init()
+
+print("Compiling bias_act...")
+bias_act._init()
+
+print("Compiling filtered_lrelu...")
+filtered_lrelu._init()
+
+print("Pre-compilation complete!")
+```
+
+If there are no error, the training will be successful 
+
+
+## FFHQ
+
+### Data preparation  
+
+```
+python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
+                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_16x16.zip \
+                         --resolution=16x16
+
+python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
+                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_32x32.zip \
+                         --resolution=32x32
+
+python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
+                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_64x64.zip \
+                         --resolution=64x64                      
+
+python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
+                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_128x128.zip \
+                         --resolution=128x128
+
+python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
+                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_256x256.zip \
+                         --resolution=256x256
+
+python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
+                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_512x512.zip \
+                         --resolution=512x512
+
+python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
+                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_1024x1024.zip \
+                         --resolution=1024x1024
+
+```
+
+### Training
+```
+python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-r --data=./data/ffhq16.zip \
+        --gpus=8 --batch=2048 --mirror=1 --snap 10 --batch-gpu 8 squeue --syn_layers 6
+
+python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-r --data=./data/ffhq32.zip \
+        --gpus=8 --batch=2048 --mirror=1 --snap 10 --batch-gpu 8 --kimg 175000 --syn_layers 6 \
+        --superres --up_factor 2 --head_layers 7 \
+        --path_stem training-runs/ffhq/00000-stylegan3-r-ffhq16-gpus8-batch2048/best_model.pkl
+
+python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq64.zip \
+        --gpus=8 --batch=256 --mirror=1 --snap 10 --batch-gpu 8 --kimg 95000 --syn_layers 6 \
+        --superres --up_factor 2 --head_layers 4 \
+        --path_stem training-runs/ffhq/00001-stylegan3-r-ffhq32-gpus8-batch2048/best_model.pkl
+
+python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq128.zip \
+        --gpus=8 --batch=256 --mirror=1 --snap 10 --batch-gpu 8 --kimg 57000 --syn_layers 6 \
+        --superres --up_factor 2 --head_layers 4 \
+        --path_stem training-runs/ffhq/00002-stylegan3-t-ffhq64-gpus8-batch256/best_model.pkl
+
+python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq256.zip \
+        --gpus=8 --batch=256 --mirror=1 --snap 10 --batch-gpu 8 --kimg 11000 --syn_layers 6 \
+        --superres --up_factor 2 --head_layers 4 \
+        --path_stem training-runs/ffhq/00003-stylegan3-t-ffhq128-gpus8-batch256/best_model.pkl
+
+python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq512.zip \
+        --gpus=8 --batch=128 --mirror=1 --snap 10 --batch-gpu 8 --kimg 4000 --syn_layers 6 \
+        --superres --up_factor 2 --head_layers 4 \
+        --path_stem training-runs/ffhq/00004-stylegan3-t-ffhq256-gpus8-batch256/best_model.pkl
+
+python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq1024.zip \
+        --gpus=8 --batch=128 --mirror=1 --snap 10 --batch-gpu 8 --kimg 4000 --syn_layers 6 \
+        --superres --up_factor 2 --head_layers 4 \
+        --path_stem training-runs/ffhq/00005-stylegan3-t-ffhq512-gpus8-batch128/best_model.pkl
+```
+
+
+## Generating Samples
+```
+python gen_class_samplesheet.py --outdir=generated --trunc=0.7 \
+  --samples-per-class 100000 --classes 0,1,2 --grid-width 8 --batch-gpu=8 --batch-latent=4 \
+  --network=./runs/ffhq/00017-stylegan3-r-o_bc_left_4x_1536_1024x1024_rgb_512x512-gpus2-batch20/best_model.pkl
+```
+
+## Quality Metrics
+You need to preprocess a dataset in advance, following Data Preparation.
+To calculate metrics for a specific network snapshot, run
+```
+python calc_metrics.py --metrics=fid50k_full --network=<path_to_checkpoint>
+python calc_metrics.py --metrics=is50k --network=<path_to_checkpoint>
+```
+
+The metric runners now gather features across GPUs via NCCL all-gathers,
+eliminating the previous per-rank broadcast loop. When you launch metrics in
+distributed mode the workload is evenly partitioned and every GPU remains busy.
+During training the metric evaluators also inherit a dynamic per-GPU batch size
+from the current run (capped between 32 and 512), which keeps the detector
+queues full and cuts evaluation latency substantially.
