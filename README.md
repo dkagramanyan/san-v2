@@ -8,6 +8,8 @@ Please cite [[1](#citation)] in your work when using this code in your experimen
 
 ## Installation
 
+Create conda env with python=3.12
+
 ```
 cd san
 pip install -r requirements.txt
