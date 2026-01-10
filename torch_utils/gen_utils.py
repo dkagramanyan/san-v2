@@ -425,8 +425,13 @@ def w_to_img(G, dlatents: Union[List[torch.Tensor], torch.Tensor], noise_mode: s
     return synth_image
 
 
-def get_w_from_seed(G, batch_sz, device, truncation_psi=1.0, seed=None, centroids_path=None, class_idx=None):
+def get_w_from_seed(G, batch_sz, device, truncation_psi=1.0, seed=None, centroids_path=None, class_idx=None, seeds=None):
     """Get the dlatent from a list of random seeds, using the truncation trick (this could be optional)"""
+
+    if seeds is not None:
+        seeds = [int(s) for s in seeds]
+        if batch_sz != len(seeds):
+            batch_sz = len(seeds)
 
     if G.c_dim != 0:
         # sample random labels if no class idx is given
@@ -446,7 +451,10 @@ def get_w_from_seed(G, batch_sz, device, truncation_psi=1.0, seed=None, centroid
         if class_idx is not None:
             print('Warning: --class is ignored when running an unconditional network')
 
-    z = np.random.RandomState(seed).randn(batch_sz, G.z_dim)
+    if seeds is not None:
+        z = np.stack([np.random.RandomState(s).randn(G.z_dim) for s in seeds])
+    else:
+        z = np.random.RandomState(seed).randn(batch_sz, G.z_dim)
     z = torch.from_numpy(z).to(device)
     w = G.mapping(z, labels)
 

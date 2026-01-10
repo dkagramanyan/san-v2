@@ -1,126 +1,162 @@
-# Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
-#
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
-
-"""Generate images using pretrained network pickle."""
-
 import os
-import re
-from typing import List, Optional, Tuple, Union
+import tempfile
+from pathlib import Path
+from typing import List, Optional, Union
 
-import click
-import dnnlib
-import numpy as np
 import PIL.Image
+import click
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from tqdm import tqdm
 
 import legacy
+import dnnlib
 from torch_utils import gen_utils
 
-#----------------------------------------------------------------------------
 
 def parse_range(s: Union[str, List]) -> List[int]:
-    '''Parse a comma separated list of numbers or ranges and return a list of ints.
-
-    Example: '1,2,5-10' returns [1, 2, 5, 6, 7]
-    '''
-    if isinstance(s, list): return s
-    ranges = []
-    range_re = re.compile(r'^(\d+)-(\d+)$')
-    for p in s.split(','):
-        m = range_re.match(p)
-        if m:
-            ranges.extend(range(int(m.group(1)), int(m.group(2))+1))
+    if isinstance(s, list):
+        return s
+    out = []
+    for part in str(s).split(','):
+        if '-' in part:
+            lo, hi = part.split('-')
+            out.extend(range(int(lo), int(hi) + 1))
         else:
-            ranges.append(int(p))
-    return ranges
+            out.append(int(part))
+    return out
 
-#----------------------------------------------------------------------------
 
-def parse_vec2(s: Union[str, Tuple[float, float]]) -> Tuple[float, float]:
-    '''Parse a floating point 2-vector of syntax 'a,b'.
+def _generate_worker(rank: int, world_size: int, cfg: dict, init_method: Optional[str], run_dir: Optional[Path]) -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA device is required for image generation.')
 
-    Example:
-        '0,1' returns (0,1)
-    '''
-    if isinstance(s, tuple): return s
-    parts = s.split(',')
-    if len(parts) == 2:
-        return (float(parts[0]), float(parts[1]))
-    raise ValueError(f'cannot parse 2-vector {s}')
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group(
+            backend='nccl',
+            init_method=init_method or 'env://',
+            rank=rank,
+            world_size=world_size,
+        )
 
-#----------------------------------------------------------------------------
+    device_id = int(os.environ.get('LOCAL_RANK', rank % max(1, torch.cuda.device_count())))
+    torch.cuda.set_device(device_id)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    device = torch.device('cuda', device_id)
 
-def make_transform(translate: Tuple[float,float], angle: float):
-    m = np.eye(3)
-    s = np.sin(angle/360.0*np.pi*2)
-    c = np.cos(angle/360.0*np.pi*2)
-    m[0][0] = c
-    m[0][1] = s
-    m[0][2] = translate[0]
-    m[1][0] = -s
-    m[1][1] = c
-    m[1][2] = translate[1]
-    return m
+    if run_dir is None and rank == 0:
+        run_dir = Path(gen_utils.make_run_dir(cfg['outdir'], cfg['desc_full']))
+    if world_size > 1:
+        holder = [str(run_dir) if rank == 0 else '']
+        dist.broadcast_object_list(holder, src=0)
+        run_dir = Path(holder[0])
+        dist.barrier()
 
-#----------------------------------------------------------------------------
+    if rank == 0:
+        print(f'Loading network from "{cfg["network_pkl"]}"...')
+
+    with torch.inference_mode():
+        with dnnlib.util.open_url(cfg['network_pkl']) as f:
+            G = legacy.load_network_pkl(f)['G_ema'].eval().requires_grad_(False).to(device)
+
+        for class_idx in tqdm(cfg['classes'], disable=rank != 0):
+            class_dir = run_dir / f'class_{class_idx}'
+            if rank == 0:
+                class_dir.mkdir(parents=True, exist_ok=True)
+            if world_size > 1:
+                dist.barrier()
+
+            img_ids = list(range(rank, cfg['samples_per_class'], world_size))
+            for start in range(0, len(img_ids), cfg['batch_gpu']):
+                batch_ids = img_ids[start:start + cfg['batch_gpu']]
+                if not batch_ids:
+                    continue
+                seeds = [cfg['seed'] + class_idx * cfg['samples_per_class'] + idx for idx in batch_ids]
+                w = gen_utils.get_w_from_seed(
+                    G,
+                    batch_sz=len(batch_ids),
+                    device=device,
+                    truncation_psi=cfg['truncation_psi'],
+                    seed=None,
+                    centroids_path=cfg['centroids_path'],
+                    class_idx=class_idx,
+                    seeds=seeds,
+                )
+                images = gen_utils.w_to_img(G, w, to_np=True)
+                for img, img_idx in zip(images, batch_ids):
+                    PIL.Image.fromarray(img, 'RGB').save(class_dir / f"{class_idx}_{img_idx}.png")
+
+    if world_size > 1:
+        dist.barrier()
+        dist.destroy_process_group()
+    if rank == 0:
+        print(f'Finished writing samples to "{run_dir}".')
+
 
 @click.command()
-@click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
-@click.option('--seeds', type=parse_range, help='List of random seeds (e.g., \'0,1,4-6\')', required=True)
-@click.option('--batch-sz', type=int, help='Batch size per sample', default=1)
-@click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi', default=1, show_default=True)
-@click.option('--centroids-path', type=str, help='Pass path to precomputed centroids to enable multimodal truncation')
-@click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)')
-@click.option('--noise-mode', help='Noise mode', type=click.Choice(['const', 'random', 'none']), default='const', show_default=True)
-@click.option('--translate', help='Translate XY-coordinate (e.g. \'0.3,1\')', type=parse_vec2, default='0,0', show_default=True, metavar='VEC2')
-@click.option('--rotate', help='Rotation angle in degrees', type=float, default=0, show_default=True, metavar='ANGLE')
-@click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR')
+@click.option('--network', 'network_pkl', required=True, help='Network pickle filename')
+@click.option('--trunc', 'truncation_psi', type=float, default=1.0, show_default=True, help='Truncation psi')
+@click.option('--seed', type=int, default=42, show_default=True, help='Random seed base')
+@click.option('--centroids-path', type=str, help='Path to precomputed centroids for multimodal truncation')
+@click.option('--classes', type=parse_range, required=True, help="List of classes, e.g. '0,1,4-6'")
+@click.option('--samples-per-class', type=int, default=4, show_default=True, help='Samples per class')
+@click.option('--batch-gpu', type=int, default=32, show_default=True, help='Samples per GPU pass')
+@click.option('--gpus', type=click.IntRange(min=1), help='GPUs to use (defaults to all)')
+@click.option('--outdir', type=str, required=True, metavar='DIR', help='Where to save images')
+@click.option('--desc', type=str, metavar='STR', help='String to include in result dir name')
 def generate_images(
     network_pkl: str,
-    seeds: List[int],
-    batch_sz: int,
     truncation_psi: float,
+    seed: int,
     centroids_path: str,
-    noise_mode: str,
+    classes: List[int],
+    samples_per_class: int,
+    batch_gpu: int,
+    gpus: Optional[int],
     outdir: str,
-    translate: Tuple[float,float],
-    rotate: float,
-    class_idx: Optional[int]
+    desc: str,
 ):
-    print('Loading networks from "%s"...' % network_pkl)
-    device = torch.device('cuda')
-    with dnnlib.util.open_url(network_pkl) as f:
-        G = legacy.load_network_pkl(f)['G_ema']
-        G = G.eval().requires_grad_(False).to(device)
-
     os.makedirs(outdir, exist_ok=True)
+    desc_full = f'{Path(network_pkl).stem}_trunc_{truncation_psi}' + (f'-{desc}' if desc else '')
+    cfg = dict(
+        network_pkl=network_pkl,
+        truncation_psi=truncation_psi,
+        seed=seed,
+        centroids_path=centroids_path,
+        classes=classes,
+        samples_per_class=samples_per_class,
+        batch_gpu=batch_gpu,
+        outdir=outdir,
+        desc_full=desc_full,
+    )
 
-    # Generate images.
-    for seed_idx, seed in enumerate(seeds):
-        print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
+    env_world = int(os.environ.get('WORLD_SIZE', '1'))
+    if env_world > 1:
+        rank = int(os.environ.get('RANK', '0'))
+        _generate_worker(rank, env_world, cfg, 'env://', None)
+        return
 
-        # Construct an inverse rotation/translation matrix and pass to the generator.  The
-        # generator expects this matrix as an inverse to avoid potentially failing numerical
-        # operations in the network.
-        if hasattr(G.synthesis, 'input'):
-            m = make_transform(translate, rotate)
-            m = np.linalg.inv(m)
-            G.synthesis.input.transform.copy_(torch.from_numpy(m))
+    num_gpus = gpus or torch.cuda.device_count() or 1
+    if num_gpus == 1:
+        run_dir = Path(gen_utils.make_run_dir(outdir, desc_full))
+        _generate_worker(rank=0, world_size=1, cfg=cfg, init_method=None, run_dir=run_dir)
+        return
 
-        w = gen_utils.get_w_from_seed(G, batch_sz, device, truncation_psi, seed=seed,
-                                      centroids_path=centroids_path, class_idx=class_idx)
-        img = gen_utils.w_to_img(G, w, to_np=True)
-        PIL.Image.fromarray(gen_utils.create_image_grid(img), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
+    with tempfile.TemporaryDirectory() as temp_dir:
+        init_file = os.path.join(temp_dir, '.torch_distributed_init')
+        init_method = f'file://{init_file}'
+        run_dir = Path(gen_utils.make_run_dir(outdir, desc_full))
+        mp.set_start_method('spawn', force=True)
+        mp.spawn(
+            _generate_worker,
+            args=(num_gpus, cfg, init_method, run_dir),
+            nprocs=num_gpus,
+            join=True,
+        )
 
-
-#----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    generate_images() # pylint: disable=no-value-for-parameter
-
-#----------------------------------------------------------------------------
+    generate_images()
