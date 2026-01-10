@@ -33,9 +33,9 @@ from metrics import metric_main
 def setup_snapshot_image_grid(training_set, random_seed=0, gw=None, gh=None):
     rnd = np.random.RandomState(random_seed)
     if gw is None:
-        gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
+        gw = max(np.clip(2560 // training_set.image_shape[2], 7, 32), 1)
     if gh is None:
-        gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
+        gh = max(np.clip(1440 // training_set.image_shape[1], 4, 32), 1)
 
     # No labels => show random subset of training samples.
     if not training_set.has_labels:
@@ -88,6 +88,36 @@ def save_image_grid(img, fname, drange, grid_size):
         PIL.Image.fromarray(img[:, :, 0], 'L').save(fname)
     if C == 3:
         PIL.Image.fromarray(img, 'RGB').save(fname)
+
+#----------------------------------------------------------------------------
+
+@torch.no_grad()
+def generate_snapshot_grid_images(G_ema, grid_z, grid_c, batch_gpu, num_gpus=1, rank=0, noise_mode='const'):
+    # grid_z: [N, z_dim] tensor on GPU
+    # grid_c: [N, c_dim] tensor on GPU
+    if num_gpus == 1:
+        images = torch.cat([G_ema(z=z, c=c, noise_mode=noise_mode).cpu() for z, c in zip(grid_z.split(batch_gpu), grid_c.split(batch_gpu))]).numpy()
+        return images
+
+    n = grid_z.shape[0]
+    pad = (-n) % num_gpus
+    if pad != 0:
+        grid_z = torch.cat([grid_z, grid_z[-1:].repeat([pad, 1])], dim=0)
+        grid_c = torch.cat([grid_c, grid_c[-1:].repeat([pad, 1])], dim=0)
+
+    idx = torch.arange(rank, grid_z.shape[0], num_gpus, device=grid_z.device)
+    grid_z = grid_z.index_select(0, idx)
+    grid_c = grid_c.index_select(0, idx)
+
+    images = torch.cat([G_ema(z=z, c=c, noise_mode=noise_mode) for z, c in zip(grid_z.split(batch_gpu), grid_c.split(batch_gpu))], dim=0)
+    gathered = [torch.empty_like(images) for _ in range(num_gpus)]
+    torch.distributed.all_gather(gathered, images)
+
+    if rank == 0:
+        images = torch.stack(gathered, dim=1).reshape([images.shape[0] * num_gpus, *images.shape[1:]])[:n]
+        return images.cpu().numpy()
+
+    return images[:0].cpu().numpy()
 
 #----------------------------------------------------------------------------
 
@@ -150,9 +180,14 @@ def training_loop(
     __PL_MEAN__ = torch.zeros([], device=device)
     best_fid = 9999
 
+    # Stage logging helper (rank 0 only).
+    def stage(msg):
+        if rank == 0:
+            dt = time.time() - start_time
+            print(f'[Stage {dt:7.1f}s] {msg}', flush=True)
+
     # Load training set.
-    if rank == 0:
-        print('Loading training set...')
+    stage('Loading training set')
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
     training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
@@ -164,8 +199,7 @@ def training_loop(
         print()
 
     # Construct networks.
-    if rank == 0:
-        print('Constructing networks...')
+    stage('Constructing networks')
     common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels)
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
@@ -185,12 +219,13 @@ def training_loop(
 
 
     if (resume_pkl is not None) and (rank == 0):
-        print(f'Resuming from "{resume_pkl}"')
+        stage(f'Resuming from "{resume_pkl}"')
 
         with dnnlib.util.open_url(resume_pkl) as f:
             resume_data = legacy.load_network_pkl(f)
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
+        stage('Loaded model weights from resume pickle')
 
         if ckpt_pkl is not None:            # Load ticks
             __CUR_NIMG__ = resume_data['progress']['cur_nimg'].to(device)
@@ -215,8 +250,7 @@ def training_loop(
         misc.print_module_summary(D, [img, c])
 
     # Setup augmentation.
-    if rank == 0:
-        print('Setting up augmentation...')
+    stage('Setting up augmentation')
     augment_pipe = None
     ada_stats = None
     if (augment_kwargs is not None) and (augment_p > 0 or ada_target is not None):
@@ -226,16 +260,14 @@ def training_loop(
             ada_stats = training_stats.Collector(regex='Loss/signs/real')
 
     # Distribute across GPUs.
-    if rank == 0:
-        print(f'Distributing across {num_gpus} GPUs...')
+    stage(f'Distributing across {num_gpus} GPUs')
     for module in [G, D, G_ema, augment_pipe]:
         if module is not None and num_gpus > 1:
             for param in misc.params_and_buffers(module):
                 torch.distributed.broadcast(param, src=0)
 
     # Setup training phases.
-    if rank == 0:
-        print('Setting up training phases...')
+    stage('Setting up training phases')
     loss = dnnlib.util.construct_class_by_name(device=device, G=G, G_ema=G_ema, D=D, augment_pipe=augment_pipe, **loss_kwargs) # subclass of training.loss.Loss
     phases = []
     iter_dict = {'G': 1, 'D': 1}  # change here if you want to do several G/D iterations at once
@@ -265,20 +297,20 @@ def training_loop(
     grid_size = None
     grid_z = None
     grid_c = None
+    stage('Exporting sample images (reals.png, fakes_init.png)')
+    grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
     if rank == 0:
-        print('Exporting sample images...')
-        grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
 
-        grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
-        grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
-        images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+    grid_z = torch.randn([labels.shape[0], G.z_dim], device=device, generator=torch.Generator(device=device).manual_seed(random_seed * num_gpus))
+    grid_c = torch.from_numpy(labels).to(device)
+    images = generate_snapshot_grid_images(G_ema=G_ema, grid_z=grid_z, grid_c=grid_c, batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
 
+    if rank == 0:
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
 
     # Initialize logs.
-    if rank == 0:
-        print('Initializing logs...')
+    stage('Initializing logs (stats.jsonl, tensorboard)')
     stats_collector = training_stats.Collector(regex='.*')
     stats_metrics = dict()
     stats_jsonl = None
@@ -292,9 +324,7 @@ def training_loop(
             print('Skipping tfevents export:', err)
 
     # Train.
-    if rank == 0:
-        print(f'Training for {total_kimg} kimg...')
-        print()
+    stage(f'Training start (total_kimg={total_kimg}, batch_size={batch_size}, batch_gpu={batch_gpu})')
     if num_gpus > 1:  # broadcast loaded states to all
         torch.distributed.broadcast(__CUR_NIMG__, 0)
         torch.distributed.broadcast(__CUR_TICK__, 0)
@@ -437,14 +467,17 @@ def training_loop(
                 torch.distributed.barrier()
 
         # Save image snapshot.
-        if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+        if (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
+            stage(f'Saving image snapshot (kimg={cur_nimg/1e3:.1f})')
+            images = generate_snapshot_grid_images(G_ema=G_ema, grid_z=grid_z, grid_c=grid_c, batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
+            if rank == 0:
+                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+            stage(f'Preparing network snapshot data (kimg={cur_nimg/1e3:.1f})')
             snapshot_data = dict(G=G, D=D, G_ema=G_ema, augment_pipe=augment_pipe, training_set_kwargs=dict(training_set_kwargs))
             for key, value in snapshot_data.items():
                 if isinstance(value, torch.nn.Module):
@@ -468,6 +501,7 @@ def training_loop(
         if (rank == 0) and (restart_every > 0) and (network_snapshot_ticks is not None) and (
                 done or cur_tick % network_snapshot_ticks == 0):
             snapshot_pkl = misc.get_ckpt_path(run_dir)
+            stage(f'Saving checkpoint "{snapshot_pkl}"')
             # save as tensors to avoid error for multi GPU
             snapshot_data['progress'] = {
                 'cur_nimg': torch.LongTensor([cur_nimg]),
@@ -486,8 +520,7 @@ def training_loop(
         # Evaluate metrics.
         # if (snapshot_data is not None) and (len(metrics) > 0):
         if cur_tick and (snapshot_data is not None) and (len(metrics) > 0):
-            if rank == 0:
-                print('Evaluating metrics...')
+            stage('Evaluating metrics')
             for metric in metrics:
                 result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
                                                       dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
@@ -548,7 +581,6 @@ def training_loop(
 
     # Done.
     if rank == 0:
-        print()
-        print('Exiting...')
+        stage('Exiting')
 
 #----------------------------------------------------------------------------
