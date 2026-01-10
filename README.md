@@ -52,8 +52,7 @@ if there are errors
 2) install nvcc
 
 ```
-conda install -c conda-forge cuda-toolkit=13.0
-conda install -c nvidia cuda-nvcc=13.0
+conda install -y -c conda-forge compilers cxx-compiler
 ```
 
 
