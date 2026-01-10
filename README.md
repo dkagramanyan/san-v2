@@ -52,7 +52,7 @@ if there are errors
 2) install nvcc
 
 ```
-conda install -y -c conda-forge compilers cxx-compiler
+conda install -y -c conda-forge compilers cxx-compiler libstdcxx-ng
 ```
 
 
