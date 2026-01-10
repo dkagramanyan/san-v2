@@ -80,6 +80,7 @@ if there are errors
 
 ```
 conda install -c conda-forge cuda-toolkit=13.0
+conda install -c nvidia cuda-nvcc=13.0
 ```
 
 
