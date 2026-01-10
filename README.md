@@ -45,16 +45,6 @@ After it is neccesary to check the plugins
 python test.py
 ```
 
-If there are no error, the training will be successful 
-
-if there are errors
-1) clearn torch_extentions cache
-2) install nvcc
-
-```
-conda install -y -c conda-forge compilers cxx-compiler libstdcxx-ng
-```
-
 
 ## FFHQ
 
