@@ -28,7 +28,14 @@ from torch_utils import custom_ops
 custom_ops.verbosity = "full"
 from torch_utils.ops import upfirdn2d, bias_act, filtered_lrelu
 
+print("torch cuda:", torch.version.cuda)
+print("is available:", torch.cuda.is_available())
+print("device:", torch.cuda.get_device_name(0))
+
 print("Compiling upfirdn2d..."); upfirdn2d._init()
 print("Compiling bias_act..."); bias_act._init()
 print("Compiling filtered_lrelu..."); filtered_lrelu._init()
 print("Pre-compilation complete!")
+
+
+
