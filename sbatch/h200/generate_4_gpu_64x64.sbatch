@@ -41,7 +41,7 @@ export TORCH_CUDA_ARCH_LIST="9.0a"
 python gen_images.py \
   --outdir=./generated/ \
   --trunc=0.7 \
-  --samples-per-class 1000 \
+  --samples-per-class 10000 \
   --classes 0,1,2 \
   --gpus 4 \
   --batch-gpu 60 \
