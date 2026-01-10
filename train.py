@@ -35,9 +35,11 @@ def subprocess_fn(rank, c, temp_dir):
         if os.name == 'nt':
             init_method = 'file:///' + init_file.replace('\\', '/')
             torch.distributed.init_process_group(backend='gloo', init_method=init_method, rank=rank, world_size=c.num_gpus)
+            print(f"Rank {rank} backend = {torch.distributed.get_backend()}", flush=True)
         else:
             init_method = f'file://{init_file}'
             torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=c.num_gpus)
+            print(f"Rank {rank} backend = {torch.distributed.get_backend()}", flush=True)
 
     # Init torch_utils.
     sync_device = torch.device('cuda', rank) if c.num_gpus > 1 else None

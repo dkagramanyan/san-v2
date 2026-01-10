@@ -83,8 +83,6 @@ def get_plugin(module_name, sources, headers=None, source_dir=None, **build_kwar
                 raise RuntimeError(f'Could not find MSVC/GCC/CLANG installation on this computer. Check _find_compiler_bindir() in "{__file__}".')
             os.environ['PATH'] += ';' + compiler_bindir
 
-        os.environ['TORCH_CUDA_ARCH_LIST'] = ''
-
         all_source_files = sorted(sources + headers)
         all_source_dirs = set(os.path.dirname(fname) for fname in all_source_files)
 
