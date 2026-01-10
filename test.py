@@ -9,6 +9,7 @@ def run(cmd):
     return p.returncode
 
 for c in [
+    'rm -rf ~/.cache/torch_extensions',
     "nvidia-smi",
     "which nvcc",
     "nvcc --version",
