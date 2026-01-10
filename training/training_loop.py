@@ -33,9 +33,9 @@ from metrics import metric_main
 def setup_snapshot_image_grid(training_set, random_seed=0, gw=None, gh=None):
     rnd = np.random.RandomState(random_seed)
     if gw is None:
-        gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
+        gw = max(np.clip(2560 // training_set.image_shape[2], 7, 32), 1)
     if gh is None:
-        gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
+        gh = max(np.clip(1440 // training_set.image_shape[1], 4, 32), 1)
 
     # No labels => show random subset of training samples.
     if not training_set.has_labels:
