@@ -91,6 +91,36 @@ def save_image_grid(img, fname, drange, grid_size):
 
 #----------------------------------------------------------------------------
 
+@torch.no_grad()
+def generate_snapshot_grid_images(G_ema, grid_z, grid_c, batch_gpu, num_gpus=1, rank=0, noise_mode='const'):
+    # grid_z: [N, z_dim] tensor on GPU
+    # grid_c: [N, c_dim] tensor on GPU
+    if num_gpus == 1:
+        images = torch.cat([G_ema(z=z, c=c, noise_mode=noise_mode).cpu() for z, c in zip(grid_z.split(batch_gpu), grid_c.split(batch_gpu))]).numpy()
+        return images
+
+    n = grid_z.shape[0]
+    pad = (-n) % num_gpus
+    if pad != 0:
+        grid_z = torch.cat([grid_z, grid_z[-1:].repeat([pad, 1])], dim=0)
+        grid_c = torch.cat([grid_c, grid_c[-1:].repeat([pad, 1])], dim=0)
+
+    idx = torch.arange(rank, grid_z.shape[0], num_gpus, device=grid_z.device)
+    grid_z = grid_z.index_select(0, idx)
+    grid_c = grid_c.index_select(0, idx)
+
+    images = torch.cat([G_ema(z=z, c=c, noise_mode=noise_mode) for z, c in zip(grid_z.split(batch_gpu), grid_c.split(batch_gpu))], dim=0)
+    gathered = [torch.empty_like(images) for _ in range(num_gpus)]
+    torch.distributed.all_gather(gathered, images)
+
+    if rank == 0:
+        images = torch.stack(gathered, dim=1).reshape([images.shape[0] * num_gpus, *images.shape[1:]])[:n]
+        return images.cpu().numpy()
+
+    return images[:0].cpu().numpy()
+
+#----------------------------------------------------------------------------
+
 def weight_reset(m):
     if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Linear):
         m.reset_parameters()
@@ -267,13 +297,15 @@ def training_loop(
     grid_c = None
     if rank == 0:
         print('Exporting sample images...')
-        grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
+    grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
+    if rank == 0:
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
 
-        grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
-        grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
-        images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+    grid_z = torch.randn([labels.shape[0], G.z_dim], device=device, generator=torch.Generator(device=device).manual_seed(random_seed * num_gpus))
+    grid_c = torch.from_numpy(labels).to(device)
+    images = generate_snapshot_grid_images(G_ema=G_ema, grid_z=grid_z, grid_c=grid_c, batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
 
+    if rank == 0:
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
 
     # Initialize logs.
@@ -437,9 +469,10 @@ def training_loop(
                 torch.distributed.barrier()
 
         # Save image snapshot.
-        if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+        if (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
+            images = generate_snapshot_grid_images(G_ema=G_ema, grid_z=grid_z, grid_c=grid_c, batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
+            if rank == 0:
+                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
         # Save network snapshot.
         snapshot_pkl = None
