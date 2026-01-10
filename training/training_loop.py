@@ -14,6 +14,7 @@ import copy
 import json
 import dill
 import psutil
+from datetime import datetime
 import PIL.Image
 import numpy as np
 import torch
@@ -184,7 +185,9 @@ def training_loop(
     def stage(msg):
         if rank == 0:
             dt = time.time() - start_time
-            print(f'[Stage {dt:7.1f}s] {msg}', flush=True)
+            dt_min = dt / 60.0
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f'[Stage {now}] {msg} | {dt_min:7.1f}m', flush=True)
 
     # Load training set.
     stage('Loading training set')
