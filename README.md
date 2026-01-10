@@ -129,11 +129,17 @@ python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ff
 
 
 ## Generating Samples
+```python
+python gen_images.py \
+  --outdir=./generated/ \
+  --trunc=0.7 \
+  --samples-per-class 1000 \
+  --classes 0,1,2 \
+  --gpus 4 \
+  --batch-gpu 60 \
+  --network=./runs/wc-cv_h200/00002-stylegan3-r-imagenet_9to4_1024x1024_64x64-gpus4-batch480/best_model.pkl
 ```
-python gen_class_samplesheet.py --outdir=generated --trunc=0.7 \
-  --samples-per-class 100000 --classes 0,1,2 --grid-width 8 --batch-gpu=8 --batch-latent=4 \
-  --network=./runs/ffhq/00017-stylegan3-r-o_bc_left_4x_1536_1024x1024_rgb_512x512-gpus2-batch20/best_model.pkl
-```
+Images are written per class into `class_<id>/<class>_<index>.png`; run with `torchrun` or the `--gpus` flag to distribute work across available GPUs.
 
 ## Quality Metrics
 You need to preprocess a dataset in advance, following Data Preparation.
