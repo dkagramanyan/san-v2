@@ -1,7 +1,7 @@
 import os
 import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import PIL.Image
 import click
@@ -13,27 +13,25 @@ from tqdm import tqdm
 import legacy
 import dnnlib
 from torch_utils import gen_utils
-from gen_images import parse_range
 
 
-def _sync(world_size: int) -> None:
-    if world_size > 1 and dist.is_available() and dist.is_initialized():
-        dist.barrier()
+def parse_range(s: Union[str, List]) -> List[int]:
+    if isinstance(s, list):
+        return s
+    out = []
+    for part in str(s).split(','):
+        if '-' in part:
+            lo, hi = part.split('-')
+            out.extend(range(int(lo), int(hi) + 1))
+        else:
+            out.append(int(part))
+    return out
 
 
-def _ensure_run_dir(run_dir: Optional[Path], cfg: dict, world_size: int, rank: int) -> Path:
-    if run_dir is None and rank == 0:
-        run_dir = Path(gen_utils.make_run_dir(cfg['outdir'], cfg['desc_full']))
-    if world_size > 1 and dist.is_available() and dist.is_initialized():
-        dir_holder = [str(run_dir) if rank == 0 else '']
-        dist.broadcast_object_list(dir_holder, src=0)
-        run_dir = Path(dir_holder[0])
-    if run_dir is None:
-        raise RuntimeError('Failed to create run directory for sample generation.')
-    return run_dir
+def _generate_worker(rank: int, world_size: int, cfg: dict, init_method: Optional[str], run_dir: Optional[Path]) -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA device is required for image generation.')
 
-
-def _init_distributed(rank: int, world_size: int, init_method: Optional[str]) -> torch.device:
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(
             backend='nccl',
@@ -47,43 +45,39 @@ def _init_distributed(rank: int, world_size: int, init_method: Optional[str]) ->
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
-    return torch.device('cuda', device_id)
+    device = torch.device('cuda', device_id)
 
-
-def _generate_for_rank(rank: int, world_size: int, cfg: dict, run_dir: Optional[Path], init_method: Optional[str]) -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError('CUDA device is required for image generation.')
-
-    device = _init_distributed(rank, world_size, init_method)
-    run_dir = _ensure_run_dir(run_dir, cfg, world_size, rank)
+    if run_dir is None and rank == 0:
+        run_dir = Path(gen_utils.make_run_dir(cfg['outdir'], cfg['desc_full']))
+    if world_size > 1:
+        holder = [str(run_dir) if rank == 0 else '']
+        dist.broadcast_object_list(holder, src=0)
+        run_dir = Path(holder[0])
+        dist.barrier()
 
     if rank == 0:
         print(f'Loading network from "{cfg["network_pkl"]}"...')
+
     with torch.inference_mode():
         with dnnlib.util.open_url(cfg['network_pkl']) as f:
             G = legacy.load_network_pkl(f)['G_ema'].eval().requires_grad_(False).to(device)
 
-        _sync(world_size)
-        class_iter = tqdm(cfg['classes'], disable=rank != 0)
-        for class_idx in class_iter:
+        for class_idx in tqdm(cfg['classes'], disable=rank != 0):
             class_dir = run_dir / f'class_{class_idx}'
             if rank == 0:
                 class_dir.mkdir(parents=True, exist_ok=True)
-            _sync(world_size)
+            if world_size > 1:
+                dist.barrier()
 
-            image_indices = list(range(rank, cfg['samples_per_class'], world_size))
-            for start in range(0, len(image_indices), cfg['batch_gpu']):
-                batch_indices = image_indices[start:start + cfg['batch_gpu']]
-                if not batch_indices:
+            img_ids = list(range(rank, cfg['samples_per_class'], world_size))
+            for start in range(0, len(img_ids), cfg['batch_gpu']):
+                batch_ids = img_ids[start:start + cfg['batch_gpu']]
+                if not batch_ids:
                     continue
-                seeds = [
-                    cfg['seed'] + class_idx * cfg['samples_per_class'] + idx
-                    for idx in batch_indices
-                ]
-
+                seeds = [cfg['seed'] + class_idx * cfg['samples_per_class'] + idx for idx in batch_ids]
                 w = gen_utils.get_w_from_seed(
                     G,
-                    batch_sz=len(batch_indices),
+                    batch_sz=len(batch_ids),
                     device=device,
                     truncation_psi=cfg['truncation_psi'],
                     seed=None,
@@ -92,39 +86,28 @@ def _generate_for_rank(rank: int, world_size: int, cfg: dict, run_dir: Optional[
                     seeds=seeds,
                 )
                 images = gen_utils.w_to_img(G, w, to_np=True)
-
-                for img, img_idx in zip(images, batch_indices):
+                for img, img_idx in zip(images, batch_ids):
                     PIL.Image.fromarray(img, 'RGB').save(class_dir / f"{class_idx}_{img_idx}.png")
-    _sync(world_size)
+
+    if world_size > 1:
+        dist.barrier()
+        dist.destroy_process_group()
     if rank == 0:
         print(f'Finished writing samples to "{run_dir}".')
 
 
-def _spawn_workers(num_gpus: int, cfg: dict, run_dir: Path) -> None:
-    with tempfile.TemporaryDirectory() as temp_dir:
-        init_file = os.path.join(temp_dir, '.torch_distributed_init')
-        init_method = f'file://{init_file}'
-        mp.set_start_method('spawn', force=True)
-        mp.spawn(
-            _generate_for_rank,
-            args=(num_gpus, cfg, run_dir, init_method),
-            nprocs=num_gpus,
-            join=True,
-        )
-
-
 @click.command()
-@click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
-@click.option('--trunc', 'truncation_psi', help='Truncation psi', type=float, default=1.0, show_default=True)
-@click.option('--seed', help='Random seed base', type=int, default=42, show_default=True)
-@click.option('--centroids-path', type=str, help='Pass path to precomputed centroids to enable multimodal truncation')
-@click.option('--classes', type=parse_range, help='List of classes (e.g., \'0,1,4-6\')', required=True)
-@click.option('--samples-per-class', help='Samples per class.', type=int, default=4, show_default=True)
-@click.option('--batch-gpu', help='Samples per pass, adapt to fit on GPU', type=int, default=32, show_default=True)
-@click.option('--gpus', help='Number of GPUs to use (defaults to all available)', type=click.IntRange(min=1))
-@click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR')
-@click.option('--desc', help='String to include in result dir name', metavar='STR', type=str)
-def generate_samplesheet(
+@click.option('--network', 'network_pkl', required=True, help='Network pickle filename')
+@click.option('--trunc', 'truncation_psi', type=float, default=1.0, show_default=True, help='Truncation psi')
+@click.option('--seed', type=int, default=42, show_default=True, help='Random seed base')
+@click.option('--centroids-path', type=str, help='Path to precomputed centroids for multimodal truncation')
+@click.option('--classes', type=parse_range, required=True, help="List of classes, e.g. '0,1,4-6'")
+@click.option('--samples-per-class', type=int, default=4, show_default=True, help='Samples per class')
+@click.option('--batch-gpu', type=int, default=32, show_default=True, help='Samples per GPU pass')
+@click.option('--gpus', type=click.IntRange(min=1), help='GPUs to use (defaults to all)')
+@click.option('--outdir', type=str, required=True, metavar='DIR', help='Where to save images')
+@click.option('--desc', type=str, metavar='STR', help='String to include in result dir name')
+def generate_images(
     network_pkl: str,
     truncation_psi: float,
     seed: int,
@@ -137,10 +120,7 @@ def generate_samplesheet(
     desc: str,
 ):
     os.makedirs(outdir, exist_ok=True)
-    desc_full = f'{Path(network_pkl).stem}_trunc_{truncation_psi}'
-    if desc is not None:
-        desc_full += f'-{desc}'
-
+    desc_full = f'{Path(network_pkl).stem}_trunc_{truncation_psi}' + (f'-{desc}' if desc else '')
     cfg = dict(
         network_pkl=network_pkl,
         truncation_psi=truncation_psi,
@@ -153,19 +133,30 @@ def generate_samplesheet(
         desc_full=desc_full,
     )
 
-    env_world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    if env_world_size > 1:
+    env_world = int(os.environ.get('WORLD_SIZE', '1'))
+    if env_world > 1:
         rank = int(os.environ.get('RANK', '0'))
-        _generate_for_rank(rank, env_world_size, cfg, run_dir=None, init_method='env://')
+        _generate_worker(rank, env_world, cfg, 'env://', None)
         return
 
     num_gpus = gpus or torch.cuda.device_count() or 1
-    run_dir = Path(gen_utils.make_run_dir(outdir, desc_full))
     if num_gpus == 1:
-        _generate_for_rank(rank=0, world_size=1, cfg=cfg, run_dir=run_dir, init_method=None)
-    else:
-        _spawn_workers(num_gpus, cfg, run_dir)
+        run_dir = Path(gen_utils.make_run_dir(outdir, desc_full))
+        _generate_worker(rank=0, world_size=1, cfg=cfg, init_method=None, run_dir=run_dir)
+        return
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        init_file = os.path.join(temp_dir, '.torch_distributed_init')
+        init_method = f'file://{init_file}'
+        run_dir = Path(gen_utils.make_run_dir(outdir, desc_full))
+        mp.set_start_method('spawn', force=True)
+        mp.spawn(
+            _generate_worker,
+            args=(num_gpus, cfg, init_method, run_dir),
+            nprocs=num_gpus,
+            join=True,
+        )
 
 
 if __name__ == "__main__":
-    generate_samplesheet()
+    generate_images()
