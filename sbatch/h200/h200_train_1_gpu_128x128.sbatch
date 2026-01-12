@@ -1,19 +1,20 @@
 #!/bin/bash
 #SBATCH --job-name=SAN-128
-#SBATCH --gpus=4
+#SBATCH --gpus=1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=3-0:0
 #SBATCH --nodes=1
 #SBATCH --partition=normal
 #SBATCH --account=proj_1661
 #SBATCH --reservation=rocky
-#SBATCH --nodelist=cn-051
+#SBATCH --nodelist=cn-050
 #SBATCH --gres-flags=enforce-binding
 
 module purge
 module load Python
+module load CUDA/12.9
 
-conda activate san_rocky_51
+conda activate san_rocky_50
 
 export CC=/usr/bin/gcc
 export CXX=/usr/bin/g++
@@ -40,15 +41,15 @@ export TORCH_EXTENSIONS_DIR="${SLURM_TMPDIR:-/tmp}/${USER}_torch_extensions"
 export CUDA_CACHE_PATH="${SLURM_TMPDIR:-/tmp}/${USER}_cuda_cache"
 
 
-python train.py --outdir=./runs/wc-cv_h200_51 \
+python train.py --outdir=./runs/wc-cv_h200 \
         --cfg=stylegan3-r \
         --data=./datasets/imagenet_9to4_1024x1024_128x128.zip \
-        --gpus=4 \
-        --batch=240 \
+        --gpus=1 \
+        --batch=60 \
         --mirror=0 \
         --tick 1 \
         --metrics None \
-        --workers 2 \
+        --workers 8 \
         --snap 100 \
         --batch-gpu 60 \
         --kimg 20000 \
