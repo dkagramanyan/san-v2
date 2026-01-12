@@ -169,8 +169,8 @@ def training_loop(
     np.random.seed(random_seed * num_gpus + rank)
     torch.manual_seed(random_seed * num_gpus + rank)
     torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed.
-    torch.backends.cuda.matmul.allow_tf32 = False       # Improves numerical accuracy.
-    torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
+    torch.backends.cuda.matmul.allow_tf32 = True       # Improves numerical accuracy.
+    torch.backends.cudnn.allow_tf32 = True             # Improves numerical accuracy.
     conv2d_gradfix.enabled = True                       # Improves training speed.
     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
     __RESTART__ = torch.tensor(0., device=device)       # will be broadcasted to exit loop
@@ -187,7 +187,7 @@ def training_loop(
             dt = time.time() - start_time
             dt_min = dt / 60.0
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            print(f'[Stage {now}] {msg} | {dt_min:7.1f}m', flush=True)
+            print(f'[Stage {now}] {dt_min:7.1f}m | {msg}', flush=True)
 
     # Load training set.
     stage('Loading training set')
@@ -447,6 +447,7 @@ def training_loop(
         fields += [f"augment {training_stats.report0('Progress/augment', float(augment_pipe.p.cpu()) if augment_pipe is not None else 0):.3f}"]
         training_stats.report0('Timing/total_hours', (tick_end_time - start_time) / (60 * 60))
         training_stats.report0('Timing/total_days', (tick_end_time - start_time) / (24 * 60 * 60))
+
         if rank == 0:
             print(' '.join(fields))
 
@@ -475,6 +476,7 @@ def training_loop(
             images = generate_snapshot_grid_images(G_ema=G_ema, grid_z=grid_z, grid_c=grid_c, batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
             if rank == 0:
                 save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+            stage(f'Image snapshot saved (kimg={cur_nimg/1e3:.1f})')
 
         # Save network snapshot.
         snapshot_pkl = None
@@ -492,6 +494,7 @@ def training_loop(
                     #         torch.distributed.broadcast(param, src=0)
                     snapshot_data[key] = value #.cpu()
                 del value # conserve memory
+            stage(f'Network snapshot data prepared (kimg={cur_nimg/1e3:.1f})')
 
             # save for current time step (only for superres training, as we do not evaluate metrics here)
             if False:
@@ -506,10 +509,11 @@ def training_loop(
             snapshot_pkl = misc.get_ckpt_path(run_dir)
             stage(f'Saving checkpoint "{snapshot_pkl}"')
             # save as tensors to avoid error for multi GPU
+            # when saving checkpoint progress
             snapshot_data['progress'] = {
-                'cur_nimg': torch.LongTensor([cur_nimg]),
-                'cur_tick': torch.LongTensor([cur_tick]),
-                'batch_idx': torch.LongTensor([batch_idx]),
+                'cur_nimg': torch.tensor(cur_nimg, dtype=torch.long),
+                'cur_tick': torch.tensor(cur_tick, dtype=torch.long),
+                'batch_idx': torch.tensor(batch_idx, dtype=torch.long),
                 'best_fid': best_fid,
             }
             if augment_pipe is not None:
@@ -519,6 +523,8 @@ def training_loop(
 
             with open(snapshot_pkl, 'wb') as f:
                 dill.dump(snapshot_data, f)
+
+            stage(f'Checkpoint saved (kimg={snapshot_pkl})')
 
         # Evaluate metrics.
         # if (snapshot_data is not None) and (len(metrics) > 0):
@@ -543,6 +549,7 @@ def training_loop(
                     # save curr iteration number (directly saving it to pkl leads to problems with multi GPU)
                     with open(cur_nimg_txt, 'w') as f:
                         f.write(str(cur_nimg))
+            stage(f'Best FID saved')
 
         del snapshot_data # conserve memory
 
