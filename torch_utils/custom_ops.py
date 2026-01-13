@@ -56,16 +56,31 @@ def _get_cuda_arch_flags():
     try:
         major, minor = torch.cuda.get_device_capability()
         device_name = torch.cuda.get_device_name()
+
+        # Get additional Hopper-specific info (fixed property name for PyTorch 2.9+)
+        props = torch.cuda.get_device_properties(0)
+        shared_mem = props.shared_memory_per_block
+        multiprocessor_count = props.multi_processor_count
+        total_memory = props.total_memory
     except Exception:
         major, minor = 9, 0  # Default to Hopper
         device_name = "unknown"
+        shared_mem = 0
+        multiprocessor_count = 0
+        total_memory = 0
     
     # #region agent log
     _debug_log("custom_ops.py:_get_cuda_arch_flags", "Detected GPU capability", {
         "major": major,
         "minor": minor,
         "device_name": device_name,
-        "compute_capability": f"sm_{major}{minor}"
+        "compute_capability": f"sm_{major}{minor}",
+        "shared_mem_per_block_bytes": shared_mem,
+        "shared_mem_per_block_kb": shared_mem / 1024,
+        "multiprocessor_count": multiprocessor_count,
+        "total_memory_gb": total_memory / (1024**3),
+        "cuda_version": torch.version.cuda,
+        "pytorch_version": torch.__version__
     }, "A")
     # #endregion
     

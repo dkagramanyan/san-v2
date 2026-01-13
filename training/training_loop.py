@@ -55,13 +55,16 @@ def _debug_log(location, message, data=None, hypothesis_id=None):
 #----------------------------------------------------------------------------
 # CUDA kernel warmup to pre-trigger all kernel configurations
 
-def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=3, rank=0):
+def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
     """
     Warmup CUDA kernels by running forward/backward passes before training.
     This pre-triggers JIT compilation of all kernel configurations to avoid
     slow compilation during actual training iterations.
     
-    IMPORTANT: This also triggers upfirdn2d initialization by running gradient ops.
+    IMPORTANT: This also triggers:
+    1. Custom CUDA kernels (filtered_lrelu, upfirdn2d, bias_act) JIT compilation
+    2. cuDNN algorithm selection for all conv layer shapes (feature networks)
+    3. cuBLAS handle initialization
     """
     # #region agent log
     warmup_start = time.time()
@@ -69,15 +72,25 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=3, rank=0):
         "num_iterations": num_iterations,
         "batch_gpu": batch_gpu,
         "device": str(device),
-        "rank": rank
+        "rank": rank,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_enabled": torch.backends.cudnn.enabled,
+        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32
     }, "D")
     # #endregion
     
     if rank == 0:
         print(f'[Warmup] Running {num_iterations} warmup iterations to pre-compile CUDA kernels...', flush=True)
+        print(f'[Warmup] cuDNN benchmark={torch.backends.cudnn.benchmark} (True=auto-select optimal algorithms)', flush=True)
+        print(f'[Warmup] NOTE: First iteration may take 5-10 min on H200 due to:', flush=True)
+        print(f'[Warmup]   1. PTX JIT compilation for custom kernels (sm_90)', flush=True)
+        print(f'[Warmup]   2. cuDNN algorithm selection for feature networks (EfficientNet)', flush=True)
+        print(f'[Warmup] This is a one-time cost - subsequent runs will use cached kernels.', flush=True)
     
-    # Use smaller batch for faster warmup (just need to trigger all kernel configs)
-    warmup_batch = min(batch_gpu, 4)
+    # CRITICAL: Use actual batch_gpu to compile kernels for correct tensor shapes
+    # Using smaller batch causes PTX JIT during training (224s+ delays on H200)
+    warmup_batch = batch_gpu
     
     # Create dummy inputs
     z = torch.randn([warmup_batch, G.z_dim], device=device)
@@ -97,26 +110,60 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=3, rank=0):
             torch.cuda.synchronize(device)
             t_gen_fwd = time.time() - t0
             
-            # Phase 2: Discriminator forward (inference mode)
+            # Phase 2: Discriminator forward (inference mode, quick check)
+            # This triggers cuDNN benchmark algorithm selection for all feature network layers
             t0 = time.time()
             with torch.no_grad():
                 d_out = D(fake_img, c)
             torch.cuda.synchronize(device)
             t_disc_fwd = time.time() - t0
             
-            # Phase 3: Generator forward WITH gradients (triggers backward kernel configs)
+            # #region agent log
+            if i == 0:
+                _debug_log("training_loop.py:warmup_cuda_kernels", "Phase 2 D_fwd complete (cuDNN benchmark)", {
+                    "time_sec": t_disc_fwd,
+                    "note": "This includes cuDNN algorithm selection for feature networks"
+                }, "D")
+            # #endregion
+            
+            # Phase 3: Generator forward WITH gradients (triggers G backward kernel configs)
             t0 = time.time()
             z_grad = z.clone().requires_grad_(True)
             fake_img_grad = G(z=z_grad, c=c, noise_mode='random')
             torch.cuda.synchronize(device)
             t_gen_fwd_grad = time.time() - t0
             
-            # Phase 4: Backward pass (triggers upfirdn2d and other backward kernels)
+            # Phase 4: G backward pass (triggers upfirdn2d and other G backward kernels)
             t0 = time.time()
-            loss = fake_img_grad.sum()
-            loss.backward()
+            loss_g = fake_img_grad.sum()
+            loss_g.backward()
             torch.cuda.synchronize(device)
-            t_backward = time.time() - t0
+            t_backward_g = time.time() - t0
+            
+            # Phase 5: D forward WITH gradients + D backward (triggers D backward kernel configs)
+            # This is CRITICAL - without this, D backward kernels are JIT-compiled during training
+            # Use flg_train=True to match actual training behavior
+            t0 = time.time()
+            fake_img_d = G(z=z, c=c, noise_mode='random').detach().requires_grad_(True)
+            d_out_grad = D(fake_img_d, c, flg_train=True)  # Use training mode
+            # Handle both tuple and tensor outputs from D
+            if isinstance(d_out_grad, tuple):
+                loss_d = sum(x.sum() if x is not None else 0 for x in d_out_grad)
+            else:
+                loss_d = d_out_grad.sum()
+            loss_d.backward()
+            torch.cuda.synchronize(device)
+            t_backward_d = time.time() - t0
+            
+            # #region agent log
+            if i == 0:
+                _debug_log("training_loop.py:warmup_cuda_kernels", "Phase 5 D_train complete", {
+                    "time_sec": t_backward_d,
+                    "note": "D forward+backward with flg_train=True (matches training)"
+                }, "D")
+            # #endregion
+            
+            t_backward = t_backward_g + t_backward_d
             
             iter_time = time.time() - iter_start
             iteration_times.append(iter_time)
@@ -127,7 +174,8 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=3, rank=0):
                     "gen_forward": t_gen_fwd,
                     "disc_forward": t_disc_fwd,
                     "gen_forward_grad": t_gen_fwd_grad,
-                    "backward": t_backward
+                    "backward_g": t_backward_g,
+                    "backward_d": t_backward_d
                 }
             
             # #region agent log
@@ -137,7 +185,9 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=3, rank=0):
                 "gen_fwd_sec": t_gen_fwd,
                 "disc_fwd_sec": t_disc_fwd,
                 "gen_fwd_grad_sec": t_gen_fwd_grad,
-                "backward_sec": t_backward,
+                "backward_g_sec": t_backward_g,
+                "backward_d_sec": t_backward_d,
+                "backward_total_sec": t_backward,
                 "warmup_batch": warmup_batch
             }, "D")
             # #endregion
@@ -145,7 +195,7 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=3, rank=0):
             if rank == 0:
                 print(f'[Warmup] Iter {i+1}/{num_iterations}: {iter_time:.2f}s '
                       f'(G_fwd={t_gen_fwd:.2f}s, D_fwd={t_disc_fwd:.2f}s, '
-                      f'G_grad={t_gen_fwd_grad:.2f}s, bwd={t_backward:.2f}s)', flush=True)
+                      f'G_bwd={t_backward_g:.2f}s, D_bwd={t_backward_d:.2f}s)', flush=True)
                 
         except Exception as e:
             # #region agent log
@@ -177,7 +227,7 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=3, rank=0):
         if stage_times:
             print(f'[Warmup] First iter breakdown: G_fwd={stage_times["gen_forward"]:.2f}s, '
                   f'D_fwd={stage_times["disc_forward"]:.2f}s, '
-                  f'G_grad={stage_times["gen_forward_grad"]:.2f}s, bwd={stage_times["backward"]:.2f}s', flush=True)
+                  f'G_bwd={stage_times["backward_g"]:.2f}s, D_bwd={stage_times["backward_d"]:.2f}s', flush=True)
     
     # Clear any accumulated memory and gradients
     torch.cuda.empty_cache()
@@ -547,7 +597,7 @@ def training_loop(
     
     # Warmup CUDA kernels before training to avoid JIT compilation delays
     stage('Warming up CUDA kernels')
-    warmup_cuda_kernels(G=G_ema, D=D, device=device, batch_gpu=batch_gpu, num_iterations=3, rank=rank)
+    warmup_cuda_kernels(G=G_ema, D=D, device=device, batch_gpu=batch_gpu, num_iterations=1, rank=rank)
     
     # Synchronize all GPUs after warmup
     if num_gpus > 1:
