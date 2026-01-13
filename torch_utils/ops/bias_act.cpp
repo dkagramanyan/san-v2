@@ -9,7 +9,18 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/Dispatch.h>
 #include "bias_act.h"
+
+// Macro for dispatching over floating types including BFloat16 for Hopper support
+#ifndef AT_DISPATCH_FLOATING_TYPES_AND2
+#define AT_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...) \
+    AT_DISPATCH_SWITCH(TYPE, NAME, \
+        AT_DISPATCH_CASE(at::ScalarType::Double, __VA_ARGS__) \
+        AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
+        AT_DISPATCH_CASE(SCALARTYPE1, __VA_ARGS__) \
+        AT_DISPATCH_CASE(SCALARTYPE2, __VA_ARGS__))
+#endif
 
 //------------------------------------------------------------------------
 
@@ -74,7 +85,7 @@ static torch::Tensor bias_act(torch::Tensor x, torch::Tensor b, torch::Tensor xr
 
     // Choose CUDA kernel.
     void* kernel;
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "upfirdn2d_cuda", [&]
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "bias_act_cuda", [&]
     {
         kernel = choose_bias_act_kernel<scalar_t>(p);
     });

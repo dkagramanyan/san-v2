@@ -9,6 +9,9 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/Dispatch.h>
+#include <c10/util/Half.h>
+#include <c10/util/BFloat16.h>
 #include "filtered_lrelu.h"
 
 //------------------------------------------------------------------------
@@ -25,7 +28,7 @@ static std::tuple<torch::Tensor, torch::Tensor, int> filtered_lrelu(
     TORCH_CHECK(fu.device() == x.device() && fd.device() == x.device() && b.device() == x.device(), "all input tensors must reside on the same device");
     TORCH_CHECK(fu.dtype() == torch::kFloat && fd.dtype() == torch::kFloat, "fu and fd must be float32");
     TORCH_CHECK(b.dtype() == x.dtype(), "x and b must have the same dtype");
-    TORCH_CHECK(x.dtype() == torch::kHalf || x.dtype() == torch::kFloat, "x and b must be float16 or float32");
+    TORCH_CHECK(x.dtype() == torch::kHalf || x.dtype() == torch::kFloat || x.dtype() == torch::kBFloat16, "x and b must be float16, float32 or bfloat16");
     TORCH_CHECK(x.dim() == 4, "x must be rank 4");
     TORCH_CHECK(x.size(0) * x.size(1) <= INT_MAX && x.size(2) <= INT_MAX && x.size(3) <= INT_MAX, "x is too large");
     TORCH_CHECK(x.numel() > 0, "x is empty");
@@ -56,7 +59,7 @@ static std::tuple<torch::Tensor, torch::Tensor, int> filtered_lrelu(
     }
 
     // Input/output element size.
-    int64_t sz = (x.dtype() == torch::kHalf) ? 2 : 4;
+    int64_t sz = (x.dtype() == torch::kHalf || x.dtype() == torch::kBFloat16) ? 2 : 4;
 
     // Input sizes.
     int64_t xw = (int)x.size(3);
@@ -142,21 +145,33 @@ static std::tuple<torch::Tensor, torch::Tensor, int> filtered_lrelu(
     if (std::max(y.size(0) * p.yStride.w, 0ll) + std::max(y.size(1) * p.yStride.z, 0ll) + std::max(y.size(2) * p.yStride.y, 0ll) + std::max(y.size(3) * p.yStride.x, 0ll) >  INT_MAX) index64b = true;
     if (s.numel() > INT_MAX) index64b = true;
 
-    // Choose CUDA kernel.
+    // Choose CUDA kernel - supports float16, bfloat16, and float32
     filtered_lrelu_kernel_spec spec = { 0 };
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "filtered_lrelu_cuda", [&]
-    {
-        if constexpr (sizeof(scalar_t) <= 4) // Exclude doubles. constexpr prevents template instantiation.
-        {
-            // Choose kernel based on index type, datatype and sign read/write modes.
-            if      (!index64b &&  writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<scalar_t, int32_t, true,  false>(p, sharedKB);
-            else if (!index64b && !writeSigns &&  readSigns) spec = choose_filtered_lrelu_kernel<scalar_t, int32_t, false, true >(p, sharedKB);
-            else if (!index64b && !writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<scalar_t, int32_t, false, false>(p, sharedKB);
-            else if ( index64b &&  writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<scalar_t, int64_t, true,  false>(p, sharedKB);
-            else if ( index64b && !writeSigns &&  readSigns) spec = choose_filtered_lrelu_kernel<scalar_t, int64_t, false, true >(p, sharedKB);
-            else if ( index64b && !writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<scalar_t, int64_t, false, false>(p, sharedKB);
-        }
-    });
+    if (x.dtype() == torch::kHalf) {
+        // Choose kernel based on index type and sign read/write modes for float16
+        if      (!index64b &&  writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<c10::Half, int32_t, true,  false>(p, sharedKB);
+        else if (!index64b && !writeSigns &&  readSigns) spec = choose_filtered_lrelu_kernel<c10::Half, int32_t, false, true >(p, sharedKB);
+        else if (!index64b && !writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<c10::Half, int32_t, false, false>(p, sharedKB);
+        else if ( index64b &&  writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<c10::Half, int64_t, true,  false>(p, sharedKB);
+        else if ( index64b && !writeSigns &&  readSigns) spec = choose_filtered_lrelu_kernel<c10::Half, int64_t, false, true >(p, sharedKB);
+        else if ( index64b && !writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<c10::Half, int64_t, false, false>(p, sharedKB);
+    } else if (x.dtype() == torch::kBFloat16) {
+        // Choose kernel based on index type and sign read/write modes for bfloat16
+        if      (!index64b &&  writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<c10::BFloat16, int32_t, true,  false>(p, sharedKB);
+        else if (!index64b && !writeSigns &&  readSigns) spec = choose_filtered_lrelu_kernel<c10::BFloat16, int32_t, false, true >(p, sharedKB);
+        else if (!index64b && !writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<c10::BFloat16, int32_t, false, false>(p, sharedKB);
+        else if ( index64b &&  writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<c10::BFloat16, int64_t, true,  false>(p, sharedKB);
+        else if ( index64b && !writeSigns &&  readSigns) spec = choose_filtered_lrelu_kernel<c10::BFloat16, int64_t, false, true >(p, sharedKB);
+        else if ( index64b && !writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<c10::BFloat16, int64_t, false, false>(p, sharedKB);
+    } else {
+        // Choose kernel based on index type and sign read/write modes for float32
+        if      (!index64b &&  writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<float, int32_t, true,  false>(p, sharedKB);
+        else if (!index64b && !writeSigns &&  readSigns) spec = choose_filtered_lrelu_kernel<float, int32_t, false, true >(p, sharedKB);
+        else if (!index64b && !writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<float, int32_t, false, false>(p, sharedKB);
+        else if ( index64b &&  writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<float, int64_t, true,  false>(p, sharedKB);
+        else if ( index64b && !writeSigns &&  readSigns) spec = choose_filtered_lrelu_kernel<float, int64_t, false, true >(p, sharedKB);
+        else if ( index64b && !writeSigns && !readSigns) spec = choose_filtered_lrelu_kernel<float, int64_t, false, false>(p, sharedKB);
+    }
     TORCH_CHECK(spec.exec, "internal error - CUDA kernel not found") // This should not happen because we tested earlier that kernel exists.
 
     // Launch CUDA kernel.
@@ -220,7 +235,7 @@ static torch::Tensor filtered_lrelu_act(torch::Tensor x, torch::Tensor si, int s
     TORCH_CHECK(x.dim() == 4, "x must be rank 4");
     TORCH_CHECK(x.size(0) * x.size(1) <= INT_MAX && x.size(2) <= INT_MAX && x.size(3) <= INT_MAX, "x is too large");
     TORCH_CHECK(x.numel() > 0, "x is empty");
-    TORCH_CHECK(x.dtype() == torch::kHalf || x.dtype() == torch::kFloat || x.dtype() == torch::kDouble, "x must be float16, float32 or float64");
+    TORCH_CHECK(x.dtype() == torch::kHalf || x.dtype() == torch::kFloat || x.dtype() == torch::kDouble || x.dtype() == torch::kBFloat16, "x must be float16, bfloat16, float32 or float64");
 
     // Output signs if we don't have sign input.
     torch::Tensor so;
@@ -258,15 +273,23 @@ static torch::Tensor filtered_lrelu_act(torch::Tensor x, torch::Tensor si, int s
 
     // Choose CUDA kernel.
     void* func = 0;
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "filtered_lrelu_act_cuda", [&]
-    {
-        if (writeSigns)
-            func = choose_filtered_lrelu_act_kernel<scalar_t, true, false>();
-        else if (readSigns)
-            func = choose_filtered_lrelu_act_kernel<scalar_t, false, true>();
-        else
-            func = choose_filtered_lrelu_act_kernel<scalar_t, false, false>();
-    });
+    if (x.dtype() == torch::kHalf) {
+        if (writeSigns) func = choose_filtered_lrelu_act_kernel<c10::Half, true, false>();
+        else if (readSigns) func = choose_filtered_lrelu_act_kernel<c10::Half, false, true>();
+        else func = choose_filtered_lrelu_act_kernel<c10::Half, false, false>();
+    } else if (x.dtype() == torch::kBFloat16) {
+        if (writeSigns) func = choose_filtered_lrelu_act_kernel<c10::BFloat16, true, false>();
+        else if (readSigns) func = choose_filtered_lrelu_act_kernel<c10::BFloat16, false, true>();
+        else func = choose_filtered_lrelu_act_kernel<c10::BFloat16, false, false>();
+    } else if (x.dtype() == torch::kFloat) {
+        if (writeSigns) func = choose_filtered_lrelu_act_kernel<float, true, false>();
+        else if (readSigns) func = choose_filtered_lrelu_act_kernel<float, false, true>();
+        else func = choose_filtered_lrelu_act_kernel<float, false, false>();
+    } else { // double
+        if (writeSigns) func = choose_filtered_lrelu_act_kernel<double, true, false>();
+        else if (readSigns) func = choose_filtered_lrelu_act_kernel<double, false, true>();
+        else func = choose_filtered_lrelu_act_kernel<double, false, false>();
+    }
     TORCH_CHECK(func, "internal error - CUDA kernel not found");
 
     // Launch CUDA kernel.

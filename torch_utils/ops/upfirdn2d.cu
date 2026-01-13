@@ -7,15 +7,17 @@
 // license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 #include <c10/util/Half.h>
+#include <c10/util/BFloat16.h>
 #include "upfirdn2d.h"
 
 //------------------------------------------------------------------------
 // Helpers.
 
 template <class T> struct InternalType;
-template <> struct InternalType<double>     { typedef double scalar_t; };
-template <> struct InternalType<float>      { typedef float  scalar_t; };
-template <> struct InternalType<c10::Half>  { typedef float  scalar_t; };
+template <> struct InternalType<double>         { typedef double scalar_t; };
+template <> struct InternalType<float>          { typedef float  scalar_t; };
+template <> struct InternalType<c10::Half>      { typedef float  scalar_t; };
+template <> struct InternalType<c10::BFloat16>  { typedef float  scalar_t; };
 
 static __device__ __forceinline__ int floor_div(int a, int b)
 {
@@ -377,8 +379,9 @@ template <class T> upfirdn2d_kernel_spec choose_upfirdn2d_kernel(const upfirdn2d
 //------------------------------------------------------------------------
 // Template specializations.
 
-template upfirdn2d_kernel_spec choose_upfirdn2d_kernel<double>   (const upfirdn2d_kernel_params& p);
-template upfirdn2d_kernel_spec choose_upfirdn2d_kernel<float>    (const upfirdn2d_kernel_params& p);
-template upfirdn2d_kernel_spec choose_upfirdn2d_kernel<c10::Half>(const upfirdn2d_kernel_params& p);
+template upfirdn2d_kernel_spec choose_upfirdn2d_kernel<double>       (const upfirdn2d_kernel_params& p);
+template upfirdn2d_kernel_spec choose_upfirdn2d_kernel<float>        (const upfirdn2d_kernel_params& p);
+template upfirdn2d_kernel_spec choose_upfirdn2d_kernel<c10::Half>    (const upfirdn2d_kernel_params& p);
+template upfirdn2d_kernel_spec choose_upfirdn2d_kernel<c10::BFloat16>(const upfirdn2d_kernel_params& p);
 
 //------------------------------------------------------------------------

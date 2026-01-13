@@ -7,6 +7,7 @@
 // license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 #include <c10/util/Half.h>
+#include <c10/util/BFloat16.h>
 #include "filtered_lrelu.h"
 #include <cstdint>
 
@@ -37,6 +38,13 @@ template <> struct InternalType<float>
     __device__ __forceinline__ static float clamp(float x, float c) { return fminf(fmaxf(x, -c), c); }
 };
 template <> struct InternalType<c10::Half>
+{
+    typedef float scalar_t; typedef float2 vec2_t; typedef float4 vec4_t;
+    __device__ __forceinline__ static vec2_t zero_vec2(void) { return make_float2(0, 0); }
+    __device__ __forceinline__ static vec4_t zero_vec4(void) { return make_float4(0, 0, 0, 0); }
+    __device__ __forceinline__ static float clamp(float x, float c) { return fminf(fmaxf(x, -c), c); }
+};
+template <> struct InternalType<c10::BFloat16>
 {
     typedef float scalar_t; typedef float2 vec2_t; typedef float4 vec4_t;
     __device__ __forceinline__ static vec2_t zero_vec2(void) { return make_float2(0, 0); }
