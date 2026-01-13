@@ -196,7 +196,7 @@ def get_plugin(module_name, sources, headers=None, source_dir=None, **build_kwar
             build_top_dir = torch.utils.cpp_extension._get_build_directory(module_name, verbose=verbose_build)  # pylint: disable=protected-access
             cached_build_dir = os.path.join(build_top_dir, f'{source_digest}-{_get_mangled_gpu_name()}')
             build_dir = cached_build_dir
-            
+
             cache_exists = os.path.isdir(cached_build_dir)
             
             # #region agent log
@@ -266,7 +266,7 @@ def get_plugin(module_name, sources, headers=None, source_dir=None, **build_kwar
             sys.path.insert(0, build_dir)
 
         module = importlib.import_module(module_name)
-        
+
         total_time = time.time() - start_time
         
         # #region agent log
