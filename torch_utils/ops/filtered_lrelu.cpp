@@ -208,7 +208,7 @@ static std::tuple<torch::Tensor, torch::Tensor, int> filtered_lrelu(
     AT_CUDA_CHECK(cudaFuncSetCacheConfig(spec.exec, cudaFuncCachePreferShared));
     if (spec.dynamicSharedKB) // Need dynamically allocated shared memory?
         AT_CUDA_CHECK(cudaFuncSetAttribute(spec.exec, cudaFuncAttributeMaxDynamicSharedMemorySize, spec.dynamicSharedKB << 10));
-    AT_CUDA_CHECK(cudaFuncSetSharedMemConfig(spec.exec, cudaSharedMemBankSizeFourByte));
+    // Note: cudaFuncSetSharedMemConfig is deprecated in CUDA 12.9+ and no longer needed on Hopper+
 
     // Launch main kernel.
     const int maxSubGz = 65535; // CUDA maximum for block z dimension.

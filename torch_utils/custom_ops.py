@@ -69,7 +69,7 @@ def _get_cuda_extra_cflags():
         '--use_fast_math',
         '-O3',
         '--expt-relaxed-constexpr',
-        '-Xcompiler', '-fPIC',
+        # Note: -fPIC is already added by PyTorch's cpp_extension loader
     ]
     
     # Add architecture-specific optimizations
