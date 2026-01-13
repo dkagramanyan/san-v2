@@ -38,20 +38,8 @@ def subprocess_fn(rank, c, temp_dir):
             print(f"Rank {rank} backend = {torch.distributed.get_backend()}", flush=True)
         else:
             init_method = f'file://{init_file}'
-            # Set CUDA device before NCCL init for proper GPU binding on H200
             torch.cuda.set_device(rank)
-            
-            # Configure NCCL for H200/Hopper GPUs
-            os.environ.setdefault('NCCL_DEBUG', 'WARN')
-            os.environ.setdefault('NCCL_IB_DISABLE', '0')  # Enable InfiniBand if available
-            os.environ.setdefault('NCCL_SOCKET_IFNAME', '')  # Let NCCL auto-detect
-            
-            try:
-                torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=c.num_gpus)
-                print(f"Rank {rank} initialized with NCCL backend", flush=True)
-            except Exception as e:
-                print(f"Rank {rank} NCCL init failed ({e}), falling back to Gloo", flush=True)
-                torch.distributed.init_process_group(backend='gloo', init_method=init_method, rank=rank, world_size=c.num_gpus)
+            torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=c.num_gpus)
             
 
     # Init torch_utils.
