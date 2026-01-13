@@ -12,6 +12,7 @@
 
 module purge
 module load Python
+module load CUDA/12.9
 
 conda activate san_rocky_51
 
@@ -35,6 +36,10 @@ export TORCH_DISTRIBUTED_DEBUG=DETAIL
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_DEBUG=INFO
 export TORCH_CUDA_ARCH_LIST="9.0"
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+export PYTHONWARNINGS=all
 
 export TORCH_EXTENSIONS_DIR="${SLURM_TMPDIR:-/tmp}/${USER}_torch_extensions"
 export CUDA_CACHE_PATH="${SLURM_TMPDIR:-/tmp}/${USER}_cuda_cache"

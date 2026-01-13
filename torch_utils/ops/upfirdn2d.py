@@ -11,10 +11,32 @@
 import os
 import numpy as np
 import torch
+import time
+import json
 
 from .. import custom_ops
 from .. import misc
 from . import conv2d_gradfix
+
+# #region agent log
+_DEBUG_LOG_PATH = "/home/dgkagramanyan/.cursor/debug.log"
+
+def _debug_log(location, message, data=None, hypothesis_id=None):
+    """Write debug info to NDJSON log file."""
+    try:
+        entry = {
+            "timestamp": time.time() * 1000,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "sessionId": "cuda-kernel-debug",
+            "hypothesisId": hypothesis_id or "general"
+        }
+        with open(_DEBUG_LOG_PATH, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except Exception:
+        pass
+# #endregion
 
 #----------------------------------------------------------------------------
 
@@ -23,6 +45,11 @@ _plugin = None
 def _init():
     global _plugin
     if _plugin is None:
+        # #region agent log
+        init_start = time.time()
+        _debug_log("upfirdn2d.py:_init", "Initializing upfirdn2d plugin", {}, "C")
+        # #endregion
+        
         _plugin = custom_ops.get_plugin(
             module_name='upfirdn2d_plugin',
             sources=['upfirdn2d.cpp', 'upfirdn2d.cu'],
@@ -30,6 +57,12 @@ def _init():
             source_dir=os.path.dirname(__file__),
             extra_cuda_cflags=['--use_fast_math'],
         )
+        
+        # #region agent log
+        _debug_log("upfirdn2d.py:_init", "Plugin initialized", {
+            "init_time_sec": time.time() - init_start
+        }, "C")
+        # #endregion
     return True
 
 def _parse_scaling(scaling):

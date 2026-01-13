@@ -30,6 +30,112 @@ import legacy
 from metrics import metric_main
 
 #----------------------------------------------------------------------------
+# Debug logging for warmup diagnostics
+
+# #region agent log
+_DEBUG_LOG_PATH = "/home/dgkagramanyan/.cursor/debug.log"
+
+def _debug_log(location, message, data=None, hypothesis_id=None):
+    """Write debug info to NDJSON log file."""
+    try:
+        entry = {
+            "timestamp": time.time() * 1000,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "sessionId": "cuda-kernel-debug",
+            "hypothesisId": hypothesis_id or "general"
+        }
+        with open(_DEBUG_LOG_PATH, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except Exception:
+        pass
+# #endregion
+
+#----------------------------------------------------------------------------
+# CUDA kernel warmup to pre-trigger all kernel configurations
+
+def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=5, rank=0):
+    """
+    Warmup CUDA kernels by running forward/backward passes before training.
+    This pre-triggers JIT compilation of all kernel configurations to avoid
+    slow compilation during actual training iterations.
+    """
+    # #region agent log
+    warmup_start = time.time()
+    _debug_log("training_loop.py:warmup_cuda_kernels", "Starting CUDA kernel warmup", {
+        "num_iterations": num_iterations,
+        "batch_gpu": batch_gpu,
+        "device": str(device),
+        "rank": rank
+    }, "D")
+    # #endregion
+    
+    if rank == 0:
+        print(f'[Warmup] Running {num_iterations} warmup iterations to pre-compile CUDA kernels...', flush=True)
+    
+    # Create dummy inputs
+    z = torch.randn([batch_gpu, G.z_dim], device=device)
+    c = torch.zeros([batch_gpu, G.c_dim], device=device)
+    
+    iteration_times = []
+    
+    for i in range(num_iterations):
+        iter_start = time.time()
+        
+        try:
+            # Forward pass through generator
+            with torch.no_grad():
+                fake_img = G(z=z, c=c, noise_mode='random')
+            
+            # Forward pass through discriminator
+            with torch.no_grad():
+                _ = D(fake_img, c)
+            
+            # Sync CUDA
+            torch.cuda.synchronize(device)
+            
+            iter_time = time.time() - iter_start
+            iteration_times.append(iter_time)
+            
+            # #region agent log
+            _debug_log("training_loop.py:warmup_cuda_kernels", f"Warmup iteration {i+1} complete", {
+                "iteration": i + 1,
+                "time_sec": iter_time
+            }, "D")
+            # #endregion
+            
+            if rank == 0:
+                print(f'[Warmup] Iteration {i+1}/{num_iterations}: {iter_time:.2f}s', flush=True)
+                
+        except Exception as e:
+            # #region agent log
+            _debug_log("training_loop.py:warmup_cuda_kernels", "Warmup iteration failed", {
+                "iteration": i + 1,
+                "error": str(e)
+            }, "D")
+            # #endregion
+            if rank == 0:
+                print(f'[Warmup] Iteration {i+1} failed: {e}', flush=True)
+    
+    total_time = time.time() - warmup_start
+    
+    # #region agent log
+    _debug_log("training_loop.py:warmup_cuda_kernels", "Warmup complete", {
+        "total_time_sec": total_time,
+        "iteration_times": iteration_times,
+        "avg_time": sum(iteration_times) / len(iteration_times) if iteration_times else 0
+    }, "D")
+    # #endregion
+    
+    if rank == 0:
+        avg_time = sum(iteration_times) / len(iteration_times) if iteration_times else 0
+        print(f'[Warmup] Complete! Total: {total_time:.2f}s, Avg per iteration: {avg_time:.2f}s', flush=True)
+    
+    # Clear any accumulated memory
+    torch.cuda.empty_cache()
+
+#----------------------------------------------------------------------------
 
 def setup_snapshot_image_grid(training_set, random_seed=0, gw=None, gh=None):
     rnd = np.random.RandomState(random_seed)
@@ -326,6 +432,14 @@ def training_loop(
         except ImportError as err:
             print('Skipping tfevents export:', err)
 
+    # Warmup CUDA kernels before training to avoid JIT compilation delays
+    stage('Warming up CUDA kernels')
+    warmup_cuda_kernels(G=G_ema, D=D, device=device, batch_gpu=batch_gpu, num_iterations=5, rank=rank)
+    
+    # Synchronize all GPUs after warmup
+    if num_gpus > 1:
+        torch.distributed.barrier()
+    
     # Train.
     stage(f'Training start (total_kimg={total_kimg}, batch_size={batch_size}, batch_gpu={batch_gpu})')
     if num_gpus > 1:  # broadcast loaded states to all
@@ -348,6 +462,7 @@ def training_loop(
         augment_pipe.p.copy_(augment_p)
     if hasattr(loss, 'pl_mean'):
         loss.pl_mean.copy_(__PL_MEAN__)
+
     while True:
 
         with torch.autograd.profiler.record_function('data_fetch'):

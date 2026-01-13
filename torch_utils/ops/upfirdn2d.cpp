@@ -9,7 +9,9 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/Dispatch.h>
 #include "upfirdn2d.h"
+
 
 //------------------------------------------------------------------------
 
@@ -58,12 +60,17 @@ static torch::Tensor upfirdn2d(torch::Tensor x, torch::Tensor f, int upx, int up
     p.sizeMajor     = (p.inStride.z == 1) ? p.inSize.w : p.inSize.w * p.inSize.z;
     p.sizeMinor     = (p.inStride.z == 1) ? p.inSize.z : 1;
 
-    // Choose CUDA kernel.
+    // Choose CUDA kernel - supports float16, bfloat16, float32, float64
     upfirdn2d_kernel_spec spec;
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "upfirdn2d_cuda", [&]
-    {
-        spec = choose_upfirdn2d_kernel<scalar_t>(p);
-    });
+    if (x.dtype() == torch::kHalf) {
+        spec = choose_upfirdn2d_kernel<c10::Half>(p);
+    } else if (x.dtype() == torch::kBFloat16) {
+        spec = choose_upfirdn2d_kernel<c10::BFloat16>(p);
+    } else if (x.dtype() == torch::kFloat) {
+        spec = choose_upfirdn2d_kernel<float>(p);
+    } else {
+        spec = choose_upfirdn2d_kernel<double>(p);
+    }
 
     // Set looping options.
     p.loopMajor     = (p.sizeMajor - 1) / 16384 + 1;
