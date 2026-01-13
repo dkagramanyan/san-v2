@@ -334,7 +334,6 @@ def training_loop(
         torch.distributed.broadcast(__BATCH_IDX__, 0)
         torch.distributed.broadcast(__AUGMENT_P__, 0)
         torch.distributed.broadcast(__PL_MEAN__, 0)
-        torch.cuda.synchronize()  # Ensure all CUDA operations complete before barrier
         torch.distributed.barrier()  # ensure all processes received this info
     cur_nimg = __CUR_NIMG__.item()
     cur_tick = __CUR_TICK__.item()
@@ -349,10 +348,7 @@ def training_loop(
         augment_pipe.p.copy_(augment_p)
     if hasattr(loss, 'pl_mean'):
         loss.pl_mean.copy_(__PL_MEAN__)
-    
-    # Sync all GPUs before starting training loop (important for H200/Hopper)
-    torch.cuda.synchronize()
-    
+
     while True:
 
         with torch.autograd.profiler.record_function('data_fetch'):
@@ -390,8 +386,6 @@ def training_loop(
                 if len(params) > 0:
                     flat = torch.cat([param.grad.flatten() for param in params])
                     if num_gpus > 1:
-                        # Synchronize CUDA operations before all_reduce for H200/Hopper compatibility
-                        torch.cuda.synchronize()
                         torch.distributed.all_reduce(flat)
                         flat /= num_gpus
                     misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
@@ -411,10 +405,6 @@ def training_loop(
             # Phase done.
             if phase.end_event is not None:
                 phase.end_event.record(torch.cuda.current_stream(device))
-
-        # Synchronize GPUs after all phases (important for H200/Hopper multi-GPU training)
-        if num_gpus > 1:
-            torch.cuda.synchronize()
 
         # Update G_ema.
         with torch.autograd.profiler.record_function('Gema'):

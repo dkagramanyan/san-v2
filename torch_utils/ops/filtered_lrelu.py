@@ -213,12 +213,6 @@ def _filtered_lrelu_cuda(up=1, down=1, padding=0, gain=np.sqrt(2), slope=0.2, cl
 
             # Call C++/Cuda plugin if datatype is supported.
             if x.dtype in [torch.float16, torch.float32, torch.bfloat16]:
-                # On H200/Hopper and newer GPUs, ensure stream synchronization for correctness
-                current_stream = torch.cuda.current_stream(x.device)
-                default_stream = torch.cuda.default_stream(x.device)
-                if current_stream != default_stream:
-                    # Synchronize to ensure all pending operations complete before kernel launch
-                    current_stream.synchronize()
                 y, so, return_code = _plugin.filtered_lrelu(x, fu, fd, b, si, up, down, px0, px1, py0, py1, sx, sy, gain, slope, clamp, flip_filter, write_signs)
             else:
                 return_code = -1
