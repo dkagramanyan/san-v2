@@ -27,7 +27,7 @@ verbosity = 'brief' # Verbosity level: 'none', 'brief', 'full'
 # CUDA architecture detection and flags for Hopper (sm_90) and newer.
 
 def _get_cuda_arch_flags():
-    """Get CUDA architecture flags for compilation, supporting H200/Hopper (sm_90)."""
+    """Get CUDA architecture flags for compilation, supporting H200/Hopper (sm_90) and beyond."""
     arch_flags = []
     
     # Detect current GPU compute capability
@@ -48,11 +48,11 @@ def _get_cuda_arch_flags():
         if 80 not in supported_archs and cc >= 80:
             supported_archs.append(80)
             
-        # Add Hopper support for H200
+        # Add Hopper support for H200 (sm_90)
         if 90 not in supported_archs and cc >= 90:
             supported_archs.append(90)
         
-        # Generate flags
+        # Generate flags for each architecture
         for arch in sorted(set(supported_archs)):
             arch_flags.append(f'-gencode=arch=compute_{arch},code=sm_{arch}')
         
@@ -60,6 +60,10 @@ def _get_cuda_arch_flags():
         if supported_archs:
             max_arch = max(supported_archs)
             arch_flags.append(f'-gencode=arch=compute_{max_arch},code=compute_{max_arch}')
+            
+            # For Hopper (sm_90+), add sm_90a variant for enhanced features
+            if max_arch >= 90:
+                arch_flags.append(f'-gencode=arch=compute_90a,code=sm_90a')
     
     return arch_flags
 
@@ -69,6 +73,7 @@ def _get_cuda_extra_cflags():
         '--use_fast_math',
         '-O3',
         '--expt-relaxed-constexpr',
+        '-lineinfo',  # Enable line info for profiling/debugging
         # Note: -fPIC is already added by PyTorch's cpp_extension loader
     ]
     
@@ -77,17 +82,20 @@ def _get_cuda_extra_cflags():
         device = torch.cuda.current_device()
         major, minor = torch.cuda.get_device_capability(device)
         
-        # Hopper (sm_90) specific optimizations
+        # Hopper (sm_90) specific optimizations - H100, H200
         if major >= 9:
             cflags.extend([
                 '-DHOPPER_ARCH',
                 '--threads', '4',  # Parallel compilation
+                '--maxrregcount=128',  # Optimize register usage for Hopper
+                '-allow-unsupported-compiler',  # Allow newer compilers
             ])
-        # Ampere (sm_80) optimizations
+        # Ampere (sm_80) optimizations - A100
         elif major >= 8:
             cflags.extend([
                 '-DAMPERE_ARCH',
                 '--threads', '4',
+                '--maxrregcount=128',
             ])
     
     return cflags
@@ -124,9 +132,30 @@ def _get_mangled_gpu_name():
 # Main entry point for compiling and loading C++/CUDA plugins.
 
 _cached_plugins = dict()
+_arch_check_done = False
+
+def _check_arch_compatibility():
+    """Check if compiled kernels are compatible with current GPU architecture.
+    If not, the cache will be invalidated automatically through the hash mechanism.
+    """
+    global _arch_check_done
+    if _arch_check_done:
+        return
+    _arch_check_done = True
+    
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device)
+        gpu_name = torch.cuda.get_device_name(device)
+        print(f'[Custom CUDA Ops] Detected GPU: {gpu_name} (sm_{major}{minor})')
+        if major >= 9:
+            print(f'[Custom CUDA Ops] Using Hopper-optimized compilation settings')
+        elif major >= 8:
+            print(f'[Custom CUDA Ops] Using Ampere-optimized compilation settings')
 
 def get_plugin(module_name, sources, headers=None, source_dir=None, **build_kwargs):
     import sys  # <-- added
+    _check_arch_compatibility()  # Check GPU architecture on first plugin load
     assert verbosity in ['none', 'brief', 'full']
     if headers is None:
         headers = []
