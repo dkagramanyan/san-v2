@@ -576,7 +576,23 @@ def training_loop(
     if hasattr(loss, 'pl_mean'):
         loss.pl_mean.copy_(__PL_MEAN__)
 
+    # #region agent log
+    _iter_count = 0
+    _phase_times = {}
+    # #endregion
+
     while True:
+        # #region agent log
+        _iter_start = time.time()
+        if _iter_count < 5 or _iter_count % 10 == 0:
+            _debug_log("training_loop.py:main_loop", f"Training iteration {_iter_count} started", {
+                "iteration": _iter_count,
+                "cur_nimg": cur_nimg,
+                "batch_idx": batch_idx,
+                "rank": rank
+            }, "L")
+        _data_fetch_start = time.time()
+        # #endregion
 
         with torch.autograd.profiler.record_function('data_fetch'):
             phase_real_img, phase_real_c = next(training_set_iterator)
@@ -588,10 +604,25 @@ def training_loop(
             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
 
+        # #region agent log
+        _data_fetch_end = time.time()
+        if _iter_count < 5 or _iter_count % 10 == 0:
+            _debug_log("training_loop.py:main_loop", f"Data fetch complete", {
+                "iteration": _iter_count,
+                "data_fetch_sec": _data_fetch_end - _data_fetch_start,
+                "rank": rank
+            }, "K")
+        # #endregion
+
         # Execute training phases.
         for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
             if batch_idx % phase.interval != 0:
                 continue
+            
+            # #region agent log
+            _phase_start = time.time()
+            # #endregion
+            
             if phase.start_event is not None:
                 phase.start_event.record(torch.cuda.current_stream(device))
 
@@ -603,23 +634,53 @@ def training_loop(
             if phase.name in ['Dmain', 'Dboth', 'Dreg'] and hasattr(phase.module, 'feature_networks'):
                 phase.module.feature_networks.requires_grad_(False)
 
+            # #region agent log
+            _accum_start = time.time()
+            # #endregion
+            
             for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
                 loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
             phase.module.requires_grad_(False)
+            
+            # #region agent log
+            _accum_end = time.time()
+            # #endregion
 
             # Update weights.
+            # #region agent log
+            _allreduce_time = 0
+            # #endregion
             with torch.autograd.profiler.record_function(phase.name + '_opt'):
                 params = [param for param in phase.module.parameters() if param.grad is not None]
                 if len(params) > 0:
                     flat = torch.cat([param.grad.flatten() for param in params])
+                    # #region agent log
+                    _allreduce_start = time.time()
+                    # #endregion
                     if num_gpus > 1:
                         torch.distributed.all_reduce(flat)
                         flat /= num_gpus
+                    # #region agent log
+                    _allreduce_time = time.time() - _allreduce_start
+                    # #endregion
                     misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
                     grads = flat.split([param.numel() for param in params])
                     for param, grad in zip(params, grads):
                         param.grad = grad.reshape(param.shape)
                 phase.opt.step()
+            
+            # #region agent log
+            _phase_end = time.time()
+            if _iter_count < 5 or _iter_count % 10 == 0:
+                _debug_log("training_loop.py:main_loop", f"Phase {phase.name} complete", {
+                    "iteration": _iter_count,
+                    "phase": phase.name,
+                    "accum_grad_sec": _accum_end - _accum_start,
+                    "allreduce_sec": _allreduce_time,
+                    "phase_total_sec": _phase_end - _phase_start,
+                    "rank": rank
+                }, "J")
+            # #endregion
             if phase.name in ['Dmain', 'Dboth', 'Dreg']:
                 for _, discriminator in D.discriminators.items():
                     if D_kwargs.backbone_kwargs.cond:
@@ -647,6 +708,19 @@ def training_loop(
         # Update state.
         cur_nimg += batch_size
         batch_idx += 1
+        
+        # #region agent log
+        _iter_end = time.time()
+        if _iter_count < 5 or _iter_count % 10 == 0:
+            _debug_log("training_loop.py:main_loop", f"Training iteration {_iter_count} complete", {
+                "iteration": _iter_count,
+                "total_iter_sec": _iter_end - _iter_start,
+                "cur_nimg": cur_nimg,
+                "batch_idx": batch_idx,
+                "rank": rank
+            }, "L")
+        _iter_count += 1
+        # #endregion
 
         # Execute ADA heuristic.
         if (ada_stats is not None) and (batch_idx % ada_interval == 0):
