@@ -6,12 +6,24 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+"""
+Utility functions for training with modern PyTorch 2.x optimizations.
+
+Includes:
+- Modern DDP (DistributedDataParallel) helpers
+- Gradient synchronization utilities
+- Memory-efficient operations
+- CUDA optimization helpers
+"""
+
 import re
 import contextlib
 import numpy as np
 import torch
+import torch.distributed as dist
 import warnings
 import dnnlib
+from functools import wraps
 
 #----------------------------------------------------------------------------
 # Cached construction of constant tensors. Avoids CPU=>GPU copy when the
@@ -193,6 +205,104 @@ def ddp_sync(module, sync):
     else:
         with module.no_sync():
             yield
+
+#----------------------------------------------------------------------------
+# Modern DDP wrapper with optimizations for PyTorch 2.x
+
+def wrap_ddp(module, device_ids=None, broadcast_buffers=True, find_unused_parameters=False,
+             gradient_as_bucket_view=True, static_graph=False):
+    """
+    Wrap a module with DistributedDataParallel using modern optimizations.
+    
+    Args:
+        module: Module to wrap
+        device_ids: Device IDs for DDP (None for auto-detect)
+        broadcast_buffers: Whether to broadcast buffers each forward pass
+        find_unused_parameters: Detect unused parameters (slower, but needed for some models)
+        gradient_as_bucket_view: Modern optimization - use bucket views for gradients
+        static_graph: Enable static graph optimization (PyTorch 2.x, for fixed models)
+    
+    Returns:
+        DDP-wrapped module
+    """
+    if not dist.is_initialized():
+        return module
+    
+    # Modern DDP options for PyTorch 2.x
+    ddp_kwargs = dict(
+        device_ids=device_ids,
+        broadcast_buffers=broadcast_buffers,
+        find_unused_parameters=find_unused_parameters,
+        gradient_as_bucket_view=gradient_as_bucket_view,
+    )
+    
+    # Static graph optimization for fixed computation graphs (PyTorch 1.11+)
+    if static_graph:
+        ddp_kwargs['static_graph'] = True
+    
+    return torch.nn.parallel.DistributedDataParallel(module, **ddp_kwargs)
+
+#----------------------------------------------------------------------------
+# Efficient gradient all-reduce for manual gradient synchronization
+
+def all_reduce_grads(params, num_gpus, divide=True):
+    """
+    Efficiently synchronize gradients across GPUs using all-reduce.
+    Modern implementation using flat tensor for better performance.
+    
+    Args:
+        params: Iterator of parameters with gradients
+        num_gpus: Number of GPUs in the world
+        divide: Whether to divide by num_gpus after reduction
+    """
+    if num_gpus <= 1 or not dist.is_initialized():
+        return
+    
+    params_with_grads = [p for p in params if p.grad is not None]
+    if not params_with_grads:
+        return
+    
+    # Flatten gradients for efficient all-reduce
+    flat_grads = torch.cat([p.grad.flatten() for p in params_with_grads])
+    dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
+    
+    if divide:
+        flat_grads.div_(num_gpus)
+    
+    # Handle NaN/Inf in gradients
+    nan_to_num(flat_grads, nan=0, posinf=1e5, neginf=-1e5, out=flat_grads)
+    
+    # Unflatten and assign back
+    offset = 0
+    for p in params_with_grads:
+        numel = p.grad.numel()
+        p.grad = flat_grads[offset:offset + numel].view_as(p.grad)
+        offset += numel
+
+#----------------------------------------------------------------------------
+# CUDA memory optimization utilities
+
+def optimize_cuda_memory():
+    """Apply CUDA memory optimizations for training."""
+    if torch.cuda.is_available():
+        # Set memory allocator settings for large models
+        # These reduce memory fragmentation
+        try:
+            torch.cuda.set_per_process_memory_fraction(0.95)  # Use up to 95% of GPU memory
+        except Exception:
+            pass
+        
+        # Enable memory efficient attention if available (PyTorch 2.x)
+        if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+            torch.backends.cuda.enable_flash_sdp(True)
+        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+def empty_cuda_cache():
+    """Empty CUDA cache with synchronization."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 #----------------------------------------------------------------------------
 # Check DistributedDataParallel consistency across processes.

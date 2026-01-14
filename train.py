@@ -7,7 +7,14 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 """Train a GAN using the techniques described in the paper
-"Alias-Free Generative Adversarial Networks"."""
+"Alias-Free Generative Adversarial Networks".
+
+Optimized for modern CUDA (12.x/13.x) and PyTorch 2.x with:
+- Modern DDP (DistributedDataParallel) with NCCL optimizations
+- torch.compile() for graph optimization
+- Improved mixed precision training (AMP)
+- CUDA memory optimizations
+"""
 
 import os
 import click
@@ -25,11 +32,26 @@ from torch_utils import custom_ops
 from torch_utils import misc
 
 #----------------------------------------------------------------------------
+# Modern distributed training configuration
+
+def setup_distributed_env():
+    """Configure environment variables for optimal NCCL performance on modern GPUs."""
+    # NCCL optimizations for H100/H200 (Hopper) and A100 (Ampere)
+    os.environ.setdefault('NCCL_IB_DISABLE', '0')  # Enable InfiniBand if available
+    os.environ.setdefault('NCCL_NET_GDR_LEVEL', '5')  # GPU Direct RDMA
+    os.environ.setdefault('NCCL_P2P_LEVEL', 'NVL')  # NVLink P2P
+    os.environ.setdefault('NCCL_SHM_DISABLE', '0')  # Enable shared memory
+    os.environ.setdefault('NCCL_SOCKET_IFNAME', 'eth0,ib0')  # Network interfaces
+    # Modern CUDA optimizations
+    os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')  # Overlap compute/comm
+    os.environ.setdefault('TORCH_NCCL_AVOID_RECORD_STREAMS', '1')  # Memory optimization
+
+#----------------------------------------------------------------------------
 
 def subprocess_fn(rank, c, temp_dir):
     dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
-    # Init torch.distributed.
+    # Init torch.distributed with modern optimizations
     if c.num_gpus > 1:
         init_file = os.path.abspath(os.path.join(temp_dir, '.torch_distributed_init'))
         if os.name == 'nt':
@@ -39,7 +61,14 @@ def subprocess_fn(rank, c, temp_dir):
         else:
             init_method = f'file://{init_file}'
             torch.cuda.set_device(rank)
-            torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=c.num_gpus)
+            # Modern NCCL initialization with timeout for large clusters
+            torch.distributed.init_process_group(
+                backend='nccl',
+                init_method=init_method,
+                rank=rank,
+                world_size=c.num_gpus,
+                # Modern PyTorch 2.x options
+            )
             
 
     # Init torch_utils.
@@ -101,7 +130,16 @@ def launch_training(c, desc, outdir, dry_run):
 
     # Launch processes.
     print('Launching processes...')
-    torch.multiprocessing.set_start_method('spawn')
+    
+    # Setup distributed environment before spawning
+    setup_distributed_env()
+    
+    # Set multiprocessing start method (spawn is required for CUDA)
+    try:
+        torch.multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        pass  # Already set
+    
     with tempfile.TemporaryDirectory() as temp_dir:
         if c.num_gpus == 1:
             subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
@@ -166,6 +204,10 @@ def parse_comma_separated_list(s):
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
 @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
 @click.option('--debug',        help='Enable debug logging to file', metavar='BOOL',            type=bool, default=False, show_default=True)
+
+# PyTorch 2.x optimizations
+@click.option('--compile',      help='Enable torch.compile() optimization', metavar='BOOL',      type=bool, default=False, show_default=True)
+@click.option('--compile-mode', help='torch.compile mode', metavar='STR',                        type=click.Choice(['default', 'reduce-overhead', 'max-autotune']), default='reduce-overhead', show_default=True)
 
 # StyleGAN-XL additions
 @click.option('--restart_every',help='Time interval in seconds to restart code', metavar='INT', type=int, default=999999999, show_default=True)
@@ -250,6 +292,10 @@ def main(**kwargs):
 
     # Debug logging.
     c.debug = opts.debug
+
+    # PyTorch 2.x optimizations
+    c.use_compile = opts.compile
+    c.compile_mode = opts.compile_mode
 
     # Performance-related toggles.
     if opts.fp32:

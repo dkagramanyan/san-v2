@@ -49,15 +49,23 @@ def _debug_log(location, message, data=None, hypothesis_id=None):
 # #endregion
 
 #----------------------------------------------------------------------------
-# Get CUDA architecture flags for H200/Hopper (sm_90) and A100 (sm_80)
+# Get CUDA architecture flags for modern GPUs (CUDA 12.x/13.x support)
 
 def _get_cuda_arch_flags():
-    """Return CUDA architecture flags targeting Hopper (sm_90) and Ampere (sm_80)."""
+    """
+    Return CUDA architecture flags for modern GPUs.
+    
+    Supports:
+    - Ampere (sm_80, sm_86, sm_87): A100, A10, A40, RTX 30xx
+    - Ada Lovelace (sm_89): RTX 40xx, L40
+    - Hopper (sm_90, sm_90a): H100, H200
+    - Blackwell (sm_100, sm_101): B100, B200 (CUDA 13+)
+    """
     try:
         major, minor = torch.cuda.get_device_capability()
         device_name = torch.cuda.get_device_name()
 
-        # Get additional Hopper-specific info (fixed property name for PyTorch 2.9+)
+        # Get GPU properties
         props = torch.cuda.get_device_properties(0)
         shared_mem = props.shared_memory_per_block
         multiprocessor_count = props.multi_processor_count
@@ -69,6 +77,10 @@ def _get_cuda_arch_flags():
         multiprocessor_count = 0
         total_memory = 0
     
+    # Parse CUDA version
+    cuda_version = torch.version.cuda
+    cuda_major = int(cuda_version.split('.')[0]) if cuda_version else 12
+    
     # #region agent log
     _debug_log("custom_ops.py:_get_cuda_arch_flags", "Detected GPU capability", {
         "major": major,
@@ -79,17 +91,38 @@ def _get_cuda_arch_flags():
         "shared_mem_per_block_kb": shared_mem / 1024,
         "multiprocessor_count": multiprocessor_count,
         "total_memory_gb": total_memory / (1024**3),
-        "cuda_version": torch.version.cuda,
+        "cuda_version": cuda_version,
+        "cuda_major": cuda_major,
         "pytorch_version": torch.__version__
     }, "A")
     # #endregion
     
-    # Always include Hopper (sm_90) for H200 and Ampere (sm_80) for A100
-    arch_flags = [
-        '-gencode=arch=compute_80,code=sm_80',   # A100 (Ampere)
-        '-gencode=arch=compute_90,code=sm_90',   # H100/H200 (Hopper)
-        '-gencode=arch=compute_90,code=compute_90'  # PTX for forward compatibility
-    ]
+    # Build architecture flags based on CUDA version
+    arch_flags = []
+    
+    # Always include Ampere (widely used)
+    arch_flags.append('-gencode=arch=compute_80,code=sm_80')  # A100 (Ampere)
+    
+    # Add Ada Lovelace for RTX 40xx (CUDA 11.8+)
+    if cuda_major >= 11:
+        arch_flags.append('-gencode=arch=compute_89,code=sm_89')  # RTX 40xx, L40
+    
+    # Add Hopper for H100/H200 (CUDA 12+)
+    if cuda_major >= 12:
+        arch_flags.append('-gencode=arch=compute_90,code=sm_90')  # H100/H200 (Hopper)
+        arch_flags.append('-gencode=arch=compute_90a,code=sm_90a')  # H100/H200 with FP8
+    
+    # Add Blackwell for B100/B200 (CUDA 13+)
+    if cuda_major >= 13:
+        arch_flags.append('-gencode=arch=compute_100,code=sm_100')  # B100/B200 (Blackwell)
+    
+    # PTX for forward compatibility with future architectures
+    if cuda_major >= 13:
+        arch_flags.append('-gencode=arch=compute_100,code=compute_100')
+    elif cuda_major >= 12:
+        arch_flags.append('-gencode=arch=compute_90,code=compute_90')
+    else:
+        arch_flags.append('-gencode=arch=compute_80,code=compute_80')
     
     # Add current device's arch explicitly if different
     current_arch = f'-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}'
@@ -98,7 +131,8 @@ def _get_cuda_arch_flags():
     
     # #region agent log
     _debug_log("custom_ops.py:_get_cuda_arch_flags", "Architecture flags selected", {
-        "arch_flags": arch_flags
+        "arch_flags": arch_flags,
+        "cuda_major": cuda_major
     }, "A")
     # #endregion
     
