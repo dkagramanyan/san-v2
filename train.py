@@ -35,9 +35,12 @@ def subprocess_fn(rank, c, temp_dir):
         if os.name == 'nt':
             init_method = 'file:///' + init_file.replace('\\', '/')
             torch.distributed.init_process_group(backend='gloo', init_method=init_method, rank=rank, world_size=c.num_gpus)
+            print(f"Rank {rank} backend = {torch.distributed.get_backend()}", flush=True)
         else:
             init_method = f'file://{init_file}'
+            torch.cuda.set_device(rank)
             torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=c.num_gpus)
+            
 
     # Init torch_utils.
     sync_device = torch.device('cuda', rank) if c.num_gpus > 1 else None
@@ -163,6 +166,7 @@ def parse_comma_separated_list(s):
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
 @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
+@click.option('--debug',       help='Enable debug logging to file',                            is_flag=True)
 
 # StyleGAN-XL additions
 @click.option('--restart_every',help='Time interval in seconds to restart code', metavar='INT', type=int, default=999999999, show_default=True)
@@ -179,9 +183,9 @@ def main(**kwargs):
     opts = dnnlib.EasyDict(kwargs)  # Command line arguments
     c = dnnlib.EasyDict()  # Main config dict.
     c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict())
-    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0, 0.99], eps=1e-8)
-    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0, 0.99], eps=1e-8)
-    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
+    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.0, 0.99], eps=1e-8, fused=True, foreach=False)
+    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.0, 0.99], eps=1e-8, fused=True, foreach=False)
+    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2, persistent_workers=True)
 
     # Training set.
     c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
@@ -248,6 +252,9 @@ def main(**kwargs):
 
     # Restart.
     c.restart_every = opts.restart_every
+
+    # Debug logging.
+    c.debug = opts.debug
 
     # Performance-related toggles.
     if opts.fp32:

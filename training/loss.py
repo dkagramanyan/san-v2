@@ -21,6 +21,29 @@ from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
 import dnnlib
 import legacy
+import time
+import json
+
+# #region agent log
+_DEBUG_LOG_PATH = "/home/dgkagramanyan/.cursor/debug.log"
+_loss_call_count = 0
+
+def _debug_log(location, message, data=None, hypothesis_id=None):
+    """Write debug info to NDJSON log file."""
+    try:
+        entry = {
+            "timestamp": time.time() * 1000,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "sessionId": "cuda-kernel-debug",
+            "hypothesisId": hypothesis_id or "general"
+        }
+        with open(_DEBUG_LOG_PATH, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except Exception:
+        pass
+# #endregion
 
 from pg_modules.blocks import Interpolate
 import timm
@@ -83,6 +106,22 @@ class ProjectedGANLoss(Loss):
         return self.D(img, c, flg_train=flg_train)
 
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg):
+        # #region agent log
+        global _loss_call_count
+        _loss_call_count += 1
+        _phase_start = time.time()
+        _print_timing = _loss_call_count <= 10  # Print timing for first 10 calls
+        if _print_timing:
+            print(f'[TIMING] loss.accumulate_gradients phase={phase} call={_loss_call_count} START', flush=True)
+            _debug_log("loss.py:accumulate_gradients", f"Phase {phase} started", {
+                "phase": phase,
+                "call_count": _loss_call_count,
+                "gen_z_shape": list(gen_z.shape),
+                "real_img_shape": list(real_img.shape) if real_img is not None else None,
+                "cur_nimg": cur_nimg
+            }, "N")
+        # #endregion
+        
         assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
         do_Gmain = (phase in ['Gmain', 'Gboth'])
         do_Dmain = (phase in ['Dmain', 'Dboth'])
@@ -101,8 +140,37 @@ class ProjectedGANLoss(Loss):
                     getattr(self.G.synthesis, name).requires_grad_(name in self.G.head_layer_names)
 
             with torch.autograd.profiler.record_function('Gmain_forward'):
+                # #region agent log
+                if _print_timing:
+                    torch.cuda.synchronize()  # Sync for accurate timing
+                _run_g_start = time.time()
+                # #endregion
                 gen_img, _gen_ws = self.run_G(gen_z, gen_c)
+                # #region agent log
+                if _print_timing:
+                    torch.cuda.synchronize()  # Sync for accurate timing
+                _run_g_time = time.time() - _run_g_start
+                if _print_timing:
+                    print(f'[TIMING] Gmain run_G: {_run_g_time:.3f}s gen_img_shape={list(gen_img.shape)}', flush=True)
+                    _debug_log("loss.py:accumulate_gradients", "Gmain run_G complete", {
+                        "call_count": _loss_call_count,
+                        "run_g_sec": _run_g_time,
+                        "gen_img_shape": list(gen_img.shape)
+                    }, "N")
+                _run_d_start = time.time()
+                # #endregion
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
+                # #region agent log
+                if _print_timing:
+                    torch.cuda.synchronize()
+                _run_d_time = time.time() - _run_d_start
+                if _print_timing:
+                    print(f'[TIMING] Gmain run_D: {_run_d_time:.3f}s', flush=True)
+                    _debug_log("loss.py:accumulate_gradients", "Gmain run_D complete", {
+                        "call_count": _loss_call_count,
+                        "run_d_sec": _run_d_time
+                    }, "N")
+                # #endregion
 
                 loss_Gmain = sum([(-l).mean() for l in gen_logits])
                 gen_logits = torch.cat(gen_logits)
@@ -118,7 +186,16 @@ class ProjectedGANLoss(Loss):
                 training_stats.report('Loss/G/loss', loss_Gmain)
 
             with torch.autograd.profiler.record_function('Gmain_backward'):
+                # #region agent log
+                _gmain_bwd_start = time.time()
+                # #endregion
                 loss_Gmain.backward()
+                # #region agent log
+                _gmain_bwd_time = time.time() - _gmain_bwd_start
+                _phase_total = time.time() - _phase_start
+                if _print_timing:
+                    print(f'[TIMING] Gmain backward: {_gmain_bwd_time:.3f}s PHASE_TOTAL={_phase_total:.3f}s', flush=True)
+                # #endregion
 
         # Gpl: Apply path length regularization.
         start_plreg = (cur_nimg >= 1e6)
@@ -142,8 +219,37 @@ class ProjectedGANLoss(Loss):
         # Dmain: Minimize logits for generated images.
         if do_Dmain:
             with torch.autograd.profiler.record_function('Dgen_forward'):
+                # #region agent log
+                if _print_timing:
+                    torch.cuda.synchronize()
+                _dgen_g_start = time.time()
+                # #endregion
                 gen_img, _gen_ws = self.run_G(gen_z, gen_c, update_emas=True)
+                # #region agent log
+                if _print_timing:
+                    torch.cuda.synchronize()
+                _dgen_g_time = time.time() - _dgen_g_start
+                if _print_timing:
+                    print(f'[TIMING] Dmain run_G: {_dgen_g_time:.3f}s', flush=True)
+                    _debug_log("loss.py:accumulate_gradients", "Dmain run_G complete", {
+                        "call_count": _loss_call_count,
+                        "run_g_sec": _dgen_g_time,
+                        "gen_img_shape": list(gen_img.shape)
+                    }, "N")
+                _dgen_d_start = time.time()
+                # #endregion
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma, flg_train=True)
+                # #region agent log
+                if _print_timing:
+                    torch.cuda.synchronize()
+                _dgen_d_time = time.time() - _dgen_d_start
+                if _print_timing:
+                    print(f'[TIMING] Dmain run_D(gen): {_dgen_d_time:.3f}s', flush=True)
+                    _debug_log("loss.py:accumulate_gradients", "Dmain run_D (gen) complete", {
+                        "call_count": _loss_call_count,
+                        "run_d_sec": _dgen_d_time
+                    }, "N")
+                # #endregion
                 gen_logits_fun, gen_logits_dir = gen_logits
                 loss_Dgen = []
                 for l_fun, l_dir in zip(gen_logits_fun, gen_logits_dir):
@@ -157,13 +263,41 @@ class ProjectedGANLoss(Loss):
                 training_stats.report('Loss/signs/fake', gen_logits_fun.sign())
 
             with torch.autograd.profiler.record_function('Dgen_backward'):
+                # #region agent log
+                _dgen_bwd_start = time.time()
+                # #endregion
                 loss_Dgen.backward()
+                # #region agent log
+                _dgen_bwd_time = time.time() - _dgen_bwd_start
+                if _print_timing:
+                    print(f'[TIMING] Dmain Dgen backward: {_dgen_bwd_time:.3f}s', flush=True)
+                    _debug_log("loss.py:accumulate_gradients", "Dmain Dgen backward complete", {
+                        "call_count": _loss_call_count,
+                        "backward_sec": _dgen_bwd_time
+                    }, "N")
+                # #endregion
 
             # Dmain: Maximize logits for real images.
             name = 'Dreal'
             with torch.autograd.profiler.record_function(name + '_forward'):
+                # #region agent log
+                if _print_timing:
+                    torch.cuda.synchronize()
+                _dreal_start = time.time()
+                # #endregion
                 real_img_tmp = real_img.detach().requires_grad_(False)
                 real_logits = self.run_D(real_img_tmp, real_c, blur_sigma=blur_sigma, flg_train=True)
+                # #region agent log
+                if _print_timing:
+                    torch.cuda.synchronize()
+                _dreal_time = time.time() - _dreal_start
+                if _print_timing:
+                    print(f'[TIMING] Dmain run_D(real): {_dreal_time:.3f}s', flush=True)
+                    _debug_log("loss.py:accumulate_gradients", "Dmain run_D (real) complete", {
+                        "call_count": _loss_call_count,
+                        "run_d_real_sec": _dreal_time
+                    }, "N")
+                # #endregion
                 real_logits_fun, real_logits_dir = real_logits
                 loss_Dreal = []
                 for l_fun, l_dir in zip(real_logits_fun, real_logits_dir):
@@ -177,4 +311,18 @@ class ProjectedGANLoss(Loss):
                 training_stats.report('Loss/signs/real', real_logits_fun.sign())
                 training_stats.report('Loss/D/loss', loss_Dgen + loss_Dreal)
             with torch.autograd.profiler.record_function(name + '_backward'):
+                # #region agent log
+                _dreal_bwd_start = time.time()
+                # #endregion
                 loss_Dreal.backward()
+                # #region agent log
+                _dreal_bwd_time = time.time() - _dreal_bwd_start
+                _phase_total = time.time() - _phase_start
+                if _print_timing:
+                    print(f'[TIMING] Dmain Dreal backward: {_dreal_bwd_time:.3f}s PHASE_TOTAL={_phase_total:.3f}s', flush=True)
+                    _debug_log("loss.py:accumulate_gradients", "Dmain Dreal backward complete", {
+                        "call_count": _loss_call_count,
+                        "backward_sec": _dreal_bwd_time,
+                        "phase_total_sec": _phase_total
+                    }, "N")
+                # #endregion

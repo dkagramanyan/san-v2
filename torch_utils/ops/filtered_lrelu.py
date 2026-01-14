@@ -10,6 +10,8 @@ import os
 import numpy as np
 import torch
 import warnings
+import time
+import json
 
 from .. import custom_ops
 from .. import misc
@@ -18,11 +20,38 @@ from . import bias_act
 
 #----------------------------------------------------------------------------
 
+# #region agent log
+_DEBUG_LOG_PATH = "/home/dgkagramanyan/.cursor/debug.log"
+_kernel_call_count = 0
+_kernel_config_times = {}
+
+def _debug_log(location, message, data=None, hypothesis_id=None):
+    """Write debug info to NDJSON log file for kernel execution diagnostics."""
+    try:
+        entry = {
+            "timestamp": time.time() * 1000,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "sessionId": "cuda-kernel-debug",
+            "hypothesisId": hypothesis_id or "general"
+        }
+        with open(_DEBUG_LOG_PATH, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except Exception:
+        pass
+# #endregion
+
 _plugin = None
 
 def _init():
     global _plugin
     if _plugin is None:
+        # #region agent log
+        init_start = time.time()
+        _debug_log("filtered_lrelu.py:_init", "Initializing filtered_lrelu plugin", {}, "C")
+        # #endregion
+        
         _plugin = custom_ops.get_plugin(
             module_name='filtered_lrelu_plugin',
             sources=['filtered_lrelu.cpp', 'filtered_lrelu_wr.cu', 'filtered_lrelu_rd.cu', 'filtered_lrelu_ns.cu'],
@@ -30,6 +59,12 @@ def _init():
             source_dir=os.path.dirname(__file__),
             extra_cuda_cflags=['--use_fast_math'],
         )
+        
+        # #region agent log
+        _debug_log("filtered_lrelu.py:_init", "Plugin initialized", {
+            "init_time_sec": time.time() - init_start
+        }, "C")
+        # #endregion
     return True
 
 def _get_filter_size(f):
@@ -173,12 +208,29 @@ def _filtered_lrelu_cuda(up=1, down=1, padding=0, gain=np.sqrt(2), slope=0.2, cl
     key = (up, down, px0, px1, py0, py1, gain, slope, clamp, flip_filter)
     if key in _filtered_lrelu_cuda_cache:
         return _filtered_lrelu_cuda_cache[key]
+    
+    # #region agent log
+    _debug_log("filtered_lrelu.py:_filtered_lrelu_cuda", "Creating new kernel config class", {
+        "key": str(key),
+        "up": up,
+        "down": down,
+        "padding": [px0, px1, py0, py1]
+    }, "C")
+    # #endregion
 
     # Forward op.
     class FilteredLReluCuda(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, fu, fd, b, si, sx, sy): # pylint: disable=arguments-differ
+            global _kernel_call_count, _kernel_config_times
             assert isinstance(x, torch.Tensor) and x.ndim == 4
+            
+            # #region agent log
+            _kernel_call_count += 1
+            config_key = f"{x.shape}_{up}_{down}"
+            kernel_start = time.time()
+            _timings = {}
+            # #endregion
 
             # Replace empty up/downsample kernels with full 1x1 kernels (faster than separable).
             if fu is None:
@@ -205,17 +257,30 @@ def _filtered_lrelu_cuda(up=1, down=1, padding=0, gain=np.sqrt(2), slope=0.2, cl
             # Construct internal sign tensor only if gradients are needed.
             write_signs = (si.numel() == 0) and (x.requires_grad or b.requires_grad)
 
+            # #region agent log
+            torch.cuda.synchronize()
+            _t0_contig = time.time()
+            # #endregion
+            
             # Warn if input storage strides are not in decreasing order due to e.g. channels-last layout.
             x = x.contiguous()
             strides = [x.stride(i) for i in range(x.ndim) if x.size(i) > 1]
             if any(a < b for a, b in zip(strides[:-1], strides[1:])):
                 warnings.warn("low-performance memory layout detected in filtered_lrelu input", RuntimeWarning)
 
+            # #region agent log
+            torch.cuda.synchronize()
+            _timings['contiguous'] = time.time() - _t0_contig
+            _t0_kernel = time.time()
+            # #endregion
+
             # Call C++/Cuda plugin if datatype is supported.
-            if x.dtype in [torch.float16, torch.float32]:
-                if torch.cuda.current_stream(x.device) != torch.cuda.default_stream(x.device):
-                    warnings.warn("filtered_lrelu called with non-default cuda stream but concurrent execution is not supported", RuntimeWarning)
+            if x.dtype in [torch.float16, torch.float32, torch.bfloat16]:
                 y, so, return_code = _plugin.filtered_lrelu(x, fu, fd, b, si, up, down, px0, px1, py0, py1, sx, sy, gain, slope, clamp, flip_filter, write_signs)
+                # #region agent log
+                torch.cuda.synchronize()
+                _timings['cuda_kernel'] = time.time() - _t0_kernel
+                # #endregion
             else:
                 return_code = -1
 
@@ -223,17 +288,91 @@ def _filtered_lrelu_cuda(up=1, down=1, padding=0, gain=np.sqrt(2), slope=0.2, cl
             # only the bit-packed sign tensor is retained for gradient computation.
             if return_code < 0:
                 warnings.warn("filtered_lrelu called with parameters that have no optimized CUDA kernel, using generic fallback", RuntimeWarning)
+                
+                # #region agent log
+                _t0_fallback = time.time()
+                # #endregion
 
                 y = x.add(b.unsqueeze(-1).unsqueeze(-1)) # Add bias.
+                
+                # #region agent log
+                torch.cuda.synchronize()
+                _timings['fallback_bias'] = time.time() - _t0_fallback
+                _t0_up = time.time()
+                # #endregion
+                
                 y = upfirdn2d.upfirdn2d(x=y, f=fu, up=up, padding=[px0, px1, py0, py1], gain=up**2, flip_filter=flip_filter) # Upsample.
+                
+                # #region agent log
+                torch.cuda.synchronize()
+                _timings['fallback_upsample'] = time.time() - _t0_up
+                _t0_act = time.time()
+                # #endregion
+                
                 so = _plugin.filtered_lrelu_act_(y, si, sx, sy, gain, slope, clamp, write_signs) # Activation function and sign handling. Modifies y in-place.
+                
+                # #region agent log
+                torch.cuda.synchronize()
+                _timings['fallback_activation'] = time.time() - _t0_act
+                _t0_down = time.time()
+                # #endregion
+                
                 y = upfirdn2d.upfirdn2d(x=y, f=fd, down=down, flip_filter=flip_filter) # Downsample.
+                
+                # #region agent log
+                torch.cuda.synchronize()
+                _timings['fallback_downsample'] = time.time() - _t0_down
+                # #endregion
 
             # Prepare for gradient computation.
             ctx.save_for_backward(fu, fd, (si if si.numel() else so))
             ctx.x_shape = x.shape
             ctx.y_shape = y.shape
             ctx.s_ofs = sx, sy
+            
+            # #region agent log
+            torch.cuda.synchronize()
+            kernel_time = time.time() - kernel_start
+            _timings['total'] = kernel_time
+            
+            # Log EVERY call to identify where time is spent
+            if _kernel_call_count <= 200:  # Log first 200 kernel calls
+                _debug_log("filtered_lrelu.py:forward", "Kernel execution timing", {
+                    "config_key": config_key,
+                    "call_count": _kernel_call_count,
+                    "x_shape": list(x.shape),
+                    "y_shape": list(y.shape),
+                    "up": up,
+                    "down": down,
+                    "return_code": return_code,
+                    "timings": _timings,
+                    "used_fallback": return_code < 0,
+                    "tensor_bytes_gb": (x.numel() * x.element_size()) / (1024**3)
+                }, "B")
+            
+            # Log only if kernel takes unusually long (>0.5 sec) - indicates JIT compilation
+            if kernel_time > 0.5:
+                _debug_log("filtered_lrelu.py:forward", "SLOW kernel execution detected!", {
+                    "config_key": config_key,
+                    "kernel_time_sec": kernel_time,
+                    "x_shape": list(x.shape),
+                    "y_shape": list(y.shape),
+                    "return_code": return_code if 'return_code' in dir() else "N/A",
+                    "call_count": _kernel_call_count,
+                    "timings": _timings
+                }, "C")
+            
+            # Track first call to each config
+            if config_key not in _kernel_config_times:
+                _kernel_config_times[config_key] = kernel_time
+                _debug_log("filtered_lrelu.py:forward", "First call to kernel config", {
+                    "config_key": config_key,
+                    "kernel_time_sec": kernel_time,
+                    "call_count": _kernel_call_count,
+                    "timings": _timings
+                }, "D")
+            # #endregion
+            
             return y
 
         @staticmethod
