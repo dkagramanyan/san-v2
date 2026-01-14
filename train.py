@@ -139,7 +139,7 @@ def parse_comma_separated_list(s):
 @click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'fastgan']), required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
-@click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
+@click.option('--batch-gpu',    help='Batch size per GPU (total batch = batch-gpu * gpus)', metavar='INT', type=click.IntRange(min=1), required=True)
 
 # Optional features.
 @click.option('--cond',         help='Train conditional model', metavar='BOOL',                 type=bool, default=False, show_default=True)
@@ -148,7 +148,6 @@ def parse_comma_separated_list(s):
 @click.option('--freezed',      help='Freeze first layers of D', metavar='INT',                 type=click.IntRange(min=0), default=0, show_default=True)
 
 # Misc hyperparameters.
-@click.option('--batch-gpu',    help='Limit batch size per GPU', metavar='INT',                 type=click.IntRange(min=1))
 @click.option('--cbase',        help='Capacity multiplier', metavar='INT',                      type=click.IntRange(min=1), default=32768, show_default=True)
 @click.option('--cmax',         help='Max. feature maps', metavar='INT',                        type=click.IntRange(min=1), default=512, show_default=True)
 @click.option('--glr',          help='G learning rate  [default: varies]', metavar='FLOAT',     type=click.FloatRange(min=0))
@@ -166,7 +165,7 @@ def parse_comma_separated_list(s):
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
 @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
-@click.option('--debug',       help='Enable debug logging to file',                            is_flag=True)
+@click.option('--debug',        help='Enable debug logging to file', metavar='BOOL',            type=bool, default=False, show_default=True)
 
 # StyleGAN-XL additions
 @click.option('--restart_every',help='Time interval in seconds to restart code', metavar='INT', type=int, default=999999999, show_default=True)
@@ -196,8 +195,8 @@ def main(**kwargs):
 
     # Hyperparameters & settings.
     c.num_gpus = opts.gpus
-    c.batch_size = opts.batch
-    c.batch_gpu = opts.batch_gpu or opts.batch // opts.gpus
+    c.batch_gpu = opts.batch_gpu
+    c.batch_size = c.batch_gpu * c.num_gpus  # Total batch = batch_gpu * num_gpus
     c.G_kwargs.channel_base = opts.cbase
     c.G_kwargs.channel_max = opts.cmax
     c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
@@ -210,10 +209,6 @@ def main(**kwargs):
     c.data_loader_kwargs.num_workers = opts.workers
 
     # Sanity checks.
-    if c.batch_size % c.num_gpus != 0:
-        raise click.ClickException('--batch must be a multiple of --gpus')
-    if c.batch_size % (c.num_gpus * c.batch_gpu) != 0:
-        raise click.ClickException('--batch must be a multiple of --gpus times --batch-gpu')
     if any(not metric_main.is_valid_metric(metric) for metric in c.metrics):
         raise click.ClickException('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))
 
