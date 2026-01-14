@@ -361,6 +361,246 @@ def benchmark_custom_ops():
         print(f"  ✓ CUDA implementation is {speedup:.1f}x faster")
 
 
+def benchmark_conv2d_1x1():
+    """
+    Benchmark Conv2d with 1x1 kernel - tests the grouped convolution issue
+    that was slow on H200 Hopper architecture.
+    
+    This tests the pattern used in StyleGAN3's modulated_conv2d where
+    grouped convolution is used for per-sample style modulation.
+    """
+    print("\n" + "=" * 70)
+    print("CONV2D 1x1 BENCHMARK (Grouped Conv vs BMM)")
+    print("Tests the fix for H200 Hopper grouped convolution slowness")
+    print("=" * 70)
+    
+    device = torch.device('cuda:0')
+    warmup = 5
+    iterations = 20
+    
+    # Test configurations matching StyleGAN3 modulated_conv2d usage
+    test_configs = [
+        {'batch': 64, 'channels': 512, 'spatial': 36, 'desc': 'Small (36x36)'},
+        {'batch': 64, 'channels': 1024, 'spatial': 64, 'desc': 'Medium (64x64)'},
+        {'batch': 64, 'channels': 2048, 'spatial': 84, 'desc': 'Large (84x84)'},
+        {'batch': 64, 'channels': 2048, 'spatial': 148, 'desc': 'XLarge (148x148) - was 119s before fix'},
+    ]
+    
+    for config in test_configs:
+        batch = config['batch']
+        channels = config['channels']
+        spatial = config['spatial']
+        desc = config['desc']
+        
+        print(f"\n--- {desc}: [{batch}, {channels}, {spatial}, {spatial}] ---")
+        
+        for dtype, dtype_name in [(torch.float32, 'fp32'), (torch.float16, 'fp16')]:
+            try:
+                # Input tensor
+                x = torch.randn(batch, channels, spatial, spatial, device=device, dtype=dtype)
+                
+                # Test 1: Grouped Convolution (original slow path)
+                # Reshape to [1, batch*channels, H, W] with groups=batch
+                x_grouped = x.reshape(1, -1, spatial, spatial)
+                conv_grouped = torch.nn.Conv2d(
+                    in_channels=channels,
+                    out_channels=channels,
+                    kernel_size=1,
+                    groups=1,  # Note: actual grouped conv uses groups=batch, but that requires special weight shape
+                    bias=False
+                ).to(device=device, dtype=dtype)
+                
+                # Warmup
+                for _ in range(warmup):
+                    with torch.no_grad():
+                        _ = conv_grouped(x)
+                torch.cuda.synchronize()
+                
+                # Benchmark grouped conv
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                for _ in range(iterations):
+                    with torch.no_grad():
+                        _ = conv_grouped(x)
+                torch.cuda.synchronize()
+                conv_time = (time.perf_counter() - start) / iterations * 1000
+                
+                # Test 2: BMM (new fast path)
+                w = torch.randn(batch, channels, channels, device=device, dtype=dtype)
+                x_flat = x.reshape(batch, channels, -1)  # [B, C, H*W]
+                
+                # Warmup
+                for _ in range(warmup):
+                    with torch.no_grad():
+                        _ = torch.bmm(w, x_flat)
+                torch.cuda.synchronize()
+                
+                # Benchmark BMM
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                for _ in range(iterations):
+                    with torch.no_grad():
+                        _ = torch.bmm(w, x_flat)
+                torch.cuda.synchronize()
+                bmm_time = (time.perf_counter() - start) / iterations * 1000
+                
+                speedup = conv_time / bmm_time if bmm_time > 0 else 0
+                print(f"  {dtype_name}: Conv={conv_time:>8.2f}ms, BMM={bmm_time:>8.2f}ms, BMM speedup={speedup:>5.1f}x")
+                
+            except Exception as e:
+                print(f"  {dtype_name}: ERROR - {e}")
+
+
+def benchmark_conv3d():
+    """
+    Benchmark Conv3d with various configurations.
+    Tests for potential dtype regressions (e.g., bfloat16 slower than float32).
+    """
+    print("\n" + "=" * 70)
+    print("CONV3D BENCHMARK")
+    print("Tests for dtype performance regressions")
+    print("=" * 70)
+    
+    device = torch.device('cuda:0')
+    warmup = 3
+    iterations = 10
+    
+    # Configuration matching Qwen3-VL vision encoder patch_embed
+    print("\n--- Conv3d: [9216, 3, 2, 16, 16] -> [9216, 1024, 1, 1, 1] ---")
+    print("    (Simulates 64 images × 144 patches batch)")
+    
+    results = {}
+    
+    for dtype, dtype_name in [
+        (torch.float32, 'float32'),
+        (torch.float16, 'float16'),
+        (torch.bfloat16, 'bfloat16'),
+    ]:
+        try:
+            conv = torch.nn.Conv3d(
+                in_channels=3,
+                out_channels=1024,
+                kernel_size=(2, 16, 16),
+                stride=(2, 16, 16),
+                bias=True
+            ).to(device=device, dtype=dtype)
+            
+            x = torch.randn(9216, 3, 2, 16, 16, dtype=dtype, device=device)
+            
+            # Warmup
+            for _ in range(warmup):
+                with torch.no_grad():
+                    _ = conv(x)
+                torch.cuda.synchronize()
+            
+            # Benchmark
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            for _ in range(iterations):
+                with torch.no_grad():
+                    _ = conv(x)
+                torch.cuda.synchronize()
+            elapsed = (time.perf_counter() - start) / iterations * 1000
+            
+            results[dtype_name] = elapsed
+            print(f"  {dtype_name:>10}: {elapsed:>10.2f} ms")
+            
+        except Exception as e:
+            print(f"  {dtype_name:>10}: ERROR - {e}")
+    
+    # Check for regressions
+    if 'float32' in results and 'bfloat16' in results:
+        ratio = results['bfloat16'] / results['float32']
+        print(f"\n  Regression check (bfloat16/float32): {ratio:.2f}x")
+        if ratio > 2.0:
+            print(f"  ⚠ WARNING: bfloat16 is {ratio:.0f}x slower than float32!")
+        elif ratio > 1.0:
+            print(f"  ℹ bfloat16 is {ratio:.1f}x slower than float32")
+        else:
+            print(f"  ✓ bfloat16 is {1/ratio:.1f}x faster than float32")
+
+
+def benchmark_grouped_conv_patterns():
+    """
+    Benchmark different grouped convolution patterns to identify potential
+    performance issues on Hopper architecture.
+    
+    This specifically tests the pattern that was slow in StyleGAN3's modulated_conv2d:
+    - High group count (batch_size)
+    - Large channel count
+    - 1x1 kernel
+    """
+    print("\n" + "=" * 70)
+    print("GROUPED CONVOLUTION PATTERN BENCHMARK")
+    print("Identifies potential cuDNN algorithm selection issues on Hopper")
+    print("=" * 70)
+    
+    device = torch.device('cuda:0')
+    warmup = 3
+    iterations = 10
+    
+    # Test the exact pattern that was slow: [1, batch*channels, H, W] with groups=batch
+    test_configs = [
+        {'groups': 8, 'channels_per_group': 512, 'spatial': 64, 'kernel': 1},
+        {'groups': 16, 'channels_per_group': 512, 'spatial': 64, 'kernel': 1},
+        {'groups': 32, 'channels_per_group': 512, 'spatial': 64, 'kernel': 1},
+        {'groups': 64, 'channels_per_group': 512, 'spatial': 64, 'kernel': 1},
+        {'groups': 64, 'channels_per_group': 1024, 'spatial': 84, 'kernel': 1},
+        {'groups': 64, 'channels_per_group': 2048, 'spatial': 84, 'kernel': 1},
+        {'groups': 64, 'channels_per_group': 2048, 'spatial': 148, 'kernel': 1},  # The problematic case
+    ]
+    
+    for config in test_configs:
+        groups = config['groups']
+        cpg = config['channels_per_group']
+        spatial = config['spatial']
+        kernel = config['kernel']
+        total_channels = groups * cpg
+        
+        desc = f"groups={groups}, ch/grp={cpg}, spatial={spatial}x{spatial}"
+        print(f"\n--- {desc} ---")
+        
+        try:
+            # Create input: [1, groups*channels_per_group, H, W]
+            x = torch.randn(1, total_channels, spatial, spatial, device=device, dtype=torch.float16)
+            
+            # Create grouped conv
+            conv = torch.nn.Conv2d(
+                in_channels=total_channels,
+                out_channels=total_channels,
+                kernel_size=kernel,
+                groups=groups,
+                bias=False
+            ).to(device=device, dtype=torch.float16)
+            
+            # Warmup
+            for _ in range(warmup):
+                with torch.no_grad():
+                    _ = conv(x)
+                torch.cuda.synchronize()
+            
+            # Benchmark
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            for _ in range(iterations):
+                with torch.no_grad():
+                    _ = conv(x)
+                torch.cuda.synchronize()
+            elapsed = (time.perf_counter() - start) / iterations * 1000
+            
+            # Calculate expected vs actual
+            flops = 2 * total_channels * cpg * kernel * kernel * spatial * spatial
+            gflops = flops / 1e9
+            
+            print(f"  Time: {elapsed:>10.2f} ms, GFLOPs: {gflops:.1f}, TFLOP/s: {gflops/elapsed:.2f}")
+            
+            if elapsed > 1000:  # More than 1 second
+                print(f"  ⚠ WARNING: This pattern is very slow! Consider using BMM for 1x1 kernels.")
+            
+        except Exception as e:
+            print(f"  ERROR - {e}")
+
+
 def test_gradient_correctness():
     """Test that gradients flow correctly through custom ops."""
     print("\n" + "-" * 50)
@@ -457,6 +697,11 @@ def main():
     
     # Run performance benchmarks
     benchmark_custom_ops()
+    
+    # Run Conv2d/Conv3d benchmarks (tests for Hopper-specific issues)
+    benchmark_conv2d_1x1()
+    benchmark_conv3d()
+    benchmark_grouped_conv_patterns()
     
     # Summary
     print("\n" + "=" * 70)
