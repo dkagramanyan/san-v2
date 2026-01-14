@@ -25,6 +25,31 @@ from torch_utils.ops import filtered_lrelu
 from torch_utils.ops import bias_act
 import dnnlib
 import legacy
+import time
+import json
+
+# #region agent log
+_DEBUG_LOG_PATH = "/home/dgkagramanyan/.cursor/debug.log"
+_synth_call_count = 0
+_LAYER_TIMING_ENABLED = True  # Set to False to disable per-layer timing
+_MAX_TIMING_CALLS = 10  # Track first N synthesis calls
+
+def _debug_log(location, message, data=None, hypothesis_id=None):
+    """Write debug info to NDJSON log file."""
+    try:
+        entry = {
+            "timestamp": time.time() * 1000,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "sessionId": "generator-profile",
+            "hypothesisId": hypothesis_id or "general"
+        }
+        with open(_DEBUG_LOG_PATH, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except Exception:
+        pass
+# #endregion
 
 #----------------------------------------------------------------------------
 
@@ -67,6 +92,21 @@ def modulated_conv2d(
     x = x.reshape(1, -1, *x.shape[2:])
     w = w.reshape(-1, in_channels, kh, kw)
 
+    # #region agent log
+    # Log grouped conv details on first few calls (helps identify perf issues)
+    if _LAYER_TIMING_ENABLED and _synth_call_count <= 3:
+        _debug_log("modulated_conv2d", "Grouped conv params", {
+            "groups": batch_size,
+            "x_shape_before": list(x.shape),
+            "w_shape": list(w.shape),
+            "in_channels": in_channels,
+            "out_channels": out_channels,
+            "kernel_size": [kh, kw],
+            "padding": padding,
+            "x_dtype": str(x.dtype),
+            "w_dtype": str(w.dtype)
+        }, "A")
+    # #endregion
     x = conv2d_gradfix.conv2d(input=x, weight=w.to(x.dtype), padding=padding, groups=batch_size)
     x = x.reshape(batch_size, -1, *x.shape[2:])
     return x
@@ -231,6 +271,12 @@ class SynthesisInput(torch.nn.Module):
         self.register_buffer('phases', phases)
 
     def forward(self, w):
+        # #region agent log
+        if _LAYER_TIMING_ENABLED and _synth_call_count <= 3:
+            torch.cuda.synchronize()
+            _input_start = time.time()
+        # #endregion
+        
         # Introduce batch dimension.
         transforms = self.transform.unsqueeze(0) # [batch, row, col]
         freqs = self.freqs.unsqueeze(0) # [batch, channel, xy]
@@ -277,6 +323,19 @@ class SynthesisInput(torch.nn.Module):
         # Ensure correct shape.
         x = x.permute(0, 3, 1, 2) # [batch, channel, height, width]
         # misc.assert_shape(x, [w.shape[0], self.channels, int(self.size[1]), int(self.size[0])])
+        
+        # #region agent log
+        if _LAYER_TIMING_ENABLED and _synth_call_count <= 3:
+            torch.cuda.synchronize()
+            _input_time = time.time() - _input_start
+            _debug_log("SynthesisInput.forward", f"SynthesisInput timing", {
+                "time_sec": _input_time,
+                "batch_size": w.shape[0],
+                "channels": self.channels,
+                "size": list(self.size),
+                "sampling_rate": self.sampling_rate
+            }, "E")
+        # #endregion
         return x.contiguous()
 
     def extra_repr(self):
@@ -408,14 +467,62 @@ class SynthesisLayer(torch.nn.Module):
 
         # Execute modulated conv2d.
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+        # #region agent log
+        _do_layer_timing = _LAYER_TIMING_ENABLED and _synth_call_count <= 10
+        if _do_layer_timing:
+            torch.cuda.synchronize()
+            _t0_conv = time.time()
+            _input_shape = list(x.shape)
+            _input_bytes_gb = (x.numel() * x.element_size()) / (1024**3)
+        # #endregion
         x = modulated_conv2d(x=x.to(dtype), w=self.weight, s=styles,
             padding=self.conv_kernel-1, demodulate=(not self.is_torgb), input_gain=input_gain)
+        # #region agent log
+        if _do_layer_timing:
+            torch.cuda.synchronize()
+            _t_conv = time.time() - _t0_conv
+            _conv_output_shape = list(x.shape)
+            _t0_lrelu = time.time()
+        # #endregion
 
         # Execute bias, filtered leaky ReLU, and clamping.
         gain = 1 if self.is_torgb else np.sqrt(2)
         slope = 1 if self.is_torgb else 0.2
         x = filtered_lrelu.filtered_lrelu(x=x, fu=self.up_filter, fd=self.down_filter, b=self.bias.to(x.dtype),
             up=self.up_factor, down=self.down_factor, padding=self.padding, gain=gain, slope=slope, clamp=self.conv_clamp)
+        # #region agent log
+        if _do_layer_timing:
+            torch.cuda.synchronize()
+            _t_lrelu = time.time() - _t0_lrelu
+            _lrelu_output_shape = list(x.shape)
+            _lrelu_bytes_gb = (x.numel() * x.element_size()) / (1024**3)
+            
+            # Log detailed timing for each layer
+            _debug_log("SynthesisLayer.forward", f"Layer timing out_size={list(self.out_size)}", {
+                "out_size": list(self.out_size),
+                "in_channels": self.in_channels,
+                "out_channels": self.out_channels,
+                "up_factor": self.up_factor,
+                "down_factor": self.down_factor,
+                "is_torgb": self.is_torgb,
+                "use_fp16": self.use_fp16,
+                "actual_dtype": str(dtype),
+                "input_shape": _input_shape,
+                "input_bytes_gb": _input_bytes_gb,
+                "conv_output_shape": _conv_output_shape,
+                "lrelu_output_shape": _lrelu_output_shape,
+                "lrelu_bytes_gb": _lrelu_bytes_gb,
+                "modulated_conv2d_sec": _t_conv,
+                "filtered_lrelu_sec": _t_lrelu,
+                "total_layer_sec": _t_conv + _t_lrelu,
+                "batch_size": x.shape[0],
+                "synth_call_count": _synth_call_count
+            }, "B")
+            
+            # Also print to console for immediate visibility
+            if _t_lrelu > 1.0 or _t_conv > 1.0:
+                print(f"[SLOW LAYER] out_size={list(self.out_size)} conv={_t_conv:.3f}s lrelu={_t_lrelu:.3f}s total={_t_conv+_t_lrelu:.3f}s", flush=True)
+        # #endregion
 
         # Ensure correct shape and dtype.
         # misc.assert_shape(x, [None, self.out_channels, int(self.out_size[1]), int(self.out_size[0])])
@@ -541,17 +648,70 @@ class SynthesisNetwork(torch.nn.Module):
         misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
         ws = ws.to(torch.float32).unbind(dim=1)
 
+        # #region agent log
+        global _synth_call_count
+        _synth_call_count += 1
+        _do_timing = _LAYER_TIMING_ENABLED and _synth_call_count <= _MAX_TIMING_CALLS
+        if _do_timing:
+            _synth_start = time.time()
+            _layer_times = {}
+            print(f'[G PROFILE] SynthesisNetwork call={_synth_call_count} STARTING batch_size={ws[0].shape[0]}', flush=True)
+        # #endregion
+
         # Execute layers.
+        # #region agent log
+        if _do_timing:
+            torch.cuda.synchronize()
+            _t0_input = time.time()
+        # #endregion
         x = self.input(ws[0])
+        # #region agent log
+        if _do_timing:
+            torch.cuda.synchronize()
+            _layer_times['input'] = time.time() - _t0_input
+        # #endregion
 
         for name, w in zip(self.layer_names, ws[1:]):
+            # #region agent log
+            if _do_timing:
+                torch.cuda.synchronize()
+                _t0_layer = time.time()
+            # #endregion
             x = getattr(self, name)(x, w, **layer_kwargs)
+            # #region agent log
+            if _do_timing:
+                torch.cuda.synchronize()
+                _layer_time = time.time() - _t0_layer
+                _layer_times[name] = _layer_time
+                # Print slow layers immediately 
+                if _layer_time > 1.0:
+                    print(f'[G PROFILE] SLOW layer {name}: {_layer_time:.3f}s x_shape={list(x.shape)}', flush=True)
+            # #endregion
         if self.output_scale != 1:
             x = x * self.output_scale
 
         # Ensure correct shape and dtype.
         misc.assert_shape(x, [None, self.img_channels, self.img_resolution, self.img_resolution])
         x = x.to(torch.float32)
+        
+        # #region agent log
+        if _do_timing:
+            torch.cuda.synchronize()
+            _total_time = time.time() - _synth_start
+            # Sort by time to identify slowest layers
+            _sorted_layers = sorted(_layer_times.items(), key=lambda kv: kv[1], reverse=True)
+            _top5_slow = _sorted_layers[:5]
+            print(f'[G PROFILE] SynthesisNetwork call={_synth_call_count} FINISHED total={_total_time:.3f}s', flush=True)
+            print(f'[G PROFILE] Top 5 slow layers: {[(n, f"{t:.3f}s") for n, t in _top5_slow]}', flush=True)
+            _debug_log("SynthesisNetwork.forward", f"Synthesis network timing call={_synth_call_count}", {
+                "call_count": _synth_call_count,
+                "total_sec": _total_time,
+                "layer_times": _layer_times,
+                "top5_slow": [(n, t) for n, t in _top5_slow],
+                "batch_size": ws[0].shape[0],
+                "num_layers": len(self.layer_names)
+            }, "A")
+        # #endregion
         return x
 
     def extra_repr(self):
