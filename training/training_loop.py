@@ -146,9 +146,18 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
             t0 = time.time()
             fake_img_d = G(z=z, c=c, noise_mode='random').detach().requires_grad_(True)
             d_out_grad = D(fake_img_d, c, flg_train=True)  # Use training mode
-            # Handle both tuple and tensor outputs from D
-            if isinstance(d_out_grad, tuple):
-                loss_d = sum(x.sum() if x is not None else 0 for x in d_out_grad)
+            # Handle outputs from D: flg_train=True returns [logits_fun_list, logits_dir_list]
+            # Each inner list contains tensors that need to be summed
+            loss_d = torch.tensor(0.0, device=device, requires_grad=True)
+            if isinstance(d_out_grad, (tuple, list)):
+                for item in d_out_grad:
+                    if isinstance(item, (tuple, list)):
+                        # Nested list - sum all tensors
+                        for tensor in item:
+                            if tensor is not None and hasattr(tensor, 'sum'):
+                                loss_d = loss_d + tensor.sum()
+                    elif item is not None and hasattr(item, 'sum'):
+                        loss_d = loss_d + item.sum()
             else:
                 loss_d = d_out_grad.sum()
             loss_d.backward()
