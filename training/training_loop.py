@@ -28,26 +28,45 @@ from torch_utils.ops import grid_sample_gradfix
 
 import legacy
 from metrics import metric_main
+from training import networks_stylegan3_resetting
 
 #----------------------------------------------------------------------------
-# Debug logging for warmup diagnostics
+# Unified debug logging (TXT format)
 
-# #region agent log
-_DEBUG_LOG_PATH = "/home/dgkagramanyan/.cursor/debug.log"
+# #region debug logging
+_DEBUG_ENABLED = False
+_DEBUG_LOG_PATH = None
 
-def _debug_log(location, message, data=None, hypothesis_id=None):
-    """Write debug info to NDJSON log file."""
+def set_debug_enabled(enabled, log_path=None):
+    """Enable/disable debug logging for training loop."""
+    global _DEBUG_ENABLED, _DEBUG_LOG_PATH
+    _DEBUG_ENABLED = enabled
+    _DEBUG_LOG_PATH = log_path
+    # Also configure generator debug logging
+    networks_stylegan3_resetting.set_debug_config(enabled, log_path)
+
+def _debug_log(location, message, data=None):
+    """Unified debug logging: prints to stdout and writes to TXT file when enabled."""
+    if not _DEBUG_ENABLED:
+        return
+    
     try:
-        entry = {
-            "timestamp": time.time() * 1000,
-            "location": location,
-            "message": message,
-            "data": data or {},
-            "sessionId": "cuda-kernel-debug",
-            "hypothesisId": hypothesis_id or "general"
-        }
-        with open(_DEBUG_LOG_PATH, 'a') as f:
-            f.write(json.dumps(entry) + '\n')
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Build log line
+        log_line = f"[{timestamp}] [{location}] {message}"
+        if data:
+            # Format data as simple key=value pairs
+            data_str = " | ".join(f"{k}={v}" for k, v in data.items())
+            log_line += f" | {data_str}"
+        
+        # Print to stdout
+        print(log_line, flush=True)
+        
+        # Write to file if path is set
+        if _DEBUG_LOG_PATH:
+            with open(_DEBUG_LOG_PATH, 'a') as f:
+                f.write(log_line + '\n')
     except Exception:
         pass
 # #endregion
@@ -66,18 +85,13 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
     2. cuDNN algorithm selection for all conv layer shapes (feature networks)
     3. cuBLAS handle initialization
     """
-    # #region agent log
+    # #region debug log
     warmup_start = time.time()
-    _debug_log("training_loop.py:warmup_cuda_kernels", "Starting CUDA kernel warmup", {
-        "num_iterations": num_iterations,
+    _debug_log("warmup_cuda_kernels", "Starting CUDA kernel warmup", {
+        "iterations": num_iterations,
         "batch_gpu": batch_gpu,
-        "device": str(device),
-        "rank": rank,
-        "cudnn_benchmark": torch.backends.cudnn.benchmark,
-        "cudnn_enabled": torch.backends.cudnn.enabled,
-        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
-        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32
-    }, "D")
+        "rank": rank
+    })
     # #endregion
     
     if rank == 0:
@@ -118,12 +132,11 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
             torch.cuda.synchronize(device)
             t_disc_fwd = time.time() - t0
             
-            # #region agent log
+            # #region debug log
             if i == 0:
-                _debug_log("training_loop.py:warmup_cuda_kernels", "Phase 2 D_fwd complete (cuDNN benchmark)", {
-                    "time_sec": t_disc_fwd,
-                    "note": "This includes cuDNN algorithm selection for feature networks"
-                }, "D")
+                _debug_log("warmup", "Phase 2 D_fwd complete (cuDNN benchmark)", {
+                    "time_sec": round(t_disc_fwd, 3)
+                })
             # #endregion
             
             # Phase 3: Generator forward WITH gradients (triggers G backward kernel configs)
@@ -164,12 +177,11 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
             torch.cuda.synchronize(device)
             t_backward_d = time.time() - t0
             
-            # #region agent log
+            # #region debug log
             if i == 0:
-                _debug_log("training_loop.py:warmup_cuda_kernels", "Phase 5 D_train complete", {
-                    "time_sec": t_backward_d,
-                    "note": "D forward+backward with flg_train=True (matches training)"
-                }, "D")
+                _debug_log("warmup", "Phase 5 D_train complete", {
+                    "time_sec": round(t_backward_d, 3)
+                })
             # #endregion
             
             t_backward = t_backward_g + t_backward_d
@@ -187,18 +199,15 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
                     "backward_d": t_backward_d
                 }
             
-            # #region agent log
-            _debug_log("training_loop.py:warmup_cuda_kernels", f"Warmup iteration {i+1} complete", {
-                "iteration": i + 1,
-                "time_sec": iter_time,
-                "gen_fwd_sec": t_gen_fwd,
-                "disc_fwd_sec": t_disc_fwd,
-                "gen_fwd_grad_sec": t_gen_fwd_grad,
-                "backward_g_sec": t_backward_g,
-                "backward_d_sec": t_backward_d,
-                "backward_total_sec": t_backward,
-                "warmup_batch": warmup_batch
-            }, "D")
+            # #region debug log
+            _debug_log("warmup", f"Warmup iteration {i+1} complete", {
+                "iter": i + 1,
+                "total_sec": round(iter_time, 2),
+                "G_fwd": round(t_gen_fwd, 2),
+                "D_fwd": round(t_disc_fwd, 2),
+                "G_bwd": round(t_backward_g, 2),
+                "D_bwd": round(t_backward_d, 2)
+            })
             # #endregion
             
             if rank == 0:
@@ -207,12 +216,11 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
                       f'G_bwd={t_backward_g:.2f}s, D_bwd={t_backward_d:.2f}s)', flush=True)
                 
         except Exception as e:
-            # #region agent log
-            _debug_log("training_loop.py:warmup_cuda_kernels", "Warmup iteration failed", {
-                "iteration": i + 1,
-                "error": str(e),
-                "error_type": type(e).__name__
-            }, "D")
+            # #region debug log
+            _debug_log("warmup", "Warmup iteration failed", {
+                "iter": i + 1,
+                "error": str(e)
+            })
             # #endregion
             if rank == 0:
                 print(f'[Warmup] Iteration {i+1} failed: {e}', flush=True)
@@ -221,13 +229,12 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
     
     total_time = time.time() - warmup_start
     
-    # #region agent log
-    _debug_log("training_loop.py:warmup_cuda_kernels", "Warmup complete", {
-        "total_time_sec": total_time,
-        "iteration_times": iteration_times,
-        "avg_time": sum(iteration_times) / len(iteration_times) if iteration_times else 0,
-        "stage_times_iter1": stage_times
-    }, "D")
+    # #region debug log
+    avg_time = sum(iteration_times) / len(iteration_times) if iteration_times else 0
+    _debug_log("warmup", "Warmup complete", {
+        "total_sec": round(total_time, 2),
+        "avg_sec": round(avg_time, 2)
+    })
     # #endregion
     
     if rank == 0:
@@ -379,6 +386,7 @@ def training_loop(
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
     restart_every           = -1,       # Time interval in seconds to exit code
+    debug                   = False,    # Enable debug logging to file
 ):
     # Initialize.
     start_time = time.time()
@@ -386,6 +394,12 @@ def training_loop(
     np.random.seed(random_seed * num_gpus + rank)
     torch.manual_seed(random_seed * num_gpus + rank)
     torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed.
+    
+    # Setup debug logging
+    debug_log_path = os.path.join(run_dir, 'debug.txt') if debug else None
+    set_debug_enabled(debug, debug_log_path)
+    if debug and rank == 0:
+        print(f'[Debug] Debug logging enabled, writing to: {debug_log_path}', flush=True)
     torch.backends.cuda.matmul.allow_tf32 = True       # Improves numerical accuracy.
     torch.backends.cudnn.allow_tf32 = True             # Improves numerical accuracy.
     conv2d_gradfix.enabled = True                       # Improves training speed.
@@ -544,18 +558,14 @@ def training_loop(
             print('Skipping tfevents export:', err)
 
     # Log CUDA configuration for diagnostics
-    # #region agent log
-    _debug_log("training_loop.py", "CUDA configuration", {
+    # #region debug log
+    _debug_log("training_loop", "CUDA configuration", {
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
-        "cudnn_enabled": torch.backends.cudnn.enabled,
-        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
-        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
-        "cuda_version": torch.version.cuda,
-        "cudnn_version": torch.backends.cudnn.version(),
-        "device_name": torch.cuda.get_device_name(device),
-        "device_capability": torch.cuda.get_device_capability(device),
+        "tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cuda_ver": torch.version.cuda,
+        "device": torch.cuda.get_device_name(device),
         "rank": rank
-    }, "G")
+    })
     # #endregion
     
     if rank == 0:
@@ -568,8 +578,8 @@ def training_loop(
     if rank == 0:
         print('[Init] Force-loading all CUDA plugins...', flush=True)
     
-    # #region agent log
-    _debug_log("training_loop.py", "Pre-initializing CUDA plugins", {"rank": rank}, "F")
+    # #region debug log
+    _debug_log("training_loop", "Pre-initializing CUDA plugins", {"rank": rank})
     # #endregion
     
     # Force-initialize all plugins by importing them
@@ -588,13 +598,12 @@ def training_loop(
     upfirdn2d._init()
     t_upfirdn = time.time() - t0
     
-    # #region agent log
-    _debug_log("training_loop.py", "CUDA plugins initialized", {
-        "bias_act_sec": t_bias,
-        "filtered_lrelu_sec": t_lrelu,
-        "upfirdn2d_sec": t_upfirdn,
-        "rank": rank
-    }, "F")
+    # #region debug log
+    _debug_log("training_loop", "CUDA plugins initialized", {
+        "bias_act_sec": round(t_bias, 2),
+        "lrelu_sec": round(t_lrelu, 2),
+        "upfirdn_sec": round(t_upfirdn, 2)
+    })
     # #endregion
     
     if rank == 0:
@@ -635,21 +644,13 @@ def training_loop(
     if hasattr(loss, 'pl_mean'):
         loss.pl_mean.copy_(__PL_MEAN__)
 
-    # #region agent log
+    # #region debug log
     _iter_count = 0
-    _phase_times = {}
     # #endregion
 
     while True:
-        # #region agent log
+        # #region debug log
         _iter_start = time.time()
-        if _iter_count < 5 or _iter_count % 10 == 0:
-            _debug_log("training_loop.py:main_loop", f"Training iteration {_iter_count} started", {
-                "iteration": _iter_count,
-                "cur_nimg": cur_nimg,
-                "batch_idx": batch_idx,
-                "rank": rank
-            }, "L")
         _data_fetch_start = time.time()
         # #endregion
 
@@ -663,14 +664,8 @@ def training_loop(
             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
 
-        # #region agent log
+        # #region debug log
         _data_fetch_end = time.time()
-        if _iter_count < 5 or _iter_count % 10 == 0:
-            _debug_log("training_loop.py:main_loop", f"Data fetch complete", {
-                "iteration": _iter_count,
-                "data_fetch_sec": _data_fetch_end - _data_fetch_start,
-                "rank": rank
-            }, "K")
         # #endregion
 
         # Execute training phases.
@@ -678,7 +673,7 @@ def training_loop(
             if batch_idx % phase.interval != 0:
                 continue
             
-            # #region agent log
+            # #region debug log
             _phase_start = time.time()
             # #endregion
             
@@ -693,52 +688,32 @@ def training_loop(
             if phase.name in ['Dmain', 'Dboth', 'Dreg'] and hasattr(phase.module, 'feature_networks'):
                 phase.module.feature_networks.requires_grad_(False)
 
-            # #region agent log
-            _accum_start = time.time()
-            # #endregion
-            
             for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
                 loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
             phase.module.requires_grad_(False)
-            
-            # #region agent log
-            _accum_end = time.time()
-            # #endregion
 
             # Update weights.
-            # #region agent log
-            _allreduce_time = 0
-            # #endregion
             with torch.autograd.profiler.record_function(phase.name + '_opt'):
                 params = [param for param in phase.module.parameters() if param.grad is not None]
                 if len(params) > 0:
                     flat = torch.cat([param.grad.flatten() for param in params])
-                    # #region agent log
-                    _allreduce_start = time.time()
-                    # #endregion
                     if num_gpus > 1:
                         torch.distributed.all_reduce(flat)
                         flat /= num_gpus
-                    # #region agent log
-                    _allreduce_time = time.time() - _allreduce_start
-                    # #endregion
                     misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
                     grads = flat.split([param.numel() for param in params])
                     for param, grad in zip(params, grads):
                         param.grad = grad.reshape(param.shape)
                 phase.opt.step()
             
-            # #region agent log
+            # #region debug log
             _phase_end = time.time()
-            if _iter_count < 5 or _iter_count % 10 == 0:
-                _debug_log("training_loop.py:main_loop", f"Phase {phase.name} complete", {
-                    "iteration": _iter_count,
-                    "phase": phase.name,
-                    "accum_grad_sec": _accum_end - _accum_start,
-                    "allreduce_sec": _allreduce_time,
-                    "phase_total_sec": _phase_end - _phase_start,
-                    "rank": rank
-                }, "J")
+            _phase_time = _phase_end - _phase_start
+            if _phase_time > 5.0:  # Log slow phases (>5s)
+                _debug_log("training_loop", f"SLOW phase {phase.name}", {
+                    "iter": _iter_count,
+                    "time_sec": round(_phase_time, 2)
+                })
             # #endregion
             if phase.name in ['Dmain', 'Dboth', 'Dreg']:
                 for _, discriminator in D.discriminators.items():
@@ -768,16 +743,14 @@ def training_loop(
         cur_nimg += batch_size
         batch_idx += 1
         
-        # #region agent log
+        # #region debug log
         _iter_end = time.time()
-        if _iter_count < 5 or _iter_count % 10 == 0:
-            _debug_log("training_loop.py:main_loop", f"Training iteration {_iter_count} complete", {
-                "iteration": _iter_count,
-                "total_iter_sec": _iter_end - _iter_start,
-                "cur_nimg": cur_nimg,
-                "batch_idx": batch_idx,
-                "rank": rank
-            }, "L")
+        _iter_time = _iter_end - _iter_start
+        if _iter_time > 10.0:  # Log slow iterations (>10s)
+            _debug_log("training_loop", f"SLOW iteration {_iter_count}", {
+                "time_sec": round(_iter_time, 2),
+                "nimg": cur_nimg
+            })
         _iter_count += 1
         # #endregion
 

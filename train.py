@@ -166,6 +166,7 @@ def parse_comma_separated_list(s):
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
 @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
+@click.option('--debug',       help='Enable debug logging to file',                            is_flag=True)
 
 # StyleGAN-XL additions
 @click.option('--restart_every',help='Time interval in seconds to restart code', metavar='INT', type=int, default=999999999, show_default=True)
@@ -251,6 +252,9 @@ def main(**kwargs):
 
     # Restart.
     c.restart_every = opts.restart_every
+
+    # Debug logging.
+    c.debug = opts.debug
 
     # Performance-related toggles.
     if opts.fp32:
