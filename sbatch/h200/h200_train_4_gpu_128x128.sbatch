@@ -39,23 +39,26 @@ export TORCH_CUDA_ARCH_LIST="9.0"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-export PYTHONWARNINGS=all
+# export PYTHONWARNINGS=all
 
-export TORCH_EXTENSIONS_DIR="${SLURM_TMPDIR:-/tmp}/${USER}_torch_extensions"
-export CUDA_CACHE_PATH="${SLURM_TMPDIR:-/tmp}/${USER}_cuda_cache"
+# Use persistent cache directories for compiled CUDA kernels (critical for fast startup!)
+export TORCH_EXTENSIONS_DIR="${HOME}/.cache/torch_extensions"
+export CUDA_CACHE_PATH="${HOME}/.cache/cuda_cache"
+# export CUDA_CACHE_MAXSIZE=4294967296  # 4GB cache for JIT compiled kernels
+# export CUDA_CACHE_DISABLE=0           # Ensure caching is enabled
+# export CUDA_MODULE_LOADING=EAGER      # Load all CUDA modules at startup (reduces first-use latency)
 
 
 python train.py --outdir=./runs/wc-cv_h200_51 \
         --cfg=stylegan3-r \
         --data=./datasets/imagenet_9to4_1024x1024_128x128.zip \
         --gpus=4 \
-        --batch=240 \
+        --batch=256 \
         --mirror=0 \
         --tick 1 \
-        --metrics None \
         --workers 2 \
         --snap 100 \
-        --batch-gpu 60 \
+        --batch-gpu 64 \
         --kimg 20000 \
         --cond True \
         --syn_layers 6\
