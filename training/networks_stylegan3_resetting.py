@@ -88,27 +88,82 @@ def modulated_conv2d(
         input_gain = input_gain.expand(batch_size, in_channels) # [NI]
         w = w * input_gain.unsqueeze(1).unsqueeze(3).unsqueeze(4) # [NOIkk]
 
-    # Execute as one fused op using grouped convolution.
-    x = x.reshape(1, -1, *x.shape[2:])
-    w = w.reshape(-1, in_channels, kh, kw)
-
     # #region agent log
-    # Log grouped conv details on first few calls (helps identify perf issues)
-    if _LAYER_TIMING_ENABLED and _synth_call_count <= 3:
-        _debug_log("modulated_conv2d", "Grouped conv params", {
-            "groups": batch_size,
-            "x_shape_before": list(x.shape),
-            "w_shape": list(w.shape),
-            "in_channels": in_channels,
-            "out_channels": out_channels,
-            "kernel_size": [kh, kw],
-            "padding": padding,
-            "x_dtype": str(x.dtype),
-            "w_dtype": str(w.dtype)
-        }, "A")
+    _do_conv_timing = _LAYER_TIMING_ENABLED and _synth_call_count <= 10
+    if _do_conv_timing:
+        torch.cuda.synchronize()
+        _conv_start = time.time()
     # #endregion
-    x = conv2d_gradfix.conv2d(input=x, weight=w.to(x.dtype), padding=padding, groups=batch_size)
-    x = x.reshape(batch_size, -1, *x.shape[2:])
+
+    # For 1x1 kernels, use batched matrix multiplication (BMM) instead of grouped convolution.
+    # This is MUCH faster on Hopper (H200) where grouped conv has poor performance.
+    # For larger kernels, fall back to the original grouped convolution.
+    if kh == 1 and kw == 1 and padding == 0:
+        # BMM path for 1x1 convolutions - avoids slow grouped conv on Hopper
+        # x: [batch_size, in_channels, H, W]
+        # w: [batch_size, out_channels, in_channels, 1, 1]
+        H, W = x.shape[2], x.shape[3]
+        input_dtype = x.dtype  # Preserve original dtype (typically float16)
+        x_flat = x.reshape(batch_size, in_channels, -1)  # [B, I, H*W]
+        w_flat = w.reshape(batch_size, out_channels, in_channels)  # [B, O, I]
+        # Convert w to x's dtype (like original grouped conv: w.to(x.dtype))
+        w_flat = w_flat.to(input_dtype)
+        y = torch.bmm(w_flat, x_flat)  # [B, O, H*W]
+        x = y.reshape(batch_size, out_channels, H, W)
+        # Ensure output dtype matches input dtype
+        assert x.dtype == input_dtype, f"BMM dtype mismatch: got {x.dtype}, expected {input_dtype}"
+        
+        # #region agent log
+        if _do_conv_timing:
+            torch.cuda.synchronize()
+            _conv_time = time.time() - _conv_start
+            _debug_log("modulated_conv2d", "BMM path for 1x1 conv", {
+                "conv_time_sec": _conv_time,
+                "batch_size": batch_size,
+                "in_channels": in_channels,
+                "out_channels": out_channels,
+                "spatial": [H, W],
+                "synth_call": _synth_call_count,
+                "input_dtype": str(input_dtype),
+                "output_dtype": str(x.dtype),
+                "output_shape": list(x.shape)
+            }, "A")
+            if _conv_time > 0.5:
+                print(f"[BMM 1x1] B={batch_size} C={in_channels}->{out_channels} HW={H}x{W} time={_conv_time:.3f}s", flush=True)
+        # #endregion
+    else:
+        # Original grouped convolution path for non-1x1 kernels
+        x = x.reshape(1, -1, *x.shape[2:])
+        w = w.reshape(-1, in_channels, kh, kw)
+
+        # #region agent log
+        if _do_conv_timing:
+            _debug_log("modulated_conv2d", "Grouped conv path", {
+                "groups": batch_size,
+                "x_shape": list(x.shape),
+                "w_shape": list(w.shape),
+                "kernel_size": [kh, kw],
+                "synth_call": _synth_call_count
+            }, "A")
+        # #endregion
+        
+        x = conv2d_gradfix.conv2d(input=x, weight=w.to(x.dtype), padding=padding, groups=batch_size)
+        
+        # #region agent log
+        if _do_conv_timing:
+            torch.cuda.synchronize()
+            _conv_time = time.time() - _conv_start
+            _debug_log("modulated_conv2d", "Grouped conv FINISHED", {
+                "conv_time_sec": _conv_time,
+                "output_shape": list(x.shape),
+                "synth_call": _synth_call_count
+            }, "A")
+            if _conv_time > 1.0:
+                print(f"[SLOW CONV {kh}x{kw}] groups={batch_size} out={list(x.shape)} time={_conv_time:.3f}s", flush=True)
+        # #endregion
+        
+        x = x.reshape(batch_size, -1, *x.shape[2:])
+    
     return x
 
 #----------------------------------------------------------------------------
