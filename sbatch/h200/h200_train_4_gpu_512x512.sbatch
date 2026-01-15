@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=SAN-128
 #SBATCH --gpus=4
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --time=3-0:0
 #SBATCH --nodes=1
 #SBATCH --partition=normal
@@ -39,27 +39,24 @@ export TORCH_CUDA_ARCH_LIST="9.0"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-# export PYTHONWARNINGS=all
-
 export TORCH_EXTENSIONS_DIR="${HOME}/.cache/torch_extensions"
 export CUDA_CACHE_PATH="${HOME}/.cache/cuda_cache"
 
 
-
 python train.py --outdir=./runs/wc-cv_h200_51 \
         --cfg=stylegan3-r \
-        --data=./datasets/imagenet_9to4_1024x1024_256x256.zip \
+        --data=./datasets/imagenet_9to4_1024x1024_512x512.zip \
         --gpus=4 \
         --mirror=0 \
         --tick 1 \
         --workers 2 \
         --snap 100 \
-        --batch-gpu 42 \
+        --batch-gpu 25 \
         --kimg 20000 \
         --cond True \
         --syn_layers 6\
         --superres \
         --up_factor 2 \
         --head_layers 7 \
-        --path_stem ./runs/wc-cv_h200/00003-stylegan3-r-imagenet_9to4_1024x1024_128x128-gpus4-batch256/best_model.pkl
+        --path_stem ./runs/wc-cv_h200/00004-stylegan3-r-imagenet_9to4_1024x1024_256x256-gpus4-batch168/best_model.pkl
         
