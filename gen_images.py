@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import List, Optional, Union, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
-import multiprocessing as mp
+import torch.multiprocessing as mp
 
 import click
 import torch
@@ -46,56 +46,62 @@ def _slurm_cpu_count_fallback() -> int:
 def _save_to_hdf5(hdf5_path: Path, images_data: Dict[int, List[np.ndarray]], max_workers: int = None) -> None:
     """
     Save images to HDF5 format with groups per class.
-    Uses multiple threads for efficient writing.
+    Optimized for speed with efficient chunking and fast compression.
     """
     if max_workers is None:
         max_workers = _slurm_cpu_count_fallback()
 
+    total_images = sum(len(images) for images in images_data.values())
+    print(f"Starting HDF5 save of {total_images} images with optimized settings...")
+
     with h5py.File(hdf5_path, 'w') as f:
+        images_saved = 0
+
         for class_idx, images in images_data.items():
             if not images:
                 continue
-
-            # Create group for this class
-            group = f.create_group(f'class_{class_idx}')
 
             # Get image shape (assume all images have same shape)
             img_shape = images[0].shape
             num_images = len(images)
 
-            # Create dataset for images
+            # Create group for this class
+            group = f.create_group(f'class_{class_idx}')
+
+            print(f"Processing class {class_idx}: {num_images} images...")
+
+            # Convert to numpy array for efficient processing
+            images_array = np.stack(images, axis=0)  # Shape: (num_images, H, W, C)
+
+            # Use optimal chunk size for performance
+            chunk_size_images = min(1000, max(100, num_images // 2))
+
+            # Create dataset with optimized settings for speed
             dset = group.create_dataset(
                 'images',
                 shape=(num_images, *img_shape),
                 dtype=np.uint8,
-                chunks=(min(100, num_images), *img_shape),  # Reasonable chunk size
-                compression='gzip',
-                compression_opts=6
+                chunks=(chunk_size_images, *img_shape),
+                compression='lzf',  # Much faster than gzip
+                shuffle=True,  # Better compression
             )
 
-            # Save images using multiple threads for large datasets
-            if num_images <= 1000:  # For smaller datasets, save directly
-                for i, img in enumerate(images):
-                    dset[i] = img
-            else:  # For larger datasets, use threading
-                def _write_chunk(start_idx: int, end_idx: int) -> None:
-                    for i in range(start_idx, min(end_idx, num_images)):
-                        dset[i] = images[i]
-
-                chunk_size = max(1, num_images // max_workers)
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = []
-                    for start in range(0, num_images, chunk_size):
-                        end = min(start + chunk_size, num_images)
-                        futures.append(executor.submit(_write_chunk, start, end))
-
-                    for future in futures:
-                        future.result()
+            # Write all images at once for maximum speed
+            dset[:] = images_array
 
             # Store metadata
             group.attrs['class_idx'] = class_idx
             group.attrs['num_images'] = num_images
             group.attrs['image_shape'] = img_shape
+
+            images_saved += num_images
+            print(f"✓ Class {class_idx}: {num_images} images saved ({images_saved}/{total_images} total)")
+
+        # Final flush
+        f.flush()
+
+    file_size_mb = hdf5_path.stat().st_size / (1024 * 1024)
+    print(f"✓ HDF5 save complete: {hdf5_path} ({file_size_mb:.1f} MB)")
 
 
 def _generate_worker(
@@ -233,6 +239,9 @@ def _generate_worker(
 
     # Gather all images to rank 0 and save to HDF5
     if world_size > 1:
+        import time
+        gather_start = time.time()
+
         # Gather image counts per class from all ranks
         local_counts = {class_idx: len(images) for class_idx, images in local_images.items()}
         all_counts = [{} for _ in range(world_size)]
@@ -245,6 +254,8 @@ def _generate_worker(
                 for class_idx, count in counts.items():
                     total_images_per_class[class_idx] = total_images_per_class.get(class_idx, 0) + count
 
+            print(f"Gathering images from {world_size} GPUs...")
+
             # Prepare to receive images
             gathered_images: Dict[int, List[np.ndarray]] = {class_idx: [] for class_idx in cfg["classes"]}
 
@@ -252,6 +263,9 @@ def _generate_worker(
             for class_idx in cfg["classes"]:
                 if total_images_per_class.get(class_idx, 0) == 0:
                     continue
+
+                expected_count = total_images_per_class[class_idx]
+                print(f"Gathering {expected_count} images for class {class_idx}...")
 
                 # Collect local images for this class
                 local_class_images = local_images[class_idx]
@@ -264,10 +278,18 @@ def _generate_worker(
                 for rank_images in all_class_images:
                     gathered_images[class_idx].extend(rank_images)
 
-            # Save to HDF5
-            print(f'Saving images to "{output_path}"...')
+                actual_count = len(gathered_images[class_idx])
+                if actual_count != expected_count:
+                    print(f"Warning: Expected {expected_count} images for class {class_idx}, got {actual_count}")
+
+            gather_time = time.time() - gather_start
+            total_images = sum(len(imgs) for imgs in gathered_images.values())
+            print(f"Gather complete in {gather_time:.2f}s. Saving {total_images} images to HDF5...")
+
+            save_start = time.time()
             _save_to_hdf5(output_path, gathered_images)
-            print(f'Finished saving {sum(len(imgs) for imgs in gathered_images.values())} images to HDF5.')
+            save_time = time.time() - save_start
+            print(f'HDF5 save complete in {save_time:.2f}s')
         else:
             # Non-zero ranks: participate in gathering
             for class_idx in cfg["classes"]:
@@ -278,8 +300,10 @@ def _generate_worker(
     else:
         # Single GPU: save directly
         print(f'Saving images to "{output_path}"...')
+        save_start = time.time()
         _save_to_hdf5(output_path, local_images)
-        print(f'Finished saving {sum(len(imgs) for imgs in local_images.values())} images to HDF5.')
+        save_time = time.time() - save_start
+        print(f'HDF5 save complete in {save_time:.2f}s')
 
     if world_size > 1:
         dist.barrier()
