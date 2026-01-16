@@ -37,19 +37,6 @@ def parse_range(s: Union[str, List]) -> List[int]:
     return out
 
 
-def _slurm_cpu_count_fallback() -> int:
-    for k in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
-        v = os.environ.get(k)
-        if v:
-            try:
-                n = int(v)
-                if n > 0:
-                    return n
-            except ValueError:
-                pass
-    return os.cpu_count() or 1
-
-
 def _rank_to_device_id(rank: int) -> int:
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cuda_visible is not None:
