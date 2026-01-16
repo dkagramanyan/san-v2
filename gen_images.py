@@ -50,160 +50,263 @@ def _slurm_cpu_count_fallback() -> int:
     return os.cpu_count() or 1
 
 
-# ---------------------------
-# HDF5 writer process (rank0 only)
-#   - Single writer owns h5py.File handle => no corruption
-#   - Incremental writes during generation
-#   - No memory growth: generator never stores full dataset
-# ---------------------------
+def _rank_to_device_id(rank: int) -> int:
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible is not None:
+        ids = [int(x) for x in cuda_visible.split(",") if x.strip() != ""]
+        return ids[rank % len(ids)]
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is not None:
+        return int(local_rank)
+    return rank % max(1, torch.cuda.device_count())
 
-def _hdf5_writer_loop(
-    queue: "mp.queues.JoinableQueue",
-    hdf5_path: str,
-    classes: List[int],
-    samples_per_class: int,
-    compression: str,
-    chunk_images: int,
-) -> None:
+
+def _split_indices_block(n: int, rank: int, world_size: int) -> np.ndarray:
     """
-    Receives items: (class_idx:int, sample_idxs:np.ndarray[int], seeds:np.ndarray[int64], images:np.ndarray[uint8])
-    Writes into fixed-size datasets at positions sample_idxs (order independent).
+    Contiguous block split so every rank has almost the same count.
+    This avoids rank0 getting a systematically smaller/odd workload
+    for small n or when n % world_size != 0.
     """
-    hdf5_path = str(hdf5_path)
-    Path(hdf5_path).parent.mkdir(parents=True, exist_ok=True)
+    # block partition: [start, end)
+    base = n // world_size
+    rem = n % world_size
+    start = rank * base + min(rank, rem)
+    end = start + base + (1 if rank < rem else 0)
+    if start >= end:
+        return np.empty((0,), dtype=np.int64)
+    return np.arange(start, end, dtype=np.int64)
 
-    f = h5py.File(hdf5_path, "w")
 
-    # Lazy init once we know image shape.
-    initialized = False
-    img_shape = None  # (H, W, C)
+# ---------------------------
+# Per-rank incremental HDF5 writer (no cross-rank sync)
+# ---------------------------
 
-    groups: Dict[int, h5py.Group] = {}
-    d_images: Dict[int, h5py.Dataset] = {}
-    d_seeds: Dict[int, h5py.Dataset] = {}
-    d_written: Dict[int, h5py.Dataset] = {}
+class RankH5Writer:
+    """
+    Each rank writes its own shard file:
+      <outdir>/<desc_full>/shards/rank_000.h5
+    Incremental (during generation), fixed-size datasets, bounded memory.
+    """
+    def __init__(
+        self,
+        shard_path: Path,
+        classes: List[int],
+        samples_per_class: int,
+        compression: Optional[str],
+        chunk_images: int,
+    ):
+        self.shard_path = shard_path
+        self.classes = [int(c) for c in classes]
+        self.samples_per_class = int(samples_per_class)
+        self.compression = compression
+        self.chunk_images = int(chunk_images)
 
-    def _init_dsets(_img_shape: Tuple[int, int, int]) -> None:
-        nonlocal initialized, img_shape
-        img_shape = tuple(int(x) for x in _img_shape)
-        H, W, C = img_shape
+        self.f: Optional[h5py.File] = None
+        self.initialized = False
+        self.img_shape: Optional[Tuple[int, int, int]] = None
 
-        f.attrs["format"] = "stylegan_generated_images"
-        f.attrs["image_shape_hwc"] = img_shape
-        f.attrs["samples_per_class"] = int(samples_per_class)
-        f.attrs["classes"] = np.array(classes, dtype=np.int32)
+        self.d_images: Dict[int, h5py.Dataset] = {}
+        self.d_seeds: Dict[int, h5py.Dataset] = {}
+        self.d_written: Dict[int, h5py.Dataset] = {}
 
-        for class_idx in classes:
-            g = f.create_group(f"class_{int(class_idx)}")
-            g.attrs["class_idx"] = int(class_idx)
-            g.attrs["samples_per_class"] = int(samples_per_class)
-            g.attrs["image_shape_hwc"] = img_shape
+    def open(self):
+        self.shard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.f = h5py.File(str(self.shard_path), "w")
 
-            # Fixed-size datasets (no resizing = fewer leaks/fragmentation).
-            # Write-at-index is safe even if batches arrive out of order.
-            chunks0 = max(1, min(int(chunk_images), int(samples_per_class)))
+    def _init(self, img_shape: Tuple[int, int, int]):
+        assert self.f is not None
+        H, W, C = [int(x) for x in img_shape]
+        self.img_shape = (H, W, C)
+
+        self.f.attrs["format"] = "stylegan_generated_images_shard"
+        self.f.attrs["image_shape_hwc"] = self.img_shape
+        self.f.attrs["samples_per_class"] = int(self.samples_per_class)
+        self.f.attrs["classes"] = np.array(self.classes, dtype=np.int32)
+
+        chunks0 = max(1, min(self.chunk_images, self.samples_per_class))
+
+        for c in self.classes:
+            g = self.f.create_group(f"class_{c}")
+            g.attrs["class_idx"] = int(c)
+            g.attrs["samples_per_class"] = int(self.samples_per_class)
+            g.attrs["image_shape_hwc"] = self.img_shape
+
             dimg = g.create_dataset(
                 "images",
-                shape=(samples_per_class, H, W, C),
+                shape=(self.samples_per_class, H, W, C),
                 dtype=np.uint8,
                 chunks=(chunks0, H, W, C),
-                compression=compression if compression else None,
-                shuffle=True if compression else False,
+                compression=self.compression if self.compression else None,
+                shuffle=True if self.compression else False,
             )
             dseed = g.create_dataset(
                 "seeds",
-                shape=(samples_per_class,),
+                shape=(self.samples_per_class,),
                 dtype=np.int64,
-                chunks=(max(1, min(chunks0 * 4, samples_per_class)),),
+                chunks=(max(1, min(chunks0 * 4, self.samples_per_class)),),
                 compression=None,
             )
             dw = g.create_dataset(
                 "written",
-                shape=(samples_per_class,),
+                shape=(self.samples_per_class,),
                 dtype=np.bool_,
-                chunks=(max(1, min(chunks0 * 4, samples_per_class)),),
+                chunks=(max(1, min(chunks0 * 4, self.samples_per_class)),),
                 compression=None,
             )
             dw[:] = False
 
-            groups[class_idx] = g
-            d_images[class_idx] = dimg
-            d_seeds[class_idx] = dseed
-            d_written[class_idx] = dw
+            self.d_images[c] = dimg
+            self.d_seeds[c] = dseed
+            self.d_written[c] = dw
 
-        initialized = True
-        f.flush()
+        self.initialized = True
+        self.f.flush()
 
+    def write_batch(self, class_idx: int, sample_idxs: np.ndarray, seeds: np.ndarray, images: np.ndarray):
+        assert self.f is not None
+        class_idx = int(class_idx)
+
+        sample_idxs = np.asarray(sample_idxs, dtype=np.int64)
+        seeds = np.asarray(seeds, dtype=np.int64)
+        images = np.asarray(images, dtype=np.uint8)
+
+        if not self.initialized:
+            if images.ndim != 4:
+                raise RuntimeError(f"Expected images (B,H,W,C), got {images.shape}")
+            self._init(tuple(images.shape[1:]))
+
+        if tuple(images.shape[1:]) != tuple(self.img_shape):
+            raise RuntimeError(f"Shape mismatch: got {images.shape[1:]}, expected {self.img_shape}")
+
+        if sample_idxs.size != images.shape[0] or seeds.size != images.shape[0]:
+            raise RuntimeError("Batch mismatch idxs/seeds/images")
+
+        # Sort by index for IO locality
+        order = np.argsort(sample_idxs)
+        sample_idxs = sample_idxs[order]
+        seeds = seeds[order]
+        images = images[order]
+
+        # Write-at-index
+        self.d_images[class_idx][sample_idxs, :, :, :] = images
+        self.d_seeds[class_idx][sample_idxs] = seeds
+        self.d_written[class_idx][sample_idxs] = True
+
+        # Flush during generation (you requested “during script working”)
+        self.f.flush()
+
+    def close(self):
+        if self.f is None:
+            return
+        # Store counts
+        for c in self.classes:
+            written = int(np.count_nonzero(self.d_written[c][:]))
+            grp = self.f[f"class_{c}"]
+            grp.attrs["written_count"] = written
+            grp.attrs["missing_count"] = int(self.samples_per_class - written)
+        self.f.flush()
+        self.f.close()
+        self.f = None
+
+
+# ---------------------------
+# Optional merge (rank0 after generation)
+# ---------------------------
+
+def _merge_shards_to_one_h5(
+    merged_path: Path,
+    shards_dir: Path,
+    classes: List[int],
+    samples_per_class: int,
+    compression: Optional[str],
+    chunk_images: int,
+    world_size: int,
+):
+    """
+    Merge per-rank shards into one big HDF5.
+    Deterministic: for each class and index, take the first shard that has written=True.
+    """
+    merged_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Open all shards read-only
+    shard_files = [h5py.File(str(shards_dir / f"rank_{r:03d}.h5"), "r") for r in range(world_size)]
     try:
-        while True:
-            item = queue.get()
-            try:
-                if item is None:
-                    # Sentinel: finish and exit.
-                    return
+        # Determine image shape from first shard that has it
+        img_shape = None
+        for sf in shard_files:
+            if "image_shape_hwc" in sf.attrs:
+                img_shape = tuple(sf.attrs["image_shape_hwc"])
+                break
+        if img_shape is None:
+            raise RuntimeError("No shard contains image shape metadata (did generation run?).")
 
-                class_idx, sample_idxs, seeds, images = item
-                class_idx = int(class_idx)
+        H, W, C = [int(x) for x in img_shape]
 
-                # images: (B, H, W, C) uint8
-                if not initialized:
-                    if images.ndim != 4:
-                        raise RuntimeError(f"Writer expected images with ndim=4, got {images.ndim}")
-                    _init_dsets(tuple(images.shape[1:]))
+        with h5py.File(str(merged_path), "w") as out:
+            out.attrs["format"] = "stylegan_generated_images"
+            out.attrs["image_shape_hwc"] = (H, W, C)
+            out.attrs["samples_per_class"] = int(samples_per_class)
+            out.attrs["classes"] = np.array([int(c) for c in classes], dtype=np.int32)
+            out.attrs["world_size"] = int(world_size)
+            out.attrs["merged_from"] = str(shards_dir)
 
-                # Validate shape consistency
-                if tuple(images.shape[1:]) != tuple(img_shape):
-                    raise RuntimeError(
-                        f"Image shape mismatch: got {tuple(images.shape[1:])}, expected {tuple(img_shape)}"
-                    )
+            chunks0 = max(1, min(int(chunk_images), int(samples_per_class)))
 
-                # Ensure numpy dtypes (avoid accidental object arrays)
-                sample_idxs = np.asarray(sample_idxs, dtype=np.int64)
-                seeds = np.asarray(seeds, dtype=np.int64)
-                images = np.asarray(images, dtype=np.uint8)
+            for c in classes:
+                c = int(c)
+                g = out.create_group(f"class_{c}")
+                g.attrs["class_idx"] = c
+                g.attrs["samples_per_class"] = int(samples_per_class)
+                g.attrs["image_shape_hwc"] = (H, W, C)
 
-                if sample_idxs.size != images.shape[0] or seeds.size != images.shape[0]:
-                    raise RuntimeError(
-                        f"Batch size mismatch: idxs={sample_idxs.size}, seeds={seeds.size}, images={images.shape[0]}"
-                    )
+                dimg = g.create_dataset(
+                    "images",
+                    shape=(samples_per_class, H, W, C),
+                    dtype=np.uint8,
+                    chunks=(chunks0, H, W, C),
+                    compression=compression if compression else None,
+                    shuffle=True if compression else False,
+                )
+                dseed = g.create_dataset(
+                    "seeds",
+                    shape=(samples_per_class,),
+                    dtype=np.int64,
+                    chunks=(max(1, min(chunks0 * 4, samples_per_class)),),
+                    compression=None,
+                )
+                dw = g.create_dataset(
+                    "written",
+                    shape=(samples_per_class,),
+                    dtype=np.bool_,
+                    chunks=(max(1, min(chunks0 * 4, samples_per_class)),),
+                    compression=None,
+                )
+                dw[:] = False
 
-                # Sort indices for slightly better IO locality
-                order = np.argsort(sample_idxs)
-                sample_idxs = sample_idxs[order]
-                seeds = seeds[order]
-                images = images[order]
+                # Merge by scanning shards
+                for r, sf in enumerate(shard_files):
+                    grp = sf.get(f"class_{c}", None)
+                    if grp is None:
+                        continue
+                    wmask = np.asarray(grp["written"][:], dtype=bool)
+                    if not wmask.any():
+                        continue
+                    # only write those not yet written
+                    need = wmask & (~dw[:])
+                    if not need.any():
+                        continue
+                    idxs = np.nonzero(need)[0]
+                    dimg[idxs] = grp["images"][idxs]
+                    dseed[idxs] = grp["seeds"][idxs]
+                    dw[idxs] = True
+                    out.flush()
 
-                # Bounds check
-                if sample_idxs.min(initial=0) < 0 or sample_idxs.max(initial=-1) >= samples_per_class:
-                    raise RuntimeError(
-                        f"sample_idxs out of range for class {class_idx}: "
-                        f"min={int(sample_idxs.min())}, max={int(sample_idxs.max())}, "
-                        f"samples_per_class={samples_per_class}"
-                    )
-
-                # Write into fixed positions
-                d_images[class_idx][sample_idxs, :, :, :] = images
-                d_seeds[class_idx][sample_idxs] = seeds
-                d_written[class_idx][sample_idxs] = True
-
-                # Flush frequently so data is on disk DURING generation
-                f.flush()
-
-            finally:
-                queue.task_done()
-
+                g.attrs["written_count"] = int(np.count_nonzero(dw[:]))
+                g.attrs["missing_count"] = int(samples_per_class - g.attrs["written_count"])
+                out.flush()
     finally:
-        # Final flush + quick integrity info
-        try:
-            for class_idx in classes:
-                if class_idx in d_written:
-                    written = int(np.count_nonzero(d_written[class_idx][:]))
-                    groups[class_idx].attrs["written_count"] = written
-                    groups[class_idx].attrs["missing_count"] = int(samples_per_class - written)
-            f.flush()
-        except Exception:
-            pass
-        f.close()
+        for sf in shard_files:
+            sf.close()
 
 
 # ---------------------------
@@ -225,13 +328,10 @@ def _save_images_to_dir(
     seeds = np.asarray(seeds)
     images = np.asarray(images, dtype=np.uint8)
 
-    # One file per sample_idx (stable, deterministic)
     for i in range(images.shape[0]):
         sid = int(sample_idxs[i])
         seed = int(seeds[i])
-        img = images[i]  # HWC uint8
-        im = PIL.Image.fromarray(img)
-        # Include both class, sample index and seed in filename
+        im = PIL.Image.fromarray(images[i])
         fn = class_dir / f"idx_{sid:06d}_seed_{seed}.{fmt}"
         im.save(str(fn))
 
@@ -245,7 +345,7 @@ def _generate_worker(
     world_size: int,
     cfg: dict,
     init_method: Optional[str],
-    output_hdf5_path: Optional[Path],
+    run_dir: Path,
 ) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA device is required for image generation.")
@@ -261,18 +361,7 @@ def _generate_worker(
             world_size=world_size,
         )
 
-    # Map ranks to GPUs (respect CUDA_VISIBLE_DEVICES if set)
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cuda_visible is not None:
-        available_gpus = [int(x) for x in cuda_visible.split(",") if x.strip() != ""]
-        device_id = available_gpus[rank % len(available_gpus)]
-    else:
-        local_rank = os.environ.get("LOCAL_RANK")
-        if local_rank is not None:
-            device_id = int(local_rank)
-        else:
-            device_id = rank % max(1, torch.cuda.device_count())
-
+    device_id = _rank_to_device_id(rank)
     torch.cuda.set_device(device_id)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -287,55 +376,30 @@ def _generate_worker(
     seed_base: int = int(cfg["seed"])
 
     save_mode: str = cfg["save_mode"]  # "hdf5" or "dir"
-    outdir: Path = Path(cfg["outdir"])
     image_format: str = cfg["image_format"]
-    hdf5_compression: str = cfg["hdf5_compression"]
+    hdf5_compression: Optional[str] = cfg["hdf5_compression"]
     hdf5_chunk_images: int = int(cfg["hdf5_chunk_images"])
-    writer_queue_max: int = int(cfg["writer_queue_max"])
 
-    # Rank0 decides output_hdf5_path
-    if save_mode == "hdf5":
-        if output_hdf5_path is None and rank == 0:
-            run_dir = Path(gen_utils.make_run_dir(cfg["outdir"], cfg["desc_full"]))
-            output_hdf5_path = run_dir / f"{cfg['desc_full']}.h5"
-        if world_size > 1:
-            holder = [str(output_hdf5_path) if rank == 0 else ""]
-            dist.broadcast_object_list(holder, src=0)
-            output_hdf5_path = Path(holder[0])
-
-    # Global progress bar (rank0)
+    # Progress bar: compute-only (all ranks do equal work; pbar only on rank0)
     total_images = int(len(classes) * samples_per_class)
     pbar = None
     if rank == 0:
-        pbar = tqdm(
-            total=total_images,
-            unit="img",
-            dynamic_ncols=True,
-            desc="Generating",
-            smoothing=0.05,
-        )
+        pbar = tqdm(total=total_images, unit="img", dynamic_ncols=True, desc="Generating", smoothing=0.05)
 
-    # Start writer process on rank0 for HDF5 mode
-    writer_proc = None
-    writer_queue = None
-    if save_mode == "hdf5" and rank == 0:
-        ctx = mp.get_context("spawn")
-        writer_queue = ctx.JoinableQueue(maxsize=max(1, writer_queue_max))
-        writer_proc = ctx.Process(
-            target=_hdf5_writer_loop,
-            args=(
-                writer_queue,
-                str(output_hdf5_path),
-                classes,
-                samples_per_class,
-                hdf5_compression,
-                hdf5_chunk_images,
-            ),
-            daemon=True,
+    # Per-rank shard writer (NO rank0 gather in the hot loop => uniform GPU utilization)
+    shard_writer = None
+    shards_dir = run_dir / "shards"
+    if save_mode == "hdf5":
+        shard_path = shards_dir / f"rank_{rank:03d}.h5"
+        shard_writer = RankH5Writer(
+            shard_path=shard_path,
+            classes=classes,
+            samples_per_class=samples_per_class,
+            compression=hdf5_compression,
+            chunk_images=hdf5_chunk_images,
         )
-        writer_proc.start()
+        shard_writer.open()
 
-    # Load network
     if rank == 0:
         print(f'Loading network from "{cfg["network_pkl"]}"...')
 
@@ -343,73 +407,52 @@ def _generate_worker(
         with dnnlib.util.open_url(cfg["network_pkl"]) as f:
             G = legacy.load_network_pkl(f)["G_ema"].eval().requires_grad_(False).to(device)
 
-        # progress sync batching (distributed)
         local_done_since_sync = 0
         sync_every = max(256, batch_gpu * 4)
 
-        # Generate class by class
         for class_idx in classes:
-            # Each rank generates its shard of indices
-            img_ids = list(range(rank, samples_per_class, world_size))
+            # Balanced block split (instead of stride) for stable utilization
+            my_ids = _split_indices_block(samples_per_class, rank, world_size)
+            if my_ids.size == 0:
+                continue
 
-            for start in range(0, len(img_ids), batch_gpu):
-                batch_ids = img_ids[start:start + batch_gpu]
-                if not batch_ids:
+            for start in range(0, my_ids.size, batch_gpu):
+                batch_ids = my_ids[start:start + batch_gpu]
+                if batch_ids.size == 0:
                     continue
 
-                # Deterministic per-sample seed
-                seeds = [seed_base + int(class_idx) * samples_per_class + int(idx) for idx in batch_ids]
+                # Seeds per sample index (deterministic)
+                seeds = seed_base + int(class_idx) * samples_per_class + batch_ids.astype(np.int64)
+                seeds_list = [int(s) for s in seeds.tolist()]  # gen_utils expects python ints
 
                 w = gen_utils.get_w_from_seed(
                     G,
-                    batch_sz=len(batch_ids),
+                    batch_sz=int(batch_ids.size),
                     device=device,
                     truncation_psi=truncation_psi,
                     seed=None,
                     centroids_path=centroids_path,
-                    class_idx=class_idx,
-                    seeds=seeds,
+                    class_idx=int(class_idx),
+                    seeds=seeds_list,
                 )
                 images_list = gen_utils.w_to_img(G, w, to_np=True)  # list of HWC uint8
 
-                # Convert to contiguous numpy batch for transfer/write
-                images_np = np.stack(images_list, axis=0).astype(np.uint8, copy=False)  # (B,H,W,C)
-                sample_idxs_np = np.asarray(batch_ids, dtype=np.int64)
-                seeds_np = np.asarray(seeds, dtype=np.int64)
+                images_np = np.stack(images_list, axis=0).astype(np.uint8, copy=False)
+                sample_idxs_np = batch_ids.astype(np.int64, copy=False)
+                seeds_np = seeds.astype(np.int64, copy=False)
 
-                # Free GPU-side refs ASAP to avoid leaks
+                # Free GPU refs ASAP (avoid fragmentation)
                 del w
-                # (Optional) helps reduce fragmentation; keep light
-                # torch.cuda.empty_cache()
 
-                # Save DURING generation
+                # Save DURING generation (no cross-rank sync here)
                 if save_mode == "dir":
-                    # Safe to write per-rank directly (unique filenames), no gather needed
-                    _save_images_to_dir(outdir, class_idx, sample_idxs_np, seeds_np, images_np, fmt=image_format)
+                    outdir = Path(cfg["outdir"])
+                    _save_images_to_dir(outdir, int(class_idx), sample_idxs_np, seeds_np, images_np, fmt=image_format)
                 else:
-                    # save_mode == "hdf5": gather to rank0 and enqueue to writer
-                    payload = (int(class_idx), sample_idxs_np, seeds_np, images_np)
-
-                    if world_size == 1:
-                        # Single GPU: directly enqueue
-                        writer_queue.put(payload)
-                    else:
-                        # Gather per-batch payloads from all ranks to rank0
-                        gathered: List[Any] = [None for _ in range(world_size)] if rank == 0 else None
-                        dist.gather_object(payload, object_gather_list=gathered, dst=0)
-
-                        if rank == 0:
-                            # Enqueue each rank's payload (skip empty)
-                            for item in gathered:
-                                if item is None:
-                                    continue
-                                cidx, sidxs, sds, imgs = item
-                                if imgs is None or len(sidxs) == 0:
-                                    continue
-                                writer_queue.put(item)
+                    shard_writer.write_batch(int(class_idx), sample_idxs_np, seeds_np, images_np)
 
                 # Update progress
-                local_done_since_sync += len(batch_ids)
+                local_done_since_sync += int(batch_ids.size)
 
                 if world_size > 1 and local_done_since_sync >= sync_every:
                     t = torch.tensor([local_done_since_sync], device=device, dtype=torch.long)
@@ -418,15 +461,11 @@ def _generate_worker(
                         pbar.update(int(t.item()))
                     local_done_since_sync = 0
                 elif world_size == 1 and rank == 0 and pbar is not None:
-                    pbar.update(len(batch_ids))
+                    pbar.update(int(batch_ids.size))
 
-                # Drop CPU refs ASAP (avoid accidental accumulation)
-                del images_list
-                del images_np
-                del sample_idxs_np
-                del seeds_np
+                # Drop CPU refs
+                del images_list, images_np, sample_idxs_np, seeds_np
 
-        # Final progress sync for distributed
         if world_size > 1 and local_done_since_sync > 0:
             t = torch.tensor([local_done_since_sync], device=device, dtype=torch.long)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -434,24 +473,11 @@ def _generate_worker(
                 pbar.update(int(t.item()))
             local_done_since_sync = 0
 
-    if rank == 0 and pbar is not None:
+    if pbar is not None:
         pbar.close()
 
-    # Finalize writer (rank0)
-    if save_mode == "hdf5" and rank == 0:
-        # Wait until all ranks finished generating before stopping writer
-        if world_size > 1:
-            dist.barrier()
-
-        # Drain queue and stop writer
-        writer_queue.join()          # wait all queued items processed
-        writer_queue.put(None)       # sentinel
-        writer_queue.join()          # mark sentinel as done
-        writer_proc.join()
-
-        # Quick final info
-        size_mb = output_hdf5_path.stat().st_size / (1024 * 1024)
-        print(f'✓ HDF5 written incrementally: "{output_hdf5_path}" ({size_mb:.1f} MB)')
+    if shard_writer is not None:
+        shard_writer.close()
 
     if world_size > 1:
         dist.barrier()
@@ -459,7 +485,7 @@ def _generate_worker(
 
 
 # ---------------------------
-# CLI
+# CLI / launcher
 # ---------------------------
 
 @click.command()
@@ -473,41 +499,36 @@ def _generate_worker(
 @click.option("--gpus", type=click.IntRange(min=1), help="GPUs to use (defaults to all)")
 @click.option("--outdir", type=str, required=True, metavar="DIR", help="Where to save outputs (dir or HDF5)")
 @click.option("--desc", type=str, metavar="STR", help="String to include in result filename")
-@click.option("--output-hdf5", type=str, metavar="FILE", help="Output HDF5 filename (only for --save-mode hdf5)")
 @click.option(
     "--save-mode",
     type=click.Choice(["hdf5", "dir"], case_sensitive=False),
     default="hdf5",
     show_default=True,
-    help="Save as one big HDF5 (incremental during generation) OR as folder with images.",
 )
+@click.option(
+    "--merge/--no-merge",
+    default=True,
+    show_default=True,
+    help="If save-mode=hdf5: merge per-rank shards into one big HDF5 after generation.",
+)
+@click.option("--output-hdf5", type=str, metavar="FILE", help="Final merged HDF5 filename (only if --merge)")
 @click.option(
     "--image-format",
     type=click.Choice(["png", "jpg", "jpeg"], case_sensitive=False),
     default="png",
     show_default=True,
-    help="Image format for --save-mode dir",
 )
 @click.option(
     "--hdf5-compression",
     type=click.Choice(["lzf", "none"], case_sensitive=False),
     default="lzf",
     show_default=True,
-    help="HDF5 compression (lzf is fast). Use 'none' for raw speed + bigger file.",
 )
 @click.option(
     "--hdf5-chunk-images",
     type=int,
     default=256,
     show_default=True,
-    help="Chunk length (images) along first dimension for HDF5 datasets.",
-)
-@click.option(
-    "--writer-queue-max",
-    type=int,
-    default=8,
-    show_default=True,
-    help="Max pending batches buffered for HDF5 writer (bounds RAM; prevents leaks).",
 )
 def generate_images(
     network_pkl: str,
@@ -520,29 +541,21 @@ def generate_images(
     gpus: Optional[int],
     outdir: str,
     desc: Optional[str],
-    output_hdf5: Optional[str],
     save_mode: str,
+    merge: bool,
+    output_hdf5: Optional[str],
     image_format: str,
     hdf5_compression: str,
     hdf5_chunk_images: int,
-    writer_queue_max: int,
 ):
     outdir_p = Path(outdir)
     outdir_p.mkdir(parents=True, exist_ok=True)
 
     desc_full = f"{Path(network_pkl).stem}_trunc_{truncation_psi}" + (f"-{desc}" if desc else "")
+    run_dir = Path(gen_utils.make_run_dir(str(outdir_p), desc_full))
 
-    # Normalize compression arg
-    hdf5_compression_norm = None if hdf5_compression.lower() == "none" else hdf5_compression.lower()
-
-    # Determine output HDF5 path (only if needed)
-    output_path: Optional[Path] = None
-    if save_mode.lower() == "hdf5":
-        if output_hdf5:
-            output_path = outdir_p / output_hdf5
-        else:
-            run_dir = Path(gen_utils.make_run_dir(str(outdir_p), desc_full))
-            output_path = run_dir / f"{desc_full}.h5"
+    # Normalize compression
+    compression_norm = None if hdf5_compression.lower() == "none" else hdf5_compression.lower()
 
     cfg = dict(
         network_pkl=network_pkl,
@@ -552,41 +565,84 @@ def generate_images(
         classes=classes,
         samples_per_class=samples_per_class,
         batch_gpu=batch_gpu,
-        outdir=str(outdir_p),
+        outdir=str(run_dir if save_mode.lower() == "hdf5" else outdir_p),
         desc_full=desc_full,
         save_mode=save_mode.lower(),
         image_format=image_format.lower(),
-        hdf5_compression=hdf5_compression_norm,
+        hdf5_compression=compression_norm,
         hdf5_chunk_images=hdf5_chunk_images,
-        writer_queue_max=writer_queue_max,
     )
 
-    # If launched with torchrun/srun with WORLD_SIZE, respect it
+    # If launched with torchrun/srun, respect that world
     env_world = int(os.environ.get("WORLD_SIZE", "1"))
     if env_world > 1:
         rank = int(os.environ.get("RANK", "0"))
-        _generate_worker(rank, env_world, cfg, "env://", output_path)
+        _generate_worker(rank, env_world, cfg, "env://", run_dir)
+        # Merge only on rank0
+        if save_mode.lower() == "hdf5" and merge and rank == 0:
+            shards_dir = run_dir / "shards"
+            final_path = (run_dir / (output_hdf5 or f"{desc_full}.h5"))
+            _merge_shards_to_one_h5(
+                merged_path=final_path,
+                shards_dir=shards_dir,
+                classes=classes,
+                samples_per_class=samples_per_class,
+                compression=compression_norm,
+                chunk_images=hdf5_chunk_images,
+                world_size=env_world,
+            )
+            size_mb = final_path.stat().st_size / (1024 * 1024)
+            print(f'✓ Merged HDF5: "{final_path}" ({size_mb:.1f} MB)')
         return
 
-    # Otherwise local spawn to match --gpus
+    # Otherwise local spawn
     num_gpus = gpus or (torch.cuda.device_count() or 1)
     if num_gpus == 1:
-        _generate_worker(0, 1, cfg, None, output_path)
+        _generate_worker(0, 1, cfg, None, run_dir)
+        if save_mode.lower() == "hdf5" and merge:
+            shards_dir = run_dir / "shards"
+            final_path = (run_dir / (output_hdf5 or f"{desc_full}.h5"))
+            _merge_shards_to_one_h5(
+                merged_path=final_path,
+                shards_dir=shards_dir,
+                classes=classes,
+                samples_per_class=samples_per_class,
+                compression=compression_norm,
+                chunk_images=hdf5_chunk_images,
+                world_size=1,
+            )
+            size_mb = final_path.stat().st_size / (1024 * 1024)
+            print(f'✓ Merged HDF5: "{final_path}" ({size_mb:.1f} MB)')
         return
 
-    with mp.get_context("spawn").Manager():  # ensures spawn context is usable
-        import tempfile
-        with tempfile.TemporaryDirectory() as temp_dir:
-            init_file = os.path.join(temp_dir, ".torch_distributed_init")
-            init_method = f"file://{init_file}"
+    import tempfile
+    with tempfile.TemporaryDirectory() as temp_dir:
+        init_file = os.path.join(temp_dir, ".torch_distributed_init")
+        init_method = f"file://{init_file}"
 
-            mp.set_start_method("spawn", force=True)
-            mp.spawn(
-                _generate_worker,
-                args=(num_gpus, cfg, init_method, output_path),
-                nprocs=num_gpus,
-                join=True,
-            )
+        mp.set_start_method("spawn", force=True)
+        mp.spawn(
+            _generate_worker,
+            args=(num_gpus, cfg, init_method, run_dir),
+            nprocs=num_gpus,
+            join=True,
+        )
+
+    # Merge after spawn (single-process here)
+    if save_mode.lower() == "hdf5" and merge:
+        shards_dir = run_dir / "shards"
+        final_path = (run_dir / (output_hdf5 or f"{desc_full}.h5"))
+        _merge_shards_to_one_h5(
+            merged_path=final_path,
+            shards_dir=shards_dir,
+            classes=classes,
+            samples_per_class=samples_per_class,
+            compression=compression_norm,
+            chunk_images=hdf5_chunk_images,
+            world_size=num_gpus,
+        )
+        size_mb = final_path.stat().st_size / (1024 * 1024)
+        print(f'✓ Merged HDF5: "{final_path}" ({size_mb:.1f} MB)')
 
 
 if __name__ == "__main__":
