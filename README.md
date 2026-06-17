@@ -118,6 +118,39 @@ python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ff
 ```
 
 
+## Configuration with Hydra
+
+In addition to the `train.py` click CLI, training can be launched via
+[Hydra](https://hydra.cc) with YAML configs. Both paths share the same
+`build_config()` logic in `train.py`, so they produce identical runs — models and
+loss are still referenced by class-path strings, so existing checkpoints and resume
+keep working.
+
+```
+# Override any option on the command line (keys mirror the CLI flags):
+python train_hydra.py outdir=./training-runs/ffhq data=./data/ffhq16.zip \
+        cfg=stylegan3-r gpus=8 batch_gpu=8 mirror=true snap=10 syn_layers=6
+
+# Or compose a ready-made experiment from configs/experiment/:
+python train_hydra.py +experiment=ffhq16_stem \
+        outdir=./training-runs/ffhq data=./data/ffhq16.zip
+```
+
+Configs live in `configs/` (`config.yaml` is the default; `configs/experiment/`
+holds composable stage presets). Helper launch scripts and the Slurm `sbatch` files
+live in `scripts/` (the latter moved to `scripts/sbatch/`).
+
+## Tests & CI
+
+Unit tests for the SAN layers live in `tests/` and run on CPU:
+
+```
+bash scripts/run_tests.sh      # or: python -m pytest tests/ -v
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the same test suite on every push
+to `main` and on pull requests, installing CPU-only PyTorch.
+
 ## Generating Samples
 ```python
 python gen_images.py \

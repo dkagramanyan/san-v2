@@ -1,0 +1,9 @@
+# @package _global_
+# FFHQ 16x16 stem stage (mirrors the first training command in the README).
+# Usage: python train_hydra.py +experiment=ffhq16_stem outdir=./training-runs/ffhq data=./data/ffhq16.zip
+cfg: stylegan3-r
+gpus: 8
+batch_gpu: 8
+mirror: true
+snap: 10
+syn_layers: 6

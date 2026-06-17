@@ -179,8 +179,19 @@ def parse_comma_separated_list(s):
 @click.option('--up_factor',    help='Up sampling factor of superres head', type=click.IntRange(min=2), default=2, show_default=True)
 
 def main(**kwargs):
-    # Initialize config.
+    # Initialize config from the command line and launch training.
     opts = dnnlib.EasyDict(kwargs)  # Command line arguments
+    launch_from_opts(opts)
+
+
+def build_config(opts):
+    """Assemble the training config dict ``c`` and run description from an options map.
+
+    ``opts`` is a dnnlib.EasyDict whose keys match the CLI options. This is shared by
+    the click CLI (``main``) and the Hydra entry point (``train_hydra.py``). Models and
+    loss are still referenced by ``class_name`` strings, so checkpoints and resume stay
+    fully compatible regardless of which entry point built the config.
+    """
     c = dnnlib.EasyDict()  # Main config dict.
     c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict())
     c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.0, 0.99], eps=1e-8, fused=True, foreach=False)
@@ -322,6 +333,13 @@ def main(**kwargs):
     ##################################
     ##################################
     ##################################
+
+    return c, desc
+
+
+def launch_from_opts(opts):
+    """Build the config from ``opts`` and launch training, handling auto-restart."""
+    c, desc = build_config(opts)
 
     # Launch.
     launch_training(c=c, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run)
