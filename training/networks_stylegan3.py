@@ -9,6 +9,7 @@
 """Generator architecture from the paper
 "Alias-Free Generative Adversarial Networks"."""
 
+import os
 import pickle
 import numpy as np
 import scipy.signal
@@ -129,7 +130,10 @@ class MappingNetwork(torch.nn.Module):
         self.w_avg_beta = w_avg_beta
 
         # additions
-        embed_path = 'in_embeddings/tf_efficientnet_lite0.pkl'
+        # Resolve relative to the repo root (CWD-independent); override with SAN_EMBED.
+        _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        embed_path = os.environ.get(
+            'SAN_EMBED', os.path.join(_repo_root, 'in_embeddings', 'tf_efficientnet_lite0.pkl'))
         # embed_path = 'in_embeddings/resnet50.pkl'
         with open(embed_path, 'rb') as f:
             self.embed = pickle.Unpickler(f).load()['embed']

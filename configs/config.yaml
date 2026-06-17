@@ -1,0 +1,68 @@
+# Default Hydra config for train_hydra.py.
+#
+# Keys mirror the train.py CLI options one-to-one, so anyone familiar with the CLI
+# can map directly. Override on the command line, e.g.:
+#
+#   python train_hydra.py outdir=./runs data=./data/ffhq16.zip gpus=8 batch_gpu=8
+#
+# or compose one of the example configs in configs/experiment/:
+#
+#   python train_hydra.py +experiment=ffhq16_stem
+#
+# Models/loss are referenced inside build_config() by class-path strings, so configs
+# stay decoupled from the module layout and checkpoints remain compatible.
+
+defaults:
+  - _self_
+
+# Required (no sensible default -- must be provided).
+outdir: ???                 # Where to save results
+cfg: stylegan3-r            # Base config: stylegan3-t | stylegan3-r | stylegan2 | fastgan
+data: ???                   # Training data: [ZIP|DIR]
+gpus: 1                     # Number of GPUs
+batch_gpu: 8                # Batch size per GPU (total batch = batch_gpu * gpus)
+
+# Optional features.
+cond: false                 # Train conditional model
+mirror: false               # Enable dataset x-flips
+resume: null                # Resume from given network pickle [PATH|URL]
+freezed: 0                  # Freeze first layers of D
+
+# Misc hyperparameters.
+cbase: 32768                # Capacity multiplier
+cmax: 512                   # Max. feature maps
+glr: null                   # G learning rate (null = cfg-dependent default)
+dlr: 0.002                  # D learning rate
+map_depth: null             # Mapping network depth (null = varies)
+
+# Misc settings.
+desc: null                  # String to include in result dir name
+metrics: [fid50k_full]      # Quality metrics ([] = none)
+kimg: 25000                 # Total training duration (kimg)
+tick: 4                     # How often to print progress (kimg)
+snap: 50                    # How often to save snapshots (ticks)
+save_weights_only: false    # Also save weights-only snapshots (G/D/G_ema, no resume state)
+seed: 0                     # Random seed
+fp32: false                 # Disable mixed-precision
+nobench: false              # Disable cuDNN benchmarking
+workers: 3                  # DataLoader worker processes
+dry_run: false              # Print training options and exit
+debug: false                # Enable debug logging to <run_dir>/debug.txt
+
+# StyleGAN-XL additions.
+restart_every: 999999999    # Time interval in seconds to restart code
+stem: false                 # Train the stem
+syn_layers: 14              # Number of layers in the stem
+superres: false             # Train superresolution stage (requires path_stem)
+path_stem: null             # Path to pretrained stem
+head_layers: 7              # Layers of added superresolution head
+cls_weight: 0.0             # Class guidance weight
+up_factor: 2                # Up-sampling factor of superres head
+
+# Keep the current working directory (repo root) so relative --data/--outdir paths
+# and the in_embeddings/ lookup behave exactly like the CLI.
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .

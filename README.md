@@ -118,6 +118,39 @@ python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ff
 ```
 
 
+## Configuration with Hydra
+
+In addition to the `train.py` click CLI, training can be launched via
+[Hydra](https://hydra.cc) with YAML configs. Both paths share the same
+`build_config()` logic in `train.py`, so they produce identical runs — models and
+loss are still referenced by class-path strings, so existing checkpoints and resume
+keep working.
+
+```
+# Override any option on the command line (keys mirror the CLI flags):
+python train_hydra.py outdir=./training-runs/ffhq data=./data/ffhq16.zip \
+        cfg=stylegan3-r gpus=8 batch_gpu=8 mirror=true snap=10 syn_layers=6
+
+# Or compose a ready-made experiment from configs/experiment/:
+python train_hydra.py +experiment=ffhq16_stem \
+        outdir=./training-runs/ffhq data=./data/ffhq16.zip
+```
+
+Configs live in `configs/` (`config.yaml` is the default; `configs/experiment/`
+holds composable stage presets). Helper launch scripts and the Slurm `sbatch` files
+live in `scripts/` (the latter moved to `scripts/sbatch/`).
+
+## Tests & CI
+
+Unit tests for the SAN layers live in `tests/` and run on CPU:
+
+```
+bash scripts/run_tests.sh      # or: python -m pytest tests/ -v
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the same test suite on every push
+to `main` and on pull requests, installing CPU-only PyTorch.
+
 ## Generating Samples
 ```python
 python gen_images.py \
@@ -145,3 +178,45 @@ distributed mode the workload is evenly partitioned and every GPU remains busy.
 During training the metric evaluators also inherit a dynamic per-GPU batch size
 from the current run (capped between 32 and 512), which keeps the detector
 queues full and cuts evaluation latency substantially.
+
+## Saving checkpoints vs. weights-only snapshots
+
+There are two kinds of artifacts the training loop can write:
+
+- **Full resume checkpoint** — `network-snapshot.pkl` (written when `--restart_every`
+  is set). It contains the `G`/`D`/`G_ema` networks **and** the training progress
+  (`cur_nimg`, tick, augmentation `p`, `pl_mean`, best FID) needed to resume training.
+  This feature is unchanged.
+- **Weights-only snapshot** — pass `--save-weights-only=true` to also write
+  `network-snapshot-<kimg>.pkl` every snapshot tick. These contain only the
+  `G`/`D`/`G_ema` weights (no resume state), so they are smaller and are intended for
+  inference/evaluation (`gen_images.py`, `calc_metrics.py`) — **not** for resuming
+  training. Use the full checkpoint above to resume.
+
+```
+python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-r --data=./data/ffhq16.zip \
+        --gpus=8 --batch-gpu 8 --snap 10 --save-weights-only=true
+```
+
+## Differences from the original Sony StyleSAN-XL
+
+This repository is a fork of Sony's
+[StyleSAN-XL](https://github.com/sony/san/tree/main/stylesan-xl) (which builds on
+StyleGAN-XL → StyleGAN3 + Projected GAN). The **SAN training objective, optimizer
+settings, and weight initialization are unchanged from upstream** — the changes here
+are engineering / infrastructure improvements:
+
+- **H200 kernel optimization** — a batched-matmul (BMM) path for 1×1 modulated
+  convolutions in the generator (`training/networks_stylegan3_resetting.py`).
+- **Fused Adam** for both G and D optimizers (`train.py`, `fused=True`).
+- **CUDA-kernel warmup** that JIT-compiles all kernel configurations before the loop
+  starts to avoid mid-training stalls (`training/training_loop.py:warmup_cuda_kernels`).
+- **Distributed image generation with HDF5 output** in `gen_images.py`.
+- **Dynamic per-GPU metric batch sizing** and NCCL all-gather based metric collection.
+- **Unified, opt-in debug/timing instrumentation** across the training stack
+  (`--debug`), writing to `<run_dir>/debug.txt` (no hardcoded paths).
+- **Weights-only snapshots** (`--save-weights-only`, see above) in addition to the
+  full resume checkpoint.
+- **CWD-independent ImageNet embedding loading** — the `in_embeddings/*.pkl` path is
+  resolved relative to the repo root and overridable via the `SAN_EMBED` env var.
+- **ImageNet 1024×1024 progressive-superres recipe** (see the training commands above).

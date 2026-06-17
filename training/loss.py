@@ -22,25 +22,35 @@ from torch_utils.ops import upfirdn2d
 import dnnlib
 import legacy
 import time
-import json
 
-# #region agent log
-_DEBUG_LOG_PATH = "/home/dgkagramanyan/.cursor/debug.log"
+# #region debug logging
+# Disabled by default. training_loop.set_debug_enabled() turns this on and points
+# it at <run_dir>/debug.txt so loss timings land in the same unified log as the
+# rest of the training stack (no hardcoded paths).
+_DEBUG_ENABLED = False
+_DEBUG_LOG_PATH = None
 _loss_call_count = 0
 
+def set_debug_config(enabled, log_path=None):
+    """Enable/disable debug logging for the loss module."""
+    global _DEBUG_ENABLED, _DEBUG_LOG_PATH
+    _DEBUG_ENABLED = enabled
+    _DEBUG_LOG_PATH = log_path
+
 def _debug_log(location, message, data=None, hypothesis_id=None):
-    """Write debug info to NDJSON log file."""
+    """Unified debug logging: prints to stdout and appends to the TXT log when enabled."""
+    if not _DEBUG_ENABLED:
+        return
     try:
-        entry = {
-            "timestamp": time.time() * 1000,
-            "location": location,
-            "message": message,
-            "data": data or {},
-            "sessionId": "cuda-kernel-debug",
-            "hypothesisId": hypothesis_id or "general"
-        }
-        with open(_DEBUG_LOG_PATH, 'a') as f:
-            f.write(json.dumps(entry) + '\n')
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_line = f"[{timestamp}] [{location}] {message}"
+        if data:
+            data_str = " | ".join(f"{k}={v}" for k, v in data.items())
+            log_line += f" | {data_str}"
+        print(log_line, flush=True)
+        if _DEBUG_LOG_PATH:
+            with open(_DEBUG_LOG_PATH, 'a') as f:
+                f.write(log_line + '\n')
     except Exception:
         pass
 # #endregion

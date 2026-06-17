@@ -1,3 +1,12 @@
+"""SAN (Slicing Adversarial Network) discriminative normalized linear layers.
+
+Each layer keeps a unit-norm weight (the "direction") and a separate learnable
+``scale`` (the "magnitude"). In training mode (``flg_train=True``) the forward pass
+returns ``[out_fun, out_dir]``: the function path detaches the weight so gradients
+flow to the input, while the direction path detaches the input so gradients flow to
+the weight. This separation is what induces metrizability (see arXiv:2301.12811).
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +15,21 @@ import torch.nn.functional as F
 def _normalize(tensor, dim):
     denom = tensor.norm(p=2.0, dim=dim, keepdim=True).clamp_min(1e-12)
     return tensor / denom
+
+
+def _san_dual_path(op, input, normalized_weight, scale, flg_train):
+    """Apply ``op(input, weight) * scale`` with SAN's dual-path gradient separation.
+
+    ``op(inp, w)`` must return the *un-scaled* linear/conv output. In training mode
+    (``flg_train=True``) this returns ``[out_fun, out_dir]`` where the function path
+    detaches the weight and the direction path detaches the input -- identical to the
+    original per-layer implementations, just factored out to remove duplication.
+    """
+    if flg_train:
+        out_fun = op(input, normalized_weight.detach())
+        out_dir = op(input.detach(), normalized_weight)
+        return [out_fun * scale, out_dir * scale.detach()]
+    return op(input, normalized_weight) * scale
 
 
 class SANLinear(nn.Linear):
@@ -31,15 +55,8 @@ class SANLinear(nn.Linear):
         if self.bias is not None:
             input = input + self.bias
         normalized_weight = self._get_normalized_weight()
-        scale = self.scale
-        if flg_train:
-            out_fun = F.linear(input, normalized_weight.detach(), None)
-            out_dir = F.linear(input.detach(), normalized_weight, None)
-            out = [out_fun * scale, out_dir * scale.detach()]
-        else:
-            out = F.linear(input, normalized_weight, None)
-            out = out * scale
-        return out
+        op = lambda inp, w: F.linear(inp, w, None)
+        return _san_dual_path(op, input, normalized_weight, self.scale, flg_train)
 
     @torch.no_grad()
     def normalize_weight(self):
@@ -79,17 +96,9 @@ class SANConv1d(nn.Conv1d):
             input = input + self.bias.view(self.in_channels, 1)
         normalized_weight = self._get_normalized_weight()
         scale = self.scale.view(self.out_channels, 1)
-        if flg_train:
-            out_fun = F.conv1d(input, normalized_weight.detach(), None, self.stride,
-                               self.padding, self.dilation, self.groups)
-            out_dir = F.conv1d(input.detach(), normalized_weight, None, self.stride,
-                               self.padding, self.dilation, self.groups)
-            out = [out_fun * scale, out_dir * scale.detach()]
-        else:
-            out = F.conv1d(input, normalized_weight, None, self.stride,
-                           self.padding, self.dilation, self.groups)
-            out = out * scale
-        return out
+        op = lambda inp, w: F.conv1d(inp, w, None, self.stride,
+                                     self.padding, self.dilation, self.groups)
+        return _san_dual_path(op, input, normalized_weight, scale, flg_train)
 
     @torch.no_grad()
     def normalize_weight(self):
@@ -129,17 +138,9 @@ class SANConv2d(nn.Conv2d):
             input = input + self.bias.view(self.in_channels, 1, 1)
         normalized_weight = self._get_normalized_weight()
         scale = self.scale.view(self.out_channels, 1, 1)
-        if flg_train:
-            out_fun = F.conv2d(input, normalized_weight.detach(), None, self.stride,
-                               self.padding, self.dilation, self.groups)
-            out_dir = F.conv2d(input.detach(), normalized_weight, None, self.stride,
-                               self.padding, self.dilation, self.groups)
-            out = [out_fun * scale, out_dir * scale.detach()]
-        else:
-            out = F.conv2d(input, normalized_weight, None, self.stride,
-                           self.padding, self.dilation, self.groups)
-            out = out * scale
-        return out
+        op = lambda inp, w: F.conv2d(inp, w, None, self.stride,
+                                     self.padding, self.dilation, self.groups)
+        return _san_dual_path(op, input, normalized_weight, scale, flg_train)
 
     @torch.no_grad()
     def normalize_weight(self):
