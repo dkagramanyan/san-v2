@@ -44,6 +44,9 @@ def set_debug_enabled(enabled, log_path=None):
     _DEBUG_LOG_PATH = log_path
     # Also configure generator debug logging
     networks_stylegan3_resetting.set_debug_config(enabled, log_path)
+    # Also configure loss debug logging (lazy import to avoid any import cycle)
+    from training import loss as _loss_module
+    _loss_module.set_debug_config(enabled, log_path)
 
 def _debug_log(location, message, data=None):
     """Unified debug logging: prints to stdout and writes to TXT file when enabled."""
@@ -70,6 +73,21 @@ def _debug_log(location, message, data=None):
     except Exception:
         pass
 # #endregion
+
+#----------------------------------------------------------------------------
+
+def save_weights_snapshot(snapshot_data, path):
+    """Save only model weights (G, D, G_ema modules) to ``path``.
+
+    The resulting pickle is loadable by ``legacy.load_network_pkl`` and therefore
+    by ``gen_images.py`` / ``calc_metrics.py``, but it deliberately omits the
+    training-resume state (``progress``, augmentation/dataset kwargs). It is meant
+    for inference/evaluation, NOT for resuming training -- use the full checkpoint
+    written by ``misc.get_ckpt_path`` for that.
+    """
+    weights_data = {k: snapshot_data[k] for k in ('G', 'D', 'G_ema') if k in snapshot_data}
+    with open(path, 'wb') as f:
+        dill.dump(weights_data, f)
 
 #----------------------------------------------------------------------------
 # CUDA kernel warmup to pre-trigger all kernel configurations
@@ -380,6 +398,7 @@ def training_loop(
     kimg_per_tick           = 4,        # Progress snapshot interval.
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
+    save_weights_only       = False,    # Save only model weights (G/D/G_ema) without resume state. Full checkpoint (resume) is unaffected.
     resume_pkl              = None,     # Network pickle to resume training from.
     resume_kimg             = 0,        # First kimg to report when resuming training.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
@@ -830,12 +849,13 @@ def training_loop(
                 del value # conserve memory
             stage(f'Network snapshot data prepared (kimg={cur_nimg/1e3:.1f})')
 
-            # save for current time step (only for superres training, as we do not evaluate metrics here)
-            if False:
-                snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
-                if rank == 0:
-                    with open(snapshot_pkl, 'wb') as f:
-                        dill.dump(snapshot_data, f)
+            # Save a weights-only snapshot for the current step (no resume state).
+            # This is independent of the full resume checkpoint below.
+            if save_weights_only and (rank == 0):
+                weights_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
+                stage(f'Saving weights-only snapshot "{weights_pkl}"')
+                save_weights_snapshot(snapshot_data, weights_pkl)
+                stage(f'Weights-only snapshot saved (kimg={cur_nimg/1e3:.1f})')
 
         # Save Checkpoint if needed
         if (rank == 0) and (restart_every > 0) and (network_snapshot_ticks is not None) and (

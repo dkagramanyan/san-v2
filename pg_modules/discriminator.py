@@ -12,45 +12,56 @@ from pg_modules.blocks import conv2d, DownBlock, DownBlockPatch
 from pg_modules.projector import F_RandomProj
 from feature_networks.constants import VITS
 
+
+def _build_disc_backbone(nc, ndf, start_sz, end_sz, head, patch):
+    """Build the shared downsampling backbone for SingleDisc / SingleDiscCond.
+
+    Returns ``(main, start_sz, nfc)`` where ``main`` is the ``nn.Sequential`` of down
+    blocks (optionally preceded by a head conv), ``start_sz`` is the (power-of-two
+    adjusted) starting resolution, and ``nfc`` is the channel map. Logic is identical
+    to the previous inline implementations -- this only removes duplication.
+    """
+    # midas channels
+    nfc_midas = {4: 512, 8: 512, 16: 256, 32: 128, 64: 64, 128: 64,
+                 256: 32, 512: 16, 1024: 8}
+
+    # interpolate for start sz that are not powers of two
+    if start_sz not in nfc_midas.keys():
+        sizes = np.array(list(nfc_midas.keys()))
+        start_sz = sizes[np.argmin(abs(sizes - start_sz))]
+    adjusted_start_sz = start_sz
+
+    # if given ndf, allocate all layers with the same ndf
+    if ndf is None:
+        nfc = nfc_midas
+    else:
+        nfc = {k: ndf for k, v in nfc_midas.items()}
+
+    # for feature map discriminators with nfc not in nfc_midas
+    # this is the case for the pretrained backbone (midas.pretrained)
+    if nc is not None and head is None:
+        nfc[start_sz] = nc
+
+    layers = []
+
+    # Head if the initial input is the full modality
+    if head:
+        layers += [conv2d(nc, nfc[256], 3, 1, 1, bias=False),
+                   nn.LeakyReLU(0.2, inplace=True)]
+
+    # Down Blocks
+    DB = DownBlockPatch if patch else DownBlock
+    while start_sz > end_sz:
+        layers.append(DB(nfc[start_sz], nfc[start_sz // 2]))
+        start_sz = start_sz // 2
+
+    return nn.Sequential(*layers), adjusted_start_sz, nfc
+
+
 class SingleDisc(nn.Module):
     def __init__(self, nc=None, ndf=None, start_sz=256, end_sz=8, head=None, patch=False):
         super().__init__()
-
-        # midas channels
-        nfc_midas = {4: 512, 8: 512, 16: 256, 32: 128, 64: 64, 128: 64,
-                     256: 32, 512: 16, 1024: 8}
-
-        # interpolate for start sz that are not powers of two
-        if start_sz not in nfc_midas.keys():
-            sizes = np.array(list(nfc_midas.keys()))
-            start_sz = sizes[np.argmin(abs(sizes - start_sz))]
-        self.start_sz = start_sz
-
-        # if given ndf, allocate all layers with the same ndf
-        if ndf is None:
-            nfc = nfc_midas
-        else:
-            nfc = {k: ndf for k, v in nfc_midas.items()}
-
-        # for feature map discriminators with nfc not in nfc_midas
-        # this is the case for the pretrained backbone (midas.pretrained)
-        if nc is not None and head is None:
-            nfc[start_sz] = nc
-
-        layers = []
-
-        # Head if the initial input is the full modality
-        if head:
-            layers += [conv2d(nc, nfc[256], 3, 1, 1, bias=False),
-                       nn.LeakyReLU(0.2, inplace=True)]
-
-        # Down Blocks
-        DB = DownBlockPatch if patch else DownBlock
-        while start_sz > end_sz:
-            layers.append(DB(nfc[start_sz], nfc[start_sz//2]))
-            start_sz = start_sz // 2
-
-        self.main = nn.Sequential(*layers)
+        self.main, self.start_sz, nfc = _build_disc_backbone(nc, ndf, start_sz, end_sz, head, patch)
         self.last_layer = SANConv2d(nfc[end_sz], 1, 4, 1, 0, bias=False)
 
     def forward(self, x, c, flg_train=False):
@@ -60,44 +71,8 @@ class SingleDiscCond(nn.Module):
     def __init__(self, nc=None, ndf=None, start_sz=256, end_sz=8, head=None, patch=False, c_dim=1000, cmap_dim=64, rand_embedding=False):
         super().__init__()
         self.cmap_dim = cmap_dim
-
-        # midas channels
-        nfc_midas = {4: 512, 8: 512, 16: 256, 32: 128, 64: 64, 128: 64,
-                     256: 32, 512: 16, 1024: 8}
-
-        # interpolate for start sz that are not powers of two
-        if start_sz not in nfc_midas.keys():
-            sizes = np.array(list(nfc_midas.keys()))
-            start_sz = sizes[np.argmin(abs(sizes - start_sz))]
-        self.start_sz = start_sz
-
-        # if given ndf, allocate all layers with the same ndf
-        if ndf is None:
-            nfc = nfc_midas
-        else:
-            nfc = {k: ndf for k, v in nfc_midas.items()}
-
-        # for feature map discriminators with nfc not in nfc_midas
-        # this is the case for the pretrained backbone (midas.pretrained)
-        if nc is not None and head is None:
-            nfc[start_sz] = nc
-
-        layers = []
-
-        # Head if the initial input is the full modality
-        if head:
-            layers += [conv2d(nc, nfc[256], 3, 1, 1, bias=False),
-                       nn.LeakyReLU(0.2, inplace=True)]
-
-        # Down Blocks
-        DB = DownBlockPatch if patch else DownBlock
-        while start_sz > end_sz:
-            layers.append(DB(nfc[start_sz],  nfc[start_sz//2]))
-            start_sz = start_sz // 2
-        self.main = nn.Sequential(*layers)
-
+        self.main, self.start_sz, nfc = _build_disc_backbone(nc, ndf, start_sz, end_sz, head, patch)
         self.cls = conv2d(nfc[end_sz], self.cmap_dim, 4, 1, 0, bias=False)
-
         self.embed = SANEmbedding(num_embeddings=c_dim, embedding_dim=self.cmap_dim)
 
     def forward(self, x, c, flg_train=False):
