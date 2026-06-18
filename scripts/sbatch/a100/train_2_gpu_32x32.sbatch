@@ -21,7 +21,6 @@ python train.py --outdir=./training-runs/ffhq \
         --cfg=stylegan3-r \
         --data=./datasets/o_bc_left_4x_1536_1024x1024_rgb_32x32.zip \
         --gpus=2 \
-        --batch=192 \
         --mirror=1 \
         --snap 250 \
         --batch-gpu 96 \

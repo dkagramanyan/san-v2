@@ -45,7 +45,6 @@ python train.py --outdir=./runs/wc-cv_h200 \
         --cfg=stylegan3-r \
         --data=./datasets/imagenet_9to4_1024x1024_128x128.zip \
         --gpus=1 \
-        --batch=60 \
         --mirror=0 \
         --tick 1 \
         --metrics None \
