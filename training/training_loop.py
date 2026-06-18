@@ -552,7 +552,6 @@ def training_loop(
     grid_c = None
     stage('Exporting sample images (reals.png, fakes_init.png)')
     grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
-    grid_reals = images  # real grid batch reused for combra metric evaluation
     if rank == 0:
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
 
@@ -562,6 +561,22 @@ def training_loop(
 
     if rank == 0:
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
+
+    # combra metric reference: the whole training set, scored against an equal
+    # number of generated images. Built once (the reference is fixed across
+    # training); reference-side features are memoised in combra_reference_cache.
+    # Latents/labels live on every rank for distributed generation; the reals
+    # (and the cache) are only needed on rank 0, which computes the metrics.
+    combra_num = len(training_set)
+    combra_labels = np.stack([training_set.get_label(i) for i in range(combra_num)])
+    combra_c = torch.from_numpy(combra_labels).to(device)
+    combra_z = torch.randn([combra_num, G.z_dim], device=device,
+        generator=torch.Generator(device=device).manual_seed(random_seed * num_gpus + 1))
+    combra_reals = None
+    combra_reference_cache = None
+    if rank == 0:
+        combra_reals = np.stack([training_set[i][0] for i in range(combra_num)])
+        combra_reference_cache = {}
 
     # Initialize logs.
     stage('Initializing logs (stats.jsonl, tensorboard)')
@@ -892,20 +907,23 @@ def training_loop(
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
                 stats_metrics.update(result_dict.results)
 
-            # combra in-memory generative-quality metrics (optional dependency).
+            # combra in-memory generative-quality metrics (optional dependency),
+            # scored over the whole training set vs an equal number of fakes.
             # A missing/uninstallable combra must never break training.
             combra_fakes = generate_snapshot_grid_images(
-                G_ema=snapshot_data['G_ema'], grid_z=grid_z, grid_c=grid_c,
+                G_ema=snapshot_data['G_ema'], grid_z=combra_z, grid_c=combra_c,
                 batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
             if rank == 0:
                 try:
                     from combra.metrics import compute_all_metrics
                     stage('Evaluating combra metrics')
-                    # G_ema outputs float in [-1, 1] but grid_reals are uint8 [0, 255];
+                    # G_ema outputs float in [-1, 1] but combra_reals are uint8 [0, 255];
                     # denormalize the fakes to the same scale so combra binarizes both
                     # sides identically (its angle path is scale-sensitive).
                     combra_fakes_u8 = np.rint(combra_fakes * 127.5 + 128).clip(0, 255).astype(np.uint8)
-                    combra_results = compute_all_metrics(grid_reals, combra_fakes_u8, device=device)
+                    combra_results = compute_all_metrics(
+                        combra_reals, combra_fakes_u8, device=device,
+                        reference_cache=combra_reference_cache)
                     for name, value in combra_results.items():
                         stats_metrics[f'combra_{name}'] = value
                     print('combra metrics: ' + ', '.join(

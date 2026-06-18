@@ -27,7 +27,6 @@ python train.py --outdir=./runs/wc-cv_h200 \
         --cfg=stylegan3-r \
         --data=./datasets/imagenet_9to4_1024x1024_16x16.zip \
         --gpus=4 \
-        --batch=1280 \
         --mirror=0 \
         --snap 500 \
         --batch-gpu 320 \

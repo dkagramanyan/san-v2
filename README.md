@@ -84,35 +84,35 @@ python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/p
 ### Training
 ```
 python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-r --data=./data/ffhq16.zip \
-        --gpus=8 --batch=2048 --mirror=1 --snap 10 --batch-gpu 8 squeue --syn_layers 6
+        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --syn_layers 6
 
 python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-r --data=./data/ffhq32.zip \
-        --gpus=8 --batch=2048 --mirror=1 --snap 10 --batch-gpu 8 --kimg 175000 --syn_layers 6 \
+        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 175000 --syn_layers 6 \
         --superres --up_factor 2 --head_layers 7 \
         --path_stem training-runs/ffhq/00000-stylegan3-r-ffhq16-gpus8-batch2048/best_model.pkl
 
 python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq64.zip \
-        --gpus=8 --batch=256 --mirror=1 --snap 10 --batch-gpu 8 --kimg 95000 --syn_layers 6 \
+        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 95000 --syn_layers 6 \
         --superres --up_factor 2 --head_layers 4 \
         --path_stem training-runs/ffhq/00001-stylegan3-r-ffhq32-gpus8-batch2048/best_model.pkl
 
 python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq128.zip \
-        --gpus=8 --batch=256 --mirror=1 --snap 10 --batch-gpu 8 --kimg 57000 --syn_layers 6 \
+        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 57000 --syn_layers 6 \
         --superres --up_factor 2 --head_layers 4 \
         --path_stem training-runs/ffhq/00002-stylegan3-t-ffhq64-gpus8-batch256/best_model.pkl
 
 python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq256.zip \
-        --gpus=8 --batch=256 --mirror=1 --snap 10 --batch-gpu 8 --kimg 11000 --syn_layers 6 \
+        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 11000 --syn_layers 6 \
         --superres --up_factor 2 --head_layers 4 \
         --path_stem training-runs/ffhq/00003-stylegan3-t-ffhq128-gpus8-batch256/best_model.pkl
 
 python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq512.zip \
-        --gpus=8 --batch=128 --mirror=1 --snap 10 --batch-gpu 8 --kimg 4000 --syn_layers 6 \
+        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 4000 --syn_layers 6 \
         --superres --up_factor 2 --head_layers 4 \
         --path_stem training-runs/ffhq/00004-stylegan3-t-ffhq256-gpus8-batch256/best_model.pkl
 
 python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq1024.zip \
-        --gpus=8 --batch=128 --mirror=1 --snap 10 --batch-gpu 8 --kimg 4000 --syn_layers 6 \
+        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 4000 --syn_layers 6 \
         --superres --up_factor 2 --head_layers 4 \
         --path_stem training-runs/ffhq/00005-stylegan3-t-ffhq512-gpus8-batch128/best_model.pkl
 ```
