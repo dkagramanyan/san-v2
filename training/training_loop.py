@@ -901,7 +901,11 @@ def training_loop(
                 try:
                     from combra.metrics import compute_all_metrics
                     stage('Evaluating combra metrics')
-                    combra_results = compute_all_metrics(grid_reals, combra_fakes, device=device)
+                    # G_ema outputs float in [-1, 1] but grid_reals are uint8 [0, 255];
+                    # denormalize the fakes to the same scale so combra binarizes both
+                    # sides identically (its angle path is scale-sensitive).
+                    combra_fakes_u8 = np.rint(combra_fakes * 127.5 + 128).clip(0, 255).astype(np.uint8)
+                    combra_results = compute_all_metrics(grid_reals, combra_fakes_u8, device=device)
                     for name, value in combra_results.items():
                         stats_metrics[f'combra_{name}'] = value
                     print('combra metrics: ' + ', '.join(
