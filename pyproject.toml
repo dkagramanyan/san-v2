@@ -40,6 +40,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7.0"]
+# Optional: enables combra angle-Wasserstein + CMMD/FD-DINOv2/FID metrics during
+# training evaluation. Training works without it (the import is guarded).
+combra = ["combra"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -552,6 +552,7 @@ def training_loop(
     grid_c = None
     stage('Exporting sample images (reals.png, fakes_init.png)')
     grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
+    grid_reals = images  # real grid batch reused for combra metric evaluation
     if rank == 0:
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
 
@@ -890,6 +891,25 @@ def training_loop(
                 if rank == 0:
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
                 stats_metrics.update(result_dict.results)
+
+            # combra in-memory generative-quality metrics (optional dependency).
+            # A missing/uninstallable combra must never break training.
+            combra_fakes = generate_snapshot_grid_images(
+                G_ema=snapshot_data['G_ema'], grid_z=grid_z, grid_c=grid_c,
+                batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
+            if rank == 0:
+                try:
+                    from combra.metrics import compute_all_metrics
+                    stage('Evaluating combra metrics')
+                    combra_results = compute_all_metrics(grid_reals, combra_fakes, device=device)
+                    for name, value in combra_results.items():
+                        stats_metrics[f'combra_{name}'] = value
+                    print('combra metrics: ' + ', '.join(
+                        f'{k}={v:.4f}' for k, v in combra_results.items()), flush=True)
+                except ImportError:
+                    print('[combra] not installed; skipping combra metrics', flush=True)
+                except Exception as e:
+                    print(f'[combra] metric evaluation failed: {e}', flush=True)
 
             # save best fid ckpt
             snapshot_pkl = os.path.join(run_dir, f'best_model.pkl')
