@@ -1,202 +1,218 @@
 # Slicing Adversarial Network (SAN) [ICLR 2024]
 
-This repository contains the official PyTorch implementation of **"SAN: Inducing Metrizability of GAN with Discriminative Normalized Linear Layer"** (*[arXiv 2301.12811](https://arxiv.org/abs/2301.12811)*).
+This repository contains a fork of the official PyTorch implementation of **"SAN: Inducing Metrizability of GAN with Discriminative Normalized Linear Layer"** (*[arXiv 2301.12811](https://arxiv.org/abs/2301.12811)*).
 Please cite [[1](#citation)] in your work when using this code in your experiments.
 
 ### [[Project Page]](https://ytakida.github.io/san/)
 
+This fork (`san-v2`) is specialised for generating **WC-Co microstructure SEM images**
+(the `imagenet_9to4` dataset, three grain classes). It is trained **progressively**
+(low → high resolution), every stage resuming from the previous stage's
+`best_model.pkl`. See [Differences from upstream](#differences-from-the-original-sony-stylesan-xl)
+for the engineering changes, and the combra docs page (`san_v2`) for how training
+evaluation is wired into [combra](https://github.com/dkagramanyan/combra).
 
-## Installation
+The guide below walks through **install → test → train → generate**. On the cluster
+all four steps run on **H200 GPUs** via the ready-made Slurm scripts in
+[`sbatch/`](sbatch/).
 
-Create conda env with python=3.12
 
-```
-cd san
+## 1. Installation
+
+Create a conda env with `python=3.12`, then install the Python deps:
+
+```bash
+cd san-v2
 pip install -r requirements.txt
 ```
 
+Remove any conda-provided torch/CUDA and install the matching wheels:
 
-Uninstall old anaconda and cuda
-
-```
+```bash
 pip uninstall torch torchvision -y
-pip uninstall nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12  -y
-```
-
-Install new versions
-
-```
+pip uninstall nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12 -y
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 ```
 
-You should install only 1 version of ninja, using anaconda. Without it you will get errors
-```
+Install **exactly one** ninja, from conda — otherwise the custom CUDA ops fail to build:
+
+```bash
 conda install anaconda::ninja -y
 ```
 
-Check 
-```
-conda list | grep -E "torch|cuda|cudnn"
-```
-
-After it is neccesary to check the plugins
+Verify the toolchain:
 
 ```bash
-python test.py
+conda list | grep -E "torch|cuda|cudnn|ninja"
 ```
 
 
-## FFHQ
+## 2. Test the build
 
-### Data preparation  
+The custom CUDA ops (`bias_act`, `filtered_lrelu`, `upfirdn2d`, …) are JIT-compiled on
+first use. Compile and check them against PyTorch references — including the H200
+(Hopper `sm_90`) path — before training:
 
-```
-python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
-                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_16x16.zip \
-                         --resolution=16x16
-
-python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
-                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_32x32.zip \
-                         --resolution=32x32
-
-python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
-                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_64x64.zip \
-                         --resolution=64x64                      
-
-python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
-                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_128x128.zip \
-                         --resolution=128x128
-
-python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
-                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_256x256.zip \
-                         --resolution=256x256
-
-python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
-                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_512x512.zip \
-                         --resolution=512x512
-
-python dataset_tool.py --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
-                         --dest=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024_1024x1024.zip \
-                         --resolution=1024x1024
-
+```bash
+python tests/test_cuda_ops.py
 ```
 
-### Training
-```
-python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-r --data=./data/ffhq16.zip \
-        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --syn_layers 6
+The SAN-layer unit tests run on CPU and are wired into CI (the GPU CUDA-op tests above
+are auto-skipped without a GPU):
 
-python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-r --data=./data/ffhq32.zip \
-        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 175000 --syn_layers 6 \
+```bash
+python -m pytest tests/ -v
+```
+
+
+## 3. Data preparation
+
+`dataset_tool.py` packs a preprocessed image folder into a resolution-specific `.zip`.
+Build one zip per stage of the progressive recipe (16² → 1024²):
+
+```bash
+for res in 16x16 32x32 64x64 128x128 256x256 512x512 1024x1024; do
+  python dataset_tool.py \
+    --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
+    --dest=./datasets/imagenet_9to4_1024x1024_${res}.zip \
+    --resolution=${res}
+done
+```
+
+
+## 4. Training
+
+Training is **progressive**: the 16² stem trains from scratch, and every higher
+resolution is a super-resolution stage that resumes from the previous stage's
+`best_model.pkl` via `--path_stem`.
+
+```bash
+# Stage 0 — 16x16 stem (no superres)
+python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
+        --data=./datasets/imagenet_9to4_1024x1024_16x16.zip \
+        --gpus=2 --mirror=0 --snap 500 --batch-gpu 320 --kimg 20000 --syn_layers 6
+
+# Stage N — superres, resuming from the previous stage's best_model.pkl
+python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
+        --data=./datasets/imagenet_9to4_1024x1024_32x32.zip \
+        --gpus=2 --mirror=0 --snap 100 --batch-gpu 96 --kimg 20000 --syn_layers 6 \
         --superres --up_factor 2 --head_layers 7 \
-        --path_stem training-runs/ffhq/00000-stylegan3-r-ffhq16-gpus8-batch2048/best_model.pkl
-
-python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq64.zip \
-        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 95000 --syn_layers 6 \
-        --superres --up_factor 2 --head_layers 4 \
-        --path_stem training-runs/ffhq/00001-stylegan3-r-ffhq32-gpus8-batch2048/best_model.pkl
-
-python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq128.zip \
-        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 57000 --syn_layers 6 \
-        --superres --up_factor 2 --head_layers 4 \
-        --path_stem training-runs/ffhq/00002-stylegan3-t-ffhq64-gpus8-batch256/best_model.pkl
-
-python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq256.zip \
-        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 11000 --syn_layers 6 \
-        --superres --up_factor 2 --head_layers 4 \
-        --path_stem training-runs/ffhq/00003-stylegan3-t-ffhq128-gpus8-batch256/best_model.pkl
-
-python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq512.zip \
-        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 4000 --syn_layers 6 \
-        --superres --up_factor 2 --head_layers 4 \
-        --path_stem training-runs/ffhq/00004-stylegan3-t-ffhq256-gpus8-batch256/best_model.pkl
-
-python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-t --data=./data/ffhq1024.zip \
-        --gpus=8 --mirror=1 --snap 10 --batch-gpu 8 --kimg 4000 --syn_layers 6 \
-        --superres --up_factor 2 --head_layers 4 \
-        --path_stem training-runs/ffhq/00005-stylegan3-t-ffhq512-gpus8-batch128/best_model.pkl
+        --path_stem ./runs/wc-cv_h200/00000-stylegan3-r-imagenet_9to4_1024x1024_16x16-gpus4-batch560/best_model.pkl
 ```
 
+Per-stage tuned settings (resolution → per-GPU batch on 2× H200; `--batch-gpu` is
+per GPU, so total batch = `batch-gpu × gpus`):
 
-## Configuration with Hydra
+| stage | resolution | `--batch-gpu` | resumes from |
+|---|---|---|---|
+| 0 | 16×16   | 320 | — (stem) |
+| 1 | 32×32   | 96  | stage 0 |
+| 2 | 64×64   | 120 | stage 1 |
+| 3 | 128×128 | 64  | stage 2 |
+| 4 | 256×256 | 42  | stage 3 |
+| 5 | 512×512 | 25  | stage 4 |
+| 6 | 1024×1024 | 14 | stage 5 |
 
-In addition to the `train.py` click CLI, training can be launched via
-[Hydra](https://hydra.cc) with YAML configs. Both paths share the same
-`build_config()` logic in `train.py`, so they produce identical runs — models and
-loss are still referenced by class-path strings, so existing checkpoints and resume
-keep working.
+### Launching on H200 (Slurm)
 
-```
-# Override any option on the command line (keys mirror the CLI flags):
-python train_hydra.py outdir=./training-runs/ffhq data=./data/ffhq16.zip \
-        cfg=stylegan3-r gpus=8 batch_gpu=8 mirror=true snap=10 syn_layers=6
+Each stage has a ready-made script in [`sbatch/`](sbatch/) (2× H200 each). They are
+written to be **submitted from the sbatch folder** and jobs land on the `rocky`
+partition (no reservation needed):
 
-# Or compose a ready-made experiment from configs/experiment/:
-python train_hydra.py +experiment=ffhq16_stem \
-        outdir=./training-runs/ffhq data=./data/ffhq16.zip
-```
-
-Configs live in `configs/` (`config.yaml` is the default; `configs/experiment/`
-holds composable stage presets). Helper launch scripts and the Slurm `sbatch` files
-live in `scripts/` (the latter moved to `scripts/sbatch/`).
-
-## Tests & CI
-
-Unit tests for the SAN layers live in `tests/` and run on CPU:
-
-```
-bash scripts/run_tests.sh      # or: python -m pytest tests/ -v
+```bash
+cd sbatch
+sbatch train_16x16.sbatch
+sbatch train_32x32.sbatch
+# … through train_1024x1024.sbatch
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs the same test suite on every push
-to `main` and on pull requests, installing CPU-only PyTorch.
+Each script resolves the repo root itself, loads the H200 toolchain
+(`CUDA/12.9`, `TORCH_CUDA_ARCH_LIST=9.0`), activates the per-node conda env and
+uses a persistent kernel cache, so a resubmit skips JIT recompilation.
 
-## Generating Samples
-```python
+### Hydra entry point
+
+The same runs can be launched through [Hydra](https://hydra.cc) — `train_hydra.py`
+shares `train.py`'s `build_config()`, so checkpoints and resume are interchangeable:
+
+```bash
+python train_hydra.py outdir=./runs cfg=stylegan3-r cond=true \
+        data=./datasets/imagenet_9to4_1024x1024_16x16.zip gpus=2 batch_gpu=320
+```
+
+The click CLI is the single source of truth for defaults, so
+[`configs/config.yaml`](configs/config.yaml) only declares the required fields
+(`outdir`/`cfg`/`data`/`gpus`/`batch_gpu`); override any other `train.py` flag on the
+command line using its Python name (e.g. `syn_layers=6`, `superres=true`).
+
+
+## 5. Generating samples
+
+```bash
 python gen_images.py \
   --outdir=./generated/ \
   --trunc=0.7 \
   --samples-per-class 1000 \
   --classes 0,1,2 \
-  --gpus 4 \
+  --gpus 2 \
   --batch-gpu 60 \
-  --network=./runs/wc-cv_h200/00002-stylegan3-r-imagenet_9to4_1024x1024_64x64-gpus4-batch480/best_model.pkl
+  --network=./runs/wc-cv_h200/00004-stylegan3-r-imagenet_9to4_1024x1024_256x256-gpus4-batch168/best_model.pkl
 ```
-Images are written per class into `class_<id>/<class>_<index>.png`; run with `torchrun` or the `--gpus` flag to distribute work across available GPUs.
+
+Images are written per class into `class_<id>/<class>_<index>.png`; pass `--gpus`
+(or launch with `torchrun`) to distribute generation across GPUs. On the cluster use the
+per-resolution scripts [`sbatch/generate_256x256.sbatch`](sbatch/generate_256x256.sbatch),
+`generate_512x512.sbatch` or `generate_1024x1024.sbatch` (submit from the sbatch folder,
+same as training).
+
+> **Class index → grain morphology** is documented in the combra `san_v2` docs page;
+> note the SAN index order differs from DiffiT (the `Co11`↔`Co25` swap).
+
 
 ## Quality Metrics
-You need to preprocess a dataset in advance, following Data Preparation.
-To calculate metrics for a specific network snapshot, run
-```
+
+Score a trained snapshot with the StyleGAN-XL metric runners (build the matching
+dataset zip first, per [Data preparation](#3-data-preparation)):
+
+```bash
 python calc_metrics.py --metrics=fid50k_full --network=<path_to_checkpoint>
-python calc_metrics.py --metrics=is50k --network=<path_to_checkpoint>
+python calc_metrics.py --metrics=is50k       --network=<path_to_checkpoint>
 ```
 
-The metric runners now gather features across GPUs via NCCL all-gathers,
-eliminating the previous per-rank broadcast loop. When you launch metrics in
-distributed mode the workload is evenly partitioned and every GPU remains busy.
-During training the metric evaluators also inherit a dynamic per-GPU batch size
-from the current run (capped between 32 and 512), which keeps the detector
-queues full and cuts evaluation latency substantially.
+Metric runners gather features across GPUs via NCCL all-gathers (no per-rank
+broadcast loop), and in distributed mode the workload is evenly partitioned so every
+GPU stays busy. During training the metric evaluators inherit a dynamic per-GPU batch
+size from the current run (capped between 32 and 512), keeping the detector queues
+full and cutting evaluation latency.
 
-## Saving checkpoints vs. weights-only snapshots
 
-There are two kinds of artifacts the training loop can write:
+## Saving checkpoints vs. weights-only vs. inference-only snapshots
+
+There are three kinds of artifacts the training loop can write — in **decreasing size**:
 
 - **Full resume checkpoint** — `network-snapshot.pkl` (written when `--restart_every`
   is set). It contains the `G`/`D`/`G_ema` networks **and** the training progress
   (`cur_nimg`, tick, augmentation `p`, `pl_mean`, best FID) needed to resume training.
-  This feature is unchanged.
 - **Weights-only snapshot** — pass `--save-weights-only=true` to also write
-  `network-snapshot-<kimg>.pkl` every snapshot tick. These contain only the
-  `G`/`D`/`G_ema` weights (no resume state), so they are smaller and are intended for
-  inference/evaluation (`gen_images.py`, `calc_metrics.py`) — **not** for resuming
-  training. Use the full checkpoint above to resume.
+  `network-snapshot-<kimg>.pkl` every snapshot tick. These contain the `G`/`D`/`G_ema`
+  weights (no resume state) — smaller than the full checkpoint, but still carry the
+  large projected discriminator.
+- **Inference-only snapshot** — pass `--save-inference-only=true` to also write
+  `network-snapshot-<kimg>-inference.pkl` every snapshot tick. This holds **only
+  `G_ema`** (no discriminator, no non-EMA generator, no resume state), so it is by far
+  the smallest. It is exactly what `gen_images.py` / `calc_metrics.py` load
+  (`legacy.load_network_pkl` mirrors `G_ema` onto `G` on load). **Not** for resuming.
 
+The weights-only and inference-only snapshots are for inference/evaluation; use the
+full resume checkpoint to continue training. The `sbatch/train_*.sbatch` scripts pass
+`--save-inference-only True` so every run leaves small, ready-to-ship generators.
+
+```bash
+python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
+        --data=./datasets/imagenet_9to4_1024x1024_16x16.zip \
+        --gpus=2 --batch-gpu 320 --snap 10 --save-inference-only=true
 ```
-python train.py --outdir=./training-runs/ffhq --cfg=stylegan3-r --data=./data/ffhq16.zip \
-        --gpus=8 --batch-gpu 8 --snap 10 --save-weights-only=true
-```
+
 
 ## Differences from the original Sony StyleSAN-XL
 
@@ -215,8 +231,10 @@ are engineering / infrastructure improvements:
 - **Dynamic per-GPU metric batch sizing** and NCCL all-gather based metric collection.
 - **Unified, opt-in debug/timing instrumentation** across the training stack
   (`--debug`), writing to `<run_dir>/debug.txt` (no hardcoded paths).
-- **Weights-only snapshots** (`--save-weights-only`, see above) in addition to the
-  full resume checkpoint.
+- **Weights-only** (`--save-weights-only`) and **inference-only** (`--save-inference-only`,
+  `G_ema` only — the smallest artifact) snapshots, in addition to the full resume checkpoint.
 - **CWD-independent ImageNet embedding loading** — the `in_embeddings/*.pkl` path is
   resolved relative to the repo root and overridable via the `SAN_EMBED` env var.
-- **ImageNet 1024×1024 progressive-superres recipe** (see the training commands above).
+- **ImageNet 1024×1024 progressive-superres recipe** (the training commands above).
+- **combra training-evaluation integration** — optional per-tick scoring of generated
+  samples with `combra.metrics.compute_all_metrics` (see the combra `san_v2` docs).

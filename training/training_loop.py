@@ -90,6 +90,20 @@ def save_weights_snapshot(snapshot_data, path):
         dill.dump(weights_data, f)
 
 #----------------------------------------------------------------------------
+
+def save_inference_snapshot(snapshot_data, path):
+    """Save only the EMA generator (``G_ema``) -- the smallest inference artifact.
+
+    Contains just the network ``gen_images.py`` / ``calc_metrics.py`` actually use,
+    dropping the discriminator, the non-EMA generator and all training-resume state.
+    ``legacy.load_network_pkl`` mirrors ``G_ema`` onto ``G`` on load, so the pickle
+    stays loadable. NOT usable for resuming training -- use the full checkpoint.
+    """
+    inference_data = {'G_ema': snapshot_data['G_ema']}
+    with open(path, 'wb') as f:
+        dill.dump(inference_data, f)
+
+#----------------------------------------------------------------------------
 # CUDA kernel warmup to pre-trigger all kernel configurations
 
 def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
@@ -399,6 +413,7 @@ def training_loop(
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
     save_weights_only       = False,    # Save only model weights (G/D/G_ema) without resume state. Full checkpoint (resume) is unaffected.
+    save_inference_only     = False,    # Save a small inference-only snapshot (G_ema only, no D/resume state) every snapshot tick.
     resume_pkl              = None,     # Network pickle to resume training from.
     resume_kimg             = 0,        # First kimg to report when resuming training.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
@@ -872,6 +887,13 @@ def training_loop(
                 stage(f'Saving weights-only snapshot "{weights_pkl}"')
                 save_weights_snapshot(snapshot_data, weights_pkl)
                 stage(f'Weights-only snapshot saved (kimg={cur_nimg/1e3:.1f})')
+
+            # Save a small inference-only snapshot (G_ema only) for the current step.
+            if save_inference_only and (rank == 0):
+                inference_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}-inference.pkl')
+                stage(f'Saving inference-only snapshot "{inference_pkl}"')
+                save_inference_snapshot(snapshot_data, inference_pkl)
+                stage(f'Inference-only snapshot saved (kimg={cur_nimg/1e3:.1f})')
 
         # Save Checkpoint if needed
         if (rank == 0) and (restart_every > 0) and (network_snapshot_ticks is not None) and (

@@ -37,6 +37,10 @@ def load_network_pkl(f, force_fp16=False):
         data['training_set_kwargs'] = None
     if 'augment_pipe' not in data:
         data['augment_pipe'] = None
+    # Inference-only snapshots contain just G_ema; mirror it onto G so the generic
+    # loader (and callers expecting 'G') still works.
+    if 'G' not in data and 'G_ema' in data:
+        data['G'] = data['G_ema']
 
     # Validate contents.
     assert isinstance(data['G'], torch.nn.Module)
