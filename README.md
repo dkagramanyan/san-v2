@@ -36,8 +36,7 @@ Install, all into the conda env:
 
 ```bash
 pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu132
-conda install -c nvidia cuda-nvcc -y      # match torch's CUDA major (13.x)
-conda install anaconda::ninja -y
+pip3 install ninja    # match torch's CUDA major (13.x)
 ```
 
 The training/inference scripts use this conda toolkit directly — they set
