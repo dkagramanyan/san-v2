@@ -19,16 +19,17 @@ import numpy as np
 # Make the repo root importable whether run as `python tests/test_cuda_ops.py` or via pytest.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Under pytest, skip this whole module when there is no GPU (the custom ops require
-# CUDA, and CI runs CPU-only). It still runs as a standalone script without pytest.
-try:
+# When collected by pytest without a GPU (e.g. CPU-only CI), skip the whole module
+# *before* importing the CUDA-op modules below -- their import chain pulls in deps
+# (dnnlib -> requests) that the GPU tests don't need on CPU. Running the file directly
+# as a script still works: main() reports cleanly when CUDA is unavailable.
+if __name__ != "__main__":
     import pytest
-    pytestmark = pytest.mark.skipif(
-        not torch.cuda.is_available(),
-        reason="custom CUDA ops require a GPU; run `python tests/test_cuda_ops.py` on an H200",
-    )
-except ImportError:
-    pass
+    if not torch.cuda.is_available():
+        pytest.skip(
+            "custom CUDA ops require a GPU; run `python tests/test_cuda_ops.py` on an H200",
+            allow_module_level=True,
+        )
 
 # Import custom ops modules
 from torch_utils import custom_ops
