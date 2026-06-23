@@ -956,9 +956,13 @@ def training_loop(
                         # denormalize the fakes to the same scale so combra binarizes both
                         # sides identically (its angle path is scale-sensitive).
                         combra_fakes_u8 = np.rint(combra_fakes * 127.5 + 128).clip(0, 255).astype(np.uint8)
+                        # image_metrics=True also computes the image-feature metrics
+                        # (fid, cmmd, fd_dinov2) alongside the angle-density ones; any
+                        # whose backend is unavailable (e.g. no network for DINOv2/CLIP
+                        # weights) comes back as nan rather than aborting.
                         combra_results = compute_all_metrics(
                             combra_reals, combra_fakes_u8, device=device,
-                            reference_cache=combra_reference_cache)
+                            reference_cache=combra_reference_cache, image_metrics=True)
                         # Cast to float so the TensorBoard scalar writer (Metrics/combra_*)
                         # accepts every value, including numpy scalars and NaNs.
                         for name, value in combra_results.items():

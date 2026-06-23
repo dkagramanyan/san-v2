@@ -75,6 +75,19 @@ are auto-skipped without a GPU):
 python -m pytest tests/ -v
 ```
 
+### Pre-download pretrained weights (offline nodes)
+
+Training pulls pretrained backbones from the network on first use — the discriminator
+backbones (`deit_base_distilled_patch16_224`, `tf_efficientnet_lite0`), the
+classifier-guidance model (`deit_small_distilled_patch16_224`), and, for
+`--combra-metrics`, the InceptionV3 / CLIP / DINOv2 weights. If your compute nodes have
+no internet, fetch them once on a login node — they cache under `$HOME` (shared with the
+compute nodes), so the training job then needs no network:
+
+```bash
+python tests/test_cuda_ops.py --download-models
+```
+
 
 ## 3. Data preparation
 
