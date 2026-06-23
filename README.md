@@ -85,13 +85,14 @@ no internet, fetch them once on a login node — they cache under `$HOME` (share
 compute nodes), so the training job then needs no network:
 
 ```bash
-bash download_models.sh        # pins the cache paths, then downloads everything
+bash download_models.sh        # pure wget/curl/git, no Python
 ```
 
-`download_models.sh` sets the per-framework cache dirs (`TORCH_HOME`, `HF_HOME`,
-`XDG_CACHE_HOME`) under `$HOME/.cache` by default — override with `MODEL_CACHE=/shared/path`
-to land them on a shared filesystem. It just wraps the Python downloader, so
-`python tests/test_san_modules.py` does the same fetch using the default cache locations.
+`download_models.sh` downloads each weight file straight into the caches the libraries
+read (`$HOME/.cache/torch/hub/checkpoints`, `$HOME/.cache/clip`, …) — override the root
+with `MODEL_CACHE=/shared/path` to land them on a shared filesystem. (A Python-driven
+equivalent that always resolves the correct URLs is `python tests/test_san_modules.py`,
+for when you have a working interpreter.)
 
 
 ## 3. Data preparation
