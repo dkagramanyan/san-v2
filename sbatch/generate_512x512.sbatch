@@ -14,10 +14,7 @@
 cd "${SLURM_SUBMIT_DIR:-$PWD}" || exit 1
 while [[ ! -f gen_images.py && "$PWD" != / ]]; do cd ..; done
 
-module purge
-module load Python
-
-conda activate san_rocky_50
+conda activate san_rocky
 
 export CC=/usr/bin/gcc
 export CXX=/usr/bin/g++
