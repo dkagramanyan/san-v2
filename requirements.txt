@@ -13,6 +13,9 @@ psutil>=5.8.0
 regex>=2022.3.15
 pyspng
 ftfy>=6.1.1
+# Pin: the trained best_model.pkl stems were saved with timm 0.4.12 and won't unpickle
+# under newer timm. combra's open-clip-torch drags in a newer timm, so re-pin it AFTER
+# installing this file:  pip install "timm==0.4.12"
 timm==0.4.12
 h5py>=3.10.0
 hydra-core>=1.3

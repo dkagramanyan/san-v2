@@ -51,10 +51,20 @@ cd san-v2
 pip install -r requirements.txt
 ```
 
+Re-pin `timm` last. combra's CMMD metric pulls `open-clip-torch`, which drags in a
+newer `timm` that **can't unpickle the trained `best_model.pkl` stems** (they were saved
+with `timm 0.4.12`; you'd hit `ModuleNotFoundError: timm.models.layers.patch_embed`). So
+force the pinned version back after everything else:
+
+```bash
+pip install "timm==0.4.12"
+python -c "import timm; print(timm.__version__)"   # must print 0.4.12
+```
+
 Verify the toolchain:
 
 ```bash
-conda list | grep -E "torch|cuda|cudnn|ninja"
+conda list | grep -E "torch|cuda|cudnn|ninja|timm"
 ```
 
 
