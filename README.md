@@ -19,25 +19,36 @@ all four steps run on **H200 GPUs** via the ready-made Slurm scripts in
 
 ## 1. Installation
 
-Create a conda env with `python=3.12`, then install the Python deps:
+Create and activate a Python 3.12 conda env:
+
+```bash
+conda create -n san python=3.12 -y
+conda activate san
+```
+
+Install, all into the conda env:
+
+- the latest **PyTorch** (CUDA 13.2 wheels for H200; the wheel bundles the CUDA runtime),
+- the **CUDA compiler** `nvcc`, used to JIT-build the custom ops — get it from conda's
+  `nvidia` channel so it matches torch's CUDA (the pip wheel ships no `nvcc`),
+- **ninja**, **from conda only** — a pip-installed ninja conflicts with it and the
+  custom ops then fail to build.
+
+```bash
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+conda install -c nvidia cuda-nvcc -y      # match torch's CUDA major (13.x)
+conda install anaconda::ninja -y
+```
+
+The training/inference scripts use this conda toolkit directly — they set
+`CUDA_HOME=$CONDA_PREFIX` and load **no** system CUDA module.
+
+Install the remaining dependencies (torch and ninja are intentionally not in
+`requirements.txt`, so this won't disturb the versions above):
 
 ```bash
 cd san-v2
 pip install -r requirements.txt
-```
-
-Remove any conda-provided torch/CUDA and install the matching wheels:
-
-```bash
-pip uninstall torch torchvision -y
-pip uninstall nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12 -y
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
-```
-
-Install **exactly one** ninja, from conda — otherwise the custom CUDA ops fail to build:
-
-```bash
-conda install anaconda::ninja -y
 ```
 
 Verify the toolchain:

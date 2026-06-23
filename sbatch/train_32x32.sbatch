@@ -16,7 +16,6 @@ while [[ ! -f train.py && "$PWD" != / ]]; do cd ..; done
 
 module purge
 module load Python
-module load CUDA/12.9
 
 conda activate san_rocky_50
 
@@ -24,6 +23,8 @@ export CC=/usr/bin/gcc
 export CXX=/usr/bin/g++
 
 # H200 (Hopper sm_90) + persistent kernel cache for fast startup.
+# Use the CUDA toolkit from the active conda env (no system CUDA module loaded).
+export CUDA_HOME="${CONDA_PREFIX}"
 export TORCH_CUDA_ARCH_LIST="9.0"
 export TORCH_EXTENSIONS_DIR="${HOME}/.cache/torch_extensions"
 export CUDA_CACHE_PATH="${HOME}/.cache/cuda_cache"
