@@ -85,7 +85,7 @@ no internet, fetch them once on a login node — they cache under `$HOME` (share
 compute nodes), so the training job then needs no network:
 
 ```bash
-python tests/test_cuda_ops.py --download-models
+python tests/test_san_modules.py
 ```
 
 

@@ -7,14 +7,29 @@ cannot silently change the training math. They run on CPU with tiny tensors.
 Run from the repo root:
 
     pytest tests/test_san_modules.py
+
+Running this file directly (instead of via pytest) pre-fetches every pretrained
+weight training needs -- handy on a login node before submitting offline jobs:
+
+    python tests/test_san_modules.py
 """
 
 import os
 import sys
 
-import pytest
-
-torch = pytest.importorskip("torch")
+# pytest drives the unit tests below, but this file is also runnable as a plain
+# script (the --download-models CLI) in environments without pytest installed --
+# fall back to a tiny shim so the module still imports there.
+try:
+    import pytest
+    torch = pytest.importorskip("torch")
+except ImportError:
+    import types
+    import torch
+    pytest = types.SimpleNamespace(
+        importorskip=lambda name: __import__(name),
+        mark=types.SimpleNamespace(parametrize=lambda *a, **k: (lambda fn: fn)),
+    )
 import torch.nn.functional as F  # noqa: E402
 
 # Make the repo root importable when pytest is invoked from elsewhere.
@@ -150,3 +165,66 @@ def test_conv2d_matches_manual_recomputation():
                         layer.padding, layer.dilation, layer.groups)
     expected = expected * layer.scale.view(layer.out_channels, 1, 1)
     assert torch.allclose(layer(x), expected, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Pretrained-model downloader (CLI: `python tests/test_san_modules.py --download-models`).
+# ---------------------------------------------------------------------------
+
+# Pretrained backbones the training stack fetches from the network on first use.
+TIMM_BACKBONES = [
+    'deit_base_distilled_patch16_224',   # ProjectedDiscriminator backbone
+    'tf_efficientnet_lite0',             # ProjectedDiscriminator backbone
+    'deit_small_distilled_patch16_224',  # classifier-guidance model (training/loss.py)
+]
+
+
+def download_models() -> int:
+    """Pre-fetch every pretrained weight training + the combra metrics need.
+
+    Run this once on a node WITH internet (e.g. a login node). The weights cache
+    under $HOME (torch hub / HF / timm), which compute nodes share, so the offline
+    training job then needs no network. No GPU required.
+    """
+    import numpy as np
+
+    print("Downloading pretrained models...")
+    ok = True
+
+    print("\n[1/2] Discriminator / classifier backbones (timm):")
+    import timm
+    for name in TIMM_BACKBONES:
+        try:
+            print(f"  - {name}")
+            timm.create_model(name, pretrained=True)
+        except Exception as e:
+            ok = False
+            print(f"    x failed: {e}")
+
+    print("\n[2/2] combra image-metric backbones (InceptionV3 / CLIP / DINOv2):")
+    try:
+        from combra.metrics import compute_fid, compute_cmmd, compute_fd_dinov2
+    except ImportError:
+        print("  combra not installed; skipping (only needed for --combra-metrics)")
+    else:
+        # A tiny dummy batch is enough to trigger each backbone's weight download.
+        dummy = np.random.randint(0, 256, size=(8, 64, 64, 3), dtype=np.uint8)
+        for label, fn in [('InceptionV3 (fid)', compute_fid),
+                          ('CLIP (cmmd)', compute_cmmd),
+                          ('DINOv2 (fd_dinov2)', compute_fd_dinov2)]:
+            try:
+                print(f"  - {label}")
+                fn(dummy, dummy, device='cpu')
+            except Exception as e:
+                ok = False
+                print(f"    x failed: {e}")
+
+    print("\n" + ("All model weights downloaded/cached."
+                  if ok else "Some downloads failed (see above)."))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    # Running this file directly downloads the pretrained weights (the SAN-layer
+    # unit tests above are run via pytest, not as a script).
+    sys.exit(download_models())

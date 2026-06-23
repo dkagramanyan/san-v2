@@ -438,59 +438,6 @@ def test_gradient_correctness():
     return results
 
 
-# Pretrained backbones the training stack fetches from the network on first use.
-TIMM_BACKBONES = [
-    'deit_base_distilled_patch16_224',   # ProjectedDiscriminator backbone
-    'tf_efficientnet_lite0',             # ProjectedDiscriminator backbone
-    'deit_small_distilled_patch16_224',  # classifier-guidance model (training/loss.py)
-]
-
-
-def download_models() -> int:
-    """Pre-fetch every pretrained weight training + the combra metrics need.
-
-    Run this once on a node WITH internet (e.g. a login node). The weights cache
-    under $HOME (torch hub / HF / timm), which compute nodes share, so the offline
-    training job then needs no network. No GPU required.
-    """
-    print("\n" + "=" * 70)
-    print("DOWNLOADING PRETRAINED MODELS")
-    print("=" * 70)
-    ok = True
-
-    print("\n[1/2] Discriminator / classifier backbones (timm):")
-    import timm
-    for name in TIMM_BACKBONES:
-        try:
-            print(f"  - {name}")
-            timm.create_model(name, pretrained=True)
-        except Exception as e:
-            ok = False
-            print(f"    ✗ failed: {e}")
-
-    print("\n[2/2] combra image-metric backbones (InceptionV3 / CLIP / DINOv2):")
-    try:
-        from combra.metrics import compute_fid, compute_cmmd, compute_fd_dinov2
-    except ImportError:
-        print("  combra not installed; skipping (only needed for --combra-metrics)")
-    else:
-        # A tiny dummy batch is enough to trigger each backbone's weight download.
-        dummy = np.random.randint(0, 256, size=(8, 64, 64, 3), dtype=np.uint8)
-        for label, fn in [('InceptionV3 (fid)', compute_fid),
-                          ('CLIP (cmmd)', compute_cmmd),
-                          ('DINOv2 (fd_dinov2)', compute_fd_dinov2)]:
-            try:
-                print(f"  - {label}")
-                fn(dummy, dummy, device='cpu')
-            except Exception as e:
-                ok = False
-                print(f"    ✗ failed: {e}")
-
-    print("\n" + ("✓ All model weights downloaded/cached."
-                  if ok else "✗ Some downloads failed (see above)."))
-    return 0 if ok else 1
-
-
 def main():
     """Main test function."""
     print("\n" + "=" * 70)
@@ -548,15 +495,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(
-        description="Custom CUDA-op tests, and a pretrained-model downloader for "
-                    "offline training nodes.")
-    parser.add_argument(
-        "--download-models", action="store_true",
-        help="Download every pretrained weight training + combra metrics need, then "
-             "exit (run on a login node with internet; no GPU required).")
-    args = parser.parse_args()
-    if args.download_models:
-        sys.exit(download_models())
     sys.exit(main())
