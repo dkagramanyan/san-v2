@@ -36,7 +36,8 @@ Install, all into the conda env:
 
 ```bash
 pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu132
-pip3 install ninja    # match torch's CUDA major (13.x)
+pip3 install ninja
+conda install -c nvidia cuda-nvcc -y      # match torch's CUDA major (13.x)
 ```
 
 The training/inference scripts use this conda toolkit directly — they set
@@ -136,9 +137,9 @@ sbatch train_32x32.sbatch
 # … through train_1024x1024.sbatch
 ```
 
-Each script resolves the repo root itself, loads the H200 toolchain
-(`CUDA/12.9`, `TORCH_CUDA_ARCH_LIST=9.0`), activates the per-node conda env and
-uses a persistent kernel cache, so a resubmit skips JIT recompilation.
+Each script resolves the repo root itself, activates the per-node conda env, builds the
+custom ops against that env's CUDA (`CUDA_HOME=$CONDA_PREFIX`, `TORCH_CUDA_ARCH_LIST=9.0`)
+and uses a persistent kernel cache, so a resubmit skips JIT recompilation.
 
 ### Hydra entry point
 
@@ -246,5 +247,8 @@ are engineering / infrastructure improvements:
 - **CWD-independent ImageNet embedding loading** — the `in_embeddings/*.pkl` path is
   resolved relative to the repo root and overridable via the `SAN_EMBED` env var.
 - **ImageNet 1024×1024 progressive-superres recipe** (the training commands above).
-- **combra training-evaluation integration** — optional per-tick scoring of generated
-  samples with `combra.metrics.compute_all_metrics` (see the combra `san_v2` docs).
+- **combra training-evaluation integration** — optional per-snapshot scoring of
+  generated samples with `combra.metrics.compute_all_metrics`, logged to TensorBoard as
+  `Metrics/combra_*`. Toggled by `--combra-metrics` (default `true`), **independent of
+  `--metrics`**; warns at startup if enabled but combra is not installed (see the combra
+  `san_v2` docs).

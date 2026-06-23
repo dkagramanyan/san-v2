@@ -14,6 +14,8 @@ import copy
 import json
 import dill
 import psutil
+import warnings
+import importlib.util
 from datetime import datetime
 import PIL.Image
 import numpy as np
@@ -414,6 +416,7 @@ def training_loop(
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
     save_weights_only       = False,    # Save only model weights (G/D/G_ema) without resume state. Full checkpoint (resume) is unaffected.
     save_inference_only     = False,    # Save a small inference-only snapshot (G_ema only, no D/resume state) every snapshot tick.
+    combra_metrics          = True,     # Compute combra generative-quality metrics each snapshot tick (independent of --metrics).
     resume_pkl              = None,     # Network pickle to resume training from.
     resume_kimg             = 0,        # First kimg to report when resuming training.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
@@ -592,6 +595,14 @@ def training_loop(
     if rank == 0:
         combra_reals = np.stack([training_set[i][0] for i in range(combra_num)])
         combra_reference_cache = {}
+
+    # Warn early (once, on rank 0) if combra metrics are requested but the package is
+    # missing, so the user is not left wondering why no combra_* values ever appear.
+    if combra_metrics and (rank == 0) and (importlib.util.find_spec('combra') is None):
+        warnings.warn(
+            'combra_metrics=True but the `combra` package is not installed -- combra '
+            'metrics will be skipped. Install it (e.g. `pip install -e ../wc_cv/combra`) '
+            'to enable them, or pass --combra-metrics=false to silence this warning.')
 
     # Initialize logs.
     stage('Initializing logs (stats.jsonl, tensorboard)')
@@ -918,42 +929,46 @@ def training_loop(
 
             stage(f'Checkpoint saved (kimg={snapshot_pkl})')
 
-        # Evaluate metrics.
-        # if (snapshot_data is not None) and (len(metrics) > 0):
-        if cur_tick and (snapshot_data is not None) and (len(metrics) > 0):
-            stage('Evaluating metrics')
-            for metric in metrics:
-                result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
-                                                      dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
-                if rank == 0:
-                    metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
-                stats_metrics.update(result_dict.results)
+        # Evaluate metrics. Standard metrics (--metrics) and combra metrics
+        # (--combra-metrics) are independent: either one alone enables this block.
+        if cur_tick and (snapshot_data is not None) and (len(metrics) > 0 or combra_metrics):
+            if len(metrics) > 0:
+                stage('Evaluating metrics')
+                for metric in metrics:
+                    result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
+                                                          dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
+                    if rank == 0:
+                        metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
+                    stats_metrics.update(result_dict.results)
 
             # combra in-memory generative-quality metrics (optional dependency),
             # scored over the whole training set vs an equal number of fakes.
             # A missing/uninstallable combra must never break training.
-            combra_fakes = generate_snapshot_grid_images(
-                G_ema=snapshot_data['G_ema'], grid_z=combra_z, grid_c=combra_c,
-                batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
-            if rank == 0:
-                try:
-                    from combra.metrics import compute_all_metrics
-                    stage('Evaluating combra metrics')
-                    # G_ema outputs float in [-1, 1] but combra_reals are uint8 [0, 255];
-                    # denormalize the fakes to the same scale so combra binarizes both
-                    # sides identically (its angle path is scale-sensitive).
-                    combra_fakes_u8 = np.rint(combra_fakes * 127.5 + 128).clip(0, 255).astype(np.uint8)
-                    combra_results = compute_all_metrics(
-                        combra_reals, combra_fakes_u8, device=device,
-                        reference_cache=combra_reference_cache)
-                    for name, value in combra_results.items():
-                        stats_metrics[f'combra_{name}'] = value
-                    print('combra metrics: ' + ', '.join(
-                        f'{k}={v:.4f}' for k, v in combra_results.items()), flush=True)
-                except ImportError:
-                    print('[combra] not installed; skipping combra metrics', flush=True)
-                except Exception as e:
-                    print(f'[combra] metric evaluation failed: {e}', flush=True)
+            if combra_metrics:
+                combra_fakes = generate_snapshot_grid_images(
+                    G_ema=snapshot_data['G_ema'], grid_z=combra_z, grid_c=combra_c,
+                    batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
+                if rank == 0:
+                    try:
+                        from combra.metrics import compute_all_metrics
+                        stage('Evaluating combra metrics')
+                        # G_ema outputs float in [-1, 1] but combra_reals are uint8 [0, 255];
+                        # denormalize the fakes to the same scale so combra binarizes both
+                        # sides identically (its angle path is scale-sensitive).
+                        combra_fakes_u8 = np.rint(combra_fakes * 127.5 + 128).clip(0, 255).astype(np.uint8)
+                        combra_results = compute_all_metrics(
+                            combra_reals, combra_fakes_u8, device=device,
+                            reference_cache=combra_reference_cache)
+                        # Cast to float so the TensorBoard scalar writer (Metrics/combra_*)
+                        # accepts every value, including numpy scalars and NaNs.
+                        for name, value in combra_results.items():
+                            stats_metrics[f'combra_{name}'] = float(value)
+                        print('combra metrics: ' + ', '.join(
+                            f'{k}={v:.4f}' for k, v in combra_results.items()), flush=True)
+                    except ImportError:
+                        warnings.warn('combra not installed; skipping combra metrics')
+                    except Exception as e:
+                        print(f'[combra] metric evaluation failed: {e}', flush=True)
 
             # save best fid ckpt
             snapshot_pkl = os.path.join(run_dir, f'best_model.pkl')

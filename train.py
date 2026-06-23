@@ -162,6 +162,7 @@ def parse_comma_separated_list(s):
 @click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
 @click.option('--save-weights-only', help='Save weights-only snapshots (G/D/G_ema, no resume state) every snapshot tick', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--save-inference-only', help='Save a small inference-only snapshot (G_ema only, no D/resume state) every snapshot tick', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--combra-metrics', help='Compute combra generative-quality metrics each snapshot tick (independent of --metrics)', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--fp32',         help='Disable mixed-precision', metavar='BOOL',                 type=bool, default=False, show_default=True)
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
@@ -220,6 +221,7 @@ def build_config(opts):
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
     c.save_weights_only = opts.save_weights_only
     c.save_inference_only = opts.save_inference_only
+    c.combra_metrics = opts.combra_metrics
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
 
