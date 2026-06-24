@@ -32,6 +32,11 @@ import legacy
 from metrics import metric_main
 from training import networks_stylegan3_resetting
 
+# Number of fake images generated each snapshot for the combra image metrics
+# (combra_fid10k / combra_cmmd10k / combra_fd_dinov2_10k). Scored against the
+# whole training set as the real reference.
+COMBRA_NUM_GEN = 10000
+
 #----------------------------------------------------------------------------
 # Unified debug logging (TXT format)
 
@@ -580,20 +585,25 @@ def training_loop(
     if rank == 0:
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
 
-    # combra metric reference: the whole training set, scored against an equal
-    # number of generated images. Built once (the reference is fixed across
-    # training); reference-side features are memoised in combra_reference_cache.
-    # Latents/labels live on every rank for distributed generation; the reals
-    # (and the cache) are only needed on rank 0, which computes the metrics.
-    combra_num = len(training_set)
-    combra_labels = np.stack([training_set.get_label(i) for i in range(combra_num)])
+    # combra metric reference: the whole training set, scored against COMBRA_NUM_GEN
+    # generated images (fid10k / cmmd10k / fd_dinov2_10k -> 10k fakes vs all reals;
+    # the image metrics estimate per-side statistics, so the counts need not match).
+    # Built once (the reference is fixed across training); reference-side features
+    # are memoised in combra_reference_cache. Latents/labels live on every rank for
+    # distributed generation; the reals (and the cache) are only needed on rank 0.
+    combra_num = COMBRA_NUM_GEN
+    # Labels for the fakes: sample the training-set label distribution with
+    # replacement (seeded identically on every rank so all ranks generate the same
+    # batch). For an unconditional G, get_label returns a zero-length vector.
+    combra_label_idx = np.random.RandomState(random_seed).randint(0, len(training_set), size=combra_num)
+    combra_labels = np.stack([training_set.get_label(i) for i in combra_label_idx])
     combra_c = torch.from_numpy(combra_labels).to(device)
     combra_z = torch.randn([combra_num, G.z_dim], device=device,
         generator=torch.Generator(device=device).manual_seed(random_seed * num_gpus + 1))
     combra_reals = None
     combra_reference_cache = None
     if rank == 0:
-        combra_reals = np.stack([training_set[i][0] for i in range(combra_num)])
+        combra_reals = np.stack([training_set[i][0] for i in range(len(training_set))])
         combra_reference_cache = {}
 
     # Warn early (once, on rank 0) if combra metrics are requested but the package is
@@ -962,11 +972,16 @@ def training_loop(
                         # weights) comes back as nan rather than aborting.
                         combra_results = compute_all_metrics(
                             combra_reals, combra_fakes_u8, device=device,
-                            reference_cache=combra_reference_cache, image_metrics=True)
+                            reference_cache=combra_reference_cache, image_metrics=True,
+                            workers=min(32, os.cpu_count() or 1))
                         # Cast to float so the TensorBoard scalar writer (Metrics/combra_*)
-                        # accepts every value, including numpy scalars and NaNs.
+                        # accepts every value, including numpy scalars and NaNs. The three
+                        # image-feature metrics carry their 10k sample size in the key.
+                        combra_image_rename = {
+                            'fid': 'fid10k', 'cmmd': 'cmmd10k', 'fd_dinov2': 'fd_dinov2_10k'}
                         for name, value in combra_results.items():
-                            stats_metrics[f'combra_{name}'] = float(value)
+                            key = combra_image_rename.get(name, name)
+                            stats_metrics[f'combra_{key}'] = float(value)
                         print('combra metrics: ' + ', '.join(
                             f'{k}={v:.4f}' for k, v in combra_results.items()), flush=True)
                     except ImportError:
@@ -978,8 +993,12 @@ def training_loop(
             snapshot_pkl = os.path.join(run_dir, f'best_model.pkl')
             cur_nimg_txt = os.path.join(run_dir, f'best_nimg.txt')
             if rank == 0:
-                if 'fid50k_full' in stats_metrics and stats_metrics['fid50k_full'] < best_fid:
-                    best_fid = stats_metrics['fid50k_full']
+                # Prefer the standard fid50k_full; fall back to combra's InceptionV3
+                # FID when fid50k_full is disabled (combra metrics replace it).
+                fid_key = 'fid50k_full' if 'fid50k_full' in stats_metrics else (
+                    'combra_fid10k' if 'combra_fid10k' in stats_metrics else None)
+                if fid_key is not None and stats_metrics[fid_key] < best_fid:
+                    best_fid = stats_metrics[fid_key]
 
                     with open(snapshot_pkl, 'wb') as f:
                         dill.dump(snapshot_data, f)

@@ -225,6 +225,12 @@ def build_config(opts):
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
 
+    # When combra metrics are on, its InceptionV3 FID (combra_fid) replaces the
+    # standard fid50k_full so the expensive 50k-image FID pass is not computed
+    # twice. Other requested metrics are left untouched.
+    if c.combra_metrics and 'fid50k_full' in c.metrics:
+        c.metrics = [m for m in c.metrics if m != 'fid50k_full']
+
     # Sanity checks.
     if any(not metric_main.is_valid_metric(metric) for metric in c.metrics):
         raise click.ClickException('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))

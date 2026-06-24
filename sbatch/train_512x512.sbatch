@@ -35,6 +35,8 @@ conda list | grep -E "torch|cuda|cudnn|ninja"
 
 python train.py --outdir=./runs/wc-cv_h200_51 \
         --cfg=stylegan3-r \
+        --metrics none \
+        --combra-metrics True \
         --data=./datasets/imagenet_9to4_1024x1024_512x512.zip \
         --gpus=2 \
         --mirror=0 \
