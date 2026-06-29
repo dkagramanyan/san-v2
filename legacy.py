@@ -70,24 +70,17 @@ class _TFNetworkStub(dnnlib.EasyDict):
 
 class _LegacyUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
-        # timm 0.6.x -> 1.0.x: timm.models.layers was relocated to timm.layers.
+        # timm 0.6.x -> 1.0.x: layers moved from timm.models.layers to timm.layers.
         # Old stem pkls reference the old path; redirect so they unpickle under new timm.
-        if module == 'timm.models.layers' or module.startswith('timm.models.layers.'):
-            module = 'timm.layers' + module[len('timm.models.layers'):]
+        if module.startswith('timm.models.layers'):
+            module = module.replace('timm.models.layers', 'timm.layers', 1)
         if module == 'dnnlib.tflib.network' and name == 'Network':
             return _TFNetworkStub
         if module == 'torch.storage' and name == '_load_from_bytes':
             return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
-        try:
-            return super().find_class(module, name)
-        except ModuleNotFoundError:
-            # timm 0.6.x -> 1.0.x privatized many submodules, e.g.
-            # timm.models.efficientnet_blocks -> timm.models._efficientnet_blocks.
-            leaf = module.rsplit('.', 1)[-1]
-            if module.startswith('timm.models.') and not leaf.startswith('_'):
-                priv = module.rsplit('.', 1)[0] + '._' + leaf
-                return super().find_class(priv, name)
-            raise
+        if module == 'torch.storage' and name == '_load_from_bytes':
+            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+        return super().find_class(module, name)
 
 #----------------------------------------------------------------------------
 
