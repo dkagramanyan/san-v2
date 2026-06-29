@@ -70,10 +70,6 @@ class _TFNetworkStub(dnnlib.EasyDict):
 
 class _LegacyUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
-        # timm 0.6.x -> 1.0.x: layers moved from timm.models.layers to timm.layers.
-        # Old stem pkls reference the old path; redirect so they unpickle under new timm.
-        if module.startswith('timm.models.layers'):
-            module = module.replace('timm.models.layers', 'timm.layers', 1)
         if module == 'dnnlib.tflib.network' and name == 'Network':
             return _TFNetworkStub
         if module == 'torch.storage' and name == '_load_from_bytes':
