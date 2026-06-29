@@ -384,6 +384,100 @@ def generate_snapshot_grid_images(G_ema, grid_z, grid_c, batch_gpu, num_gpus=1, 
     return images[:0].cpu().numpy()
 
 #----------------------------------------------------------------------------
+# Distributed combra metrics: shard the image-feature extraction (fid / cmmd /
+# fd_dinov2) across ranks instead of running it all on rank 0. Each rank generates
+# and extracts features from its own shard of the eval fakes; the feature rows and
+# the fake images are gathered to rank 0, which takes the Frechet / MMD distances
+# (vs cached reference features) and the angle-density metrics over the full set.
+# Numerically identical to the single-GPU compute_all_metrics(image_metrics=True).
+
+@torch.no_grad()
+def _combra_generate_local_shard(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, noise_mode='const'):
+    # Rank r generates the fakes at indices [r, r+num_gpus, ...]; concatenating every
+    # rank's shard reproduces the full set exactly (no padding duplicates). G_ema is
+    # deterministic given (z, c) with noise_mode='const', so which rank generates a
+    # given latent is irrelevant. Returns a float [-1, 1] NCHW numpy array.
+    n = grid_z.shape[0]
+    idx = torch.arange(rank, n, num_gpus, device=grid_z.device)
+    z = grid_z.index_select(0, idx)
+    c = grid_c.index_select(0, idx)
+    images = torch.cat([G_ema(z=zz, c=cc, noise_mode=noise_mode)
+                        for zz, cc in zip(z.split(batch_gpu), c.split(batch_gpu))], dim=0)
+    return images.cpu().numpy()
+
+
+def _combra_gather_to_rank0(local, device, rank, num_gpus):
+    # Gather per-rank arrays [k, ...] to rank 0, concatenated in rank order (None on
+    # other ranks). Uses all_gather (supported on both gloo and nccl, unlike gather);
+    # ranks may hold different k, so each block is padded to the max along axis 0 and
+    # trimmed back. Order across ranks differs from the original, which is irrelevant
+    # for the set-level metrics computed here.
+    if num_gpus == 1:
+        return local
+    t = torch.from_numpy(np.ascontiguousarray(local)).to(device)
+    count = torch.tensor([t.shape[0]], device=device, dtype=torch.long)
+    counts = [torch.zeros_like(count) for _ in range(num_gpus)]
+    torch.distributed.all_gather(counts, count)
+    max_count = max(int(c.item()) for c in counts)
+    if t.shape[0] < max_count:
+        pad = torch.zeros(max_count - t.shape[0], *t.shape[1:], device=device, dtype=t.dtype)
+        t = torch.cat([t, pad], dim=0)
+    gathered = [torch.empty_like(t) for _ in range(num_gpus)]
+    torch.distributed.all_gather(gathered, t)
+    if rank != 0:
+        return None
+    rows = [gathered[i][:int(counts[i].item())].cpu().numpy() for i in range(num_gpus)]
+    return np.concatenate(rows, axis=0)
+
+
+def _combra_eval_distributed(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, device,
+                             reals_u8, reference_cache):
+    # Returns the combra metrics dict on rank 0, None on other ranks. Every rank runs
+    # the same collectives (a feature gather per metric, then the image gather), so the
+    # caller MUST invoke this on all ranks (gated by a rank-uniform flag) or the ranks
+    # that skip it will hang the ones that don't.
+    from combra.metrics import (compute_all_metrics,
+        cmmd_features, cmmd_from_features, fd_dinov2_features, fd_dinov2_from_features,
+        fid_features, fid_from_features)
+
+    # 1. Generate this rank's shard and denormalize float [-1, 1] -> uint8 [0, 255]
+    #    (combra's angle path is scale-sensitive, so both sides must be uint8).
+    local = _combra_generate_local_shard(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank)
+    local_u8 = np.rint(local * 127.5 + 128).clip(0, 255).astype(np.uint8)
+
+    # 2. Extract image features on the local shard; gather feature rows to rank 0.
+    extractors = (('fid', fid_features), ('cmmd', cmmd_features), ('fd_dinov2', fd_dinov2_features))
+    gen_feats = {}
+    for name, fn in extractors:
+        feats = fn(local_u8, device=device).astype(np.float32)
+        gen_feats[name] = _combra_gather_to_rank0(feats, device, rank, num_gpus)
+
+    # 3. Gather the fake images to rank 0 for the angle-density metrics.
+    fakes_u8 = _combra_gather_to_rank0(local_u8, device, rank, num_gpus)
+
+    if rank != 0:
+        return None
+
+    # 4. Rank 0: cheap angle / Gaussian-fit metrics over the full set, then the
+    #    image-feature distances from the gathered generated features vs the cached
+    #    reference features (extracted once, memoised in reference_cache).
+    metrics = dict(compute_all_metrics(
+        reals_u8, fakes_u8, device=device, reference_cache=reference_cache,
+        image_metrics=False, workers=min(32, os.cpu_count() or 1)))
+    combiners = {'fid': fid_from_features, 'cmmd': cmmd_from_features, 'fd_dinov2': fd_dinov2_from_features}
+    ref_extractors = {'fid': fid_features, 'cmmd': cmmd_features, 'fd_dinov2': fd_dinov2_features}
+    for name in ('fid', 'cmmd', 'fd_dinov2'):
+        ref_key = f'dist_ref_{name}'
+        if reference_cache is not None and ref_key in reference_cache:
+            ref_feats = reference_cache[ref_key]
+        else:
+            ref_feats = ref_extractors[name](reals_u8, device=device).astype(np.float32)
+            if reference_cache is not None:
+                reference_cache[ref_key] = ref_feats
+        metrics[name] = combiners[name](ref_feats, gen_feats[name])
+    return metrics
+
+#----------------------------------------------------------------------------
 
 def weight_reset(m):
     if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Linear):
@@ -952,42 +1046,40 @@ def training_loop(
                     stats_metrics.update(result_dict.results)
 
             # combra in-memory generative-quality metrics (optional dependency),
-            # scored over the whole training set vs an equal number of fakes.
+            # scored over the whole training set vs an equal number of fakes. The
+            # image-feature extraction (fid/cmmd/fd_dinov2) is sharded across ranks
+            # (each rank handles its own fakes); angle-density metrics run on rank 0.
             # A missing/uninstallable combra must never break training.
-            if combra_metrics:
-                combra_fakes = generate_snapshot_grid_images(
-                    G_ema=snapshot_data['G_ema'], grid_z=combra_z, grid_c=combra_c,
-                    batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
-                if rank == 0:
-                    try:
-                        from combra.metrics import compute_all_metrics
-                        stage('Evaluating combra metrics')
-                        # G_ema outputs float in [-1, 1] but combra_reals are uint8 [0, 255];
-                        # denormalize the fakes to the same scale so combra binarizes both
-                        # sides identically (its angle path is scale-sensitive).
-                        combra_fakes_u8 = np.rint(combra_fakes * 127.5 + 128).clip(0, 255).astype(np.uint8)
-                        # image_metrics=True also computes the image-feature metrics
-                        # (fid, cmmd, fd_dinov2) alongside the angle-density ones; any
-                        # whose backend is unavailable (e.g. no network for DINOv2/CLIP
-                        # weights) comes back as nan rather than aborting.
-                        combra_results = compute_all_metrics(
-                            combra_reals, combra_fakes_u8, device=device,
-                            reference_cache=combra_reference_cache, image_metrics=True,
-                            workers=min(32, os.cpu_count() or 1))
-                        # Cast to float so the TensorBoard scalar writer (Metrics/combra_*)
-                        # accepts every value, including numpy scalars and NaNs. The three
-                        # image-feature metrics carry their 10k sample size in the key.
-                        combra_image_rename = {
-                            'fid': 'fid10k', 'cmmd': 'cmmd10k', 'fd_dinov2': 'fd_dinov2_10k'}
-                        for name, value in combra_results.items():
-                            key = combra_image_rename.get(name, name)
-                            stats_metrics[f'combra_{key}'] = float(value)
-                        print('combra metrics: ' + ', '.join(
-                            f'{k}={v:.4f}' for k, v in combra_results.items()), flush=True)
-                    except ImportError:
-                        warnings.warn('combra not installed; skipping combra metrics')
-                    except Exception as e:
+            #
+            # combra_active must be rank-UNIFORM: it gates the collectives inside
+            # _combra_eval_distributed, so every rank must agree. combra_metrics comes
+            # from the broadcast config and find_spec is a rank-independent filesystem
+            # check -- do NOT gate on combra_reals (rank 0 only) or the gathers deadlock.
+            combra_active = combra_metrics and (importlib.util.find_spec('combra') is not None)
+            if combra_active:
+                stage('Evaluating combra metrics')
+                # image_metrics run via the sharded path; any backend that is
+                # unavailable (e.g. no network for DINOv2/CLIP weights) fails the same
+                # way on every rank, so the except is reached symmetrically and skips.
+                try:
+                    combra_results = _combra_eval_distributed(
+                        snapshot_data['G_ema'], combra_z, combra_c, batch_gpu,
+                        num_gpus, rank, device, combra_reals, combra_reference_cache)
+                except Exception as e:
+                    combra_results = None
+                    if rank == 0:
                         print(f'[combra] metric evaluation failed: {e}', flush=True)
+                if rank == 0 and combra_results is not None:
+                    # Cast to float so the TensorBoard scalar writer (Metrics/combra_*)
+                    # accepts every value, including numpy scalars and NaNs. The three
+                    # image-feature metrics carry their 10k sample size in the key.
+                    combra_image_rename = {
+                        'fid': 'fid10k', 'cmmd': 'cmmd10k', 'fd_dinov2': 'fd_dinov2_10k'}
+                    for name, value in combra_results.items():
+                        key = combra_image_rename.get(name, name)
+                        stats_metrics[f'combra_{key}'] = float(value)
+                    print('combra metrics: ' + ', '.join(
+                        f'{k}={v:.4f}' for k, v in combra_results.items()), flush=True)
 
             # save best fid ckpt
             snapshot_pkl = os.path.join(run_dir, f'best_model.pkl')
