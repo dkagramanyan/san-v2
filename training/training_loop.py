@@ -384,12 +384,20 @@ def generate_snapshot_grid_images(G_ema, grid_z, grid_c, batch_gpu, num_gpus=1, 
     return images[:0].cpu().numpy()
 
 #----------------------------------------------------------------------------
-# Distributed combra metrics: shard the image-feature extraction (fid / cmmd /
-# fd_dinov2) across ranks instead of running it all on rank 0. Each rank generates
-# and extracts features from its own shard of the eval fakes; the feature rows and
-# the fake images are gathered to rank 0, which takes the Frechet / MMD distances
-# (vs cached reference features) and the angle-density metrics over the full set.
-# Numerically identical to the single-GPU compute_all_metrics(image_metrics=True).
+# Distributed combra metrics: shard ALL the per-image extraction across ranks
+# instead of running it on rank 0. Each rank generates its own shard of the eval
+# fakes and, from that shard, extracts the image features (fid / cmmd / fd_dinov2)
+# AND pools the vertex angles; the feature rows and the pooled-angle arrays are
+# gathered to rank 0, which takes the Frechet / MMD distances and the angle
+# Wasserstein / Gaussian metrics there against the (precomputed, cached) reference.
+# The reference side is sharded the same way and extracted once before training, so
+# no reference work or collective recurs per tick. Numerically identical to the
+# single-GPU compute_all_metrics(image_metrics=True).
+#
+# This matters for correctness, not just speed: when the angle-density extraction
+# ran rank-0-only over the full gathered set, at 512/1024 px it could take longer
+# than NCCL's collective-timeout watchdog while the other ranks idled at the next
+# allreduce, aborting the job.
 
 @torch.no_grad()
 def _combra_generate_local_shard(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, noise_mode='const'):
@@ -430,13 +438,51 @@ def _combra_gather_to_rank0(local, device, rank, num_gpus):
     return np.concatenate(rows, axis=0)
 
 
+def _combra_gather_pooled_angles(images_u8, device, rank, num_gpus):
+    # Extract this rank's pooled vertex angles and gather the 1-D arrays to rank 0
+    # (concatenated, None on other ranks). The angle counterpart of the sharded
+    # feature gather: pooled angle arrays from disjoint shards concatenate directly,
+    # so the rank-0 histogram over the concatenation matches a single-GPU pass.
+    # Reuses _combra_gather_to_rank0 by treating the angles as [k, 1] rows.
+    from combra.metrics import images_to_pooled_angles
+    pooled = np.asarray(
+        images_to_pooled_angles(images_u8, workers=min(32, os.cpu_count() or 1)),
+        np.float32).reshape(-1, 1)
+    gathered = _combra_gather_to_rank0(pooled, device, rank, num_gpus)
+    return gathered.reshape(-1) if gathered is not None else None
+
+
+def _combra_precompute_reference(training_set, device, rank, num_gpus):
+    # All ranks: extract the pooled angles and the three feature sets from this rank's
+    # deterministic slice of the training set (the combra reference) and gather them to
+    # rank 0. Returns {'angles': [M], 'feat': {name: [N, D]}} on rank 0 (None elsewhere).
+    # Called once before the training loop so the expensive reference angle/feature
+    # extraction is sharded instead of rank-0-only and the cached result is reused every
+    # tick -- no reference work or collective recurs per tick. Every rank runs the same
+    # gathers, so the caller MUST invoke this on all ranks (gated by a rank-uniform flag).
+    from combra.metrics import cmmd_features, fd_dinov2_features, fid_features
+    n = len(training_set)
+    idx = range(rank, n, num_gpus)
+    local_u8 = np.stack([training_set[i][0] for i in idx])  # NCHW uint8
+    angles = _combra_gather_pooled_angles(local_u8, device, rank, num_gpus)
+    extractors = (('fid', fid_features), ('cmmd', cmmd_features), ('fd_dinov2', fd_dinov2_features))
+    feat = {}
+    for name, fn in extractors:
+        feats = fn(local_u8, device=device).astype(np.float32)
+        feat[name] = _combra_gather_to_rank0(feats, device, rank, num_gpus)
+    if rank != 0:
+        return None
+    return {'angles': angles, 'feat': feat}
+
+
 def _combra_eval_distributed(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, device,
-                             reals_u8, reference_cache):
+                             combra_ref):
     # Returns the combra metrics dict on rank 0, None on other ranks. Every rank runs
-    # the same collectives (a feature gather per metric, then the image gather), so the
-    # caller MUST invoke this on all ranks (gated by a rank-uniform flag) or the ranks
-    # that skip it will hang the ones that don't.
-    from combra.metrics import (compute_all_metrics,
+    # the same collectives (a feature gather per metric, then the pooled-angle gather),
+    # so the caller MUST invoke this on all ranks (gated by a rank-uniform flag) or the
+    # ranks that skip it will hang the ones that don't. combra_ref is the precomputed
+    # sharded reference from _combra_precompute_reference (rank 0 only; None elsewhere).
+    from combra.metrics import (angle_density_metrics_from_pooled,
         cmmd_features, cmmd_from_features, fd_dinov2_features, fd_dinov2_from_features,
         fid_features, fid_from_features)
 
@@ -452,29 +498,19 @@ def _combra_eval_distributed(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, d
         feats = fn(local_u8, device=device).astype(np.float32)
         gen_feats[name] = _combra_gather_to_rank0(feats, device, rank, num_gpus)
 
-    # 3. Gather the fake images to rank 0 for the angle-density metrics.
-    fakes_u8 = _combra_gather_to_rank0(local_u8, device, rank, num_gpus)
+    # 3. Pool the vertex angles on the local shard; gather the 1-D arrays to rank 0.
+    gen_angles = _combra_gather_pooled_angles(local_u8, device, rank, num_gpus)
 
     if rank != 0:
         return None
 
-    # 4. Rank 0: cheap angle / Gaussian-fit metrics over the full set, then the
-    #    image-feature distances from the gathered generated features vs the cached
-    #    reference features (extracted once, memoised in reference_cache).
-    metrics = dict(compute_all_metrics(
-        reals_u8, fakes_u8, device=device, reference_cache=reference_cache,
-        image_metrics=False, workers=min(32, os.cpu_count() or 1)))
+    # 4. Rank 0: angle / Gaussian-fit metrics from the pooled reference/generated
+    #    angles, then the image-feature distances from the gathered generated features
+    #    vs the precomputed (cached) reference features.
+    metrics = dict(angle_density_metrics_from_pooled(combra_ref['angles'], gen_angles))
     combiners = {'fid': fid_from_features, 'cmmd': cmmd_from_features, 'fd_dinov2': fd_dinov2_from_features}
-    ref_extractors = {'fid': fid_features, 'cmmd': cmmd_features, 'fd_dinov2': fd_dinov2_features}
     for name in ('fid', 'cmmd', 'fd_dinov2'):
-        ref_key = f'dist_ref_{name}'
-        if reference_cache is not None and ref_key in reference_cache:
-            ref_feats = reference_cache[ref_key]
-        else:
-            ref_feats = ref_extractors[name](reals_u8, device=device).astype(np.float32)
-            if reference_cache is not None:
-                reference_cache[ref_key] = ref_feats
-        metrics[name] = combiners[name](ref_feats, gen_feats[name])
+        metrics[name] = combiners[name](combra_ref['feat'][name], gen_feats[name])
     return metrics
 
 #----------------------------------------------------------------------------
@@ -682,9 +718,11 @@ def training_loop(
     # combra metric reference: the whole training set, scored against COMBRA_NUM_GEN
     # generated images (fid10k / cmmd10k / fd_dinov2_10k -> 10k fakes vs all reals;
     # the image metrics estimate per-side statistics, so the counts need not match).
-    # Built once (the reference is fixed across training); reference-side features
-    # are memoised in combra_reference_cache. Latents/labels live on every rank for
-    # distributed generation; the reals (and the cache) are only needed on rank 0.
+    # Built once (the reference is fixed across training): every rank extracts the
+    # angles + features for its deterministic slice of the reals and the rows are
+    # gathered to rank 0, so the expensive reference extraction is sharded (not
+    # rank-0-only) and the cached result is reused every tick. Latents/labels live on
+    # every rank for distributed generation.
     combra_num = COMBRA_NUM_GEN
     # Labels for the fakes: sample the training-set label distribution with
     # replacement (seeded identically on every rank so all ranks generate the same
@@ -694,11 +732,21 @@ def training_loop(
     combra_c = torch.from_numpy(combra_labels).to(device)
     combra_z = torch.randn([combra_num, G.z_dim], device=device,
         generator=torch.Generator(device=device).manual_seed(random_seed * num_gpus + 1))
-    combra_reals = None
-    combra_reference_cache = None
-    if rank == 0:
-        combra_reals = np.stack([training_set[i][0] for i in range(len(training_set))])
-        combra_reference_cache = {}
+    # combra_active must be rank-UNIFORM (it gates the precompute collectives, just
+    # like the per-tick eval): combra_metrics is broadcast config and find_spec is a
+    # rank-independent filesystem check. Runs on every rank so the gathers stay matched.
+    combra_ref = None
+    if combra_metrics and (importlib.util.find_spec('combra') is not None):
+        # A broken combra backend (e.g. no network for DINOv2/CLIP weights) fails the
+        # same way on every rank -- before any gather in the loop below -- so the except
+        # is reached symmetrically and leaves combra_ref None on all ranks rather than
+        # half-completing a collective. Per-tick eval then no-ops via its own guard, so
+        # an unusable combra never breaks training.
+        try:
+            combra_ref = _combra_precompute_reference(training_set, device, rank, num_gpus)
+        except Exception as e:
+            if rank == 0:
+                print(f'[combra] reference precompute failed, disabling combra metrics: {e}', flush=True)
 
     # Warn early (once, on rank 0) if combra metrics are requested but the package is
     # missing, so the user is not left wondering why no combra_* values ever appear.
@@ -1046,15 +1094,16 @@ def training_loop(
                     stats_metrics.update(result_dict.results)
 
             # combra in-memory generative-quality metrics (optional dependency),
-            # scored over the whole training set vs an equal number of fakes. The
-            # image-feature extraction (fid/cmmd/fd_dinov2) is sharded across ranks
-            # (each rank handles its own fakes); angle-density metrics run on rank 0.
-            # A missing/uninstallable combra must never break training.
+            # scored over the whole training set vs an equal number of fakes. Both the
+            # image-feature extraction (fid/cmmd/fd_dinov2) and the angle-density
+            # metrics are sharded across ranks (each rank handles its own fakes);
+            # only the final distances run on rank 0. A missing/uninstallable combra
+            # must never break training.
             #
             # combra_active must be rank-UNIFORM: it gates the collectives inside
             # _combra_eval_distributed, so every rank must agree. combra_metrics comes
             # from the broadcast config and find_spec is a rank-independent filesystem
-            # check -- do NOT gate on combra_reals (rank 0 only) or the gathers deadlock.
+            # check -- do NOT gate on combra_ref (rank 0 only) or the gathers deadlock.
             combra_active = combra_metrics and (importlib.util.find_spec('combra') is not None)
             if combra_active:
                 stage('Evaluating combra metrics')
@@ -1064,7 +1113,7 @@ def training_loop(
                 try:
                     combra_results = _combra_eval_distributed(
                         snapshot_data['G_ema'], combra_z, combra_c, batch_gpu,
-                        num_gpus, rank, device, combra_reals, combra_reference_cache)
+                        num_gpus, rank, device, combra_ref)
                 except Exception as e:
                     combra_results = None
                     if rank == 0:
