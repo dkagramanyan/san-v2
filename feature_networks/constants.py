@@ -70,7 +70,7 @@ EFFNETS_IMAGENET = [
     'tf_efficientnet_b2',
     'tf_efficientnet_b3',
     'tf_efficientnet_b4',
-    'tf_efficientnet_b0_ns',
+    'tf_efficientnet_b0.ns_jft_in1k',
 ]
 
 EFFNETS_INCEPTION = [

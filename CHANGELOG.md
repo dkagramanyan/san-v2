@@ -3,6 +3,32 @@
 All notable changes to this fork (`san-v2`) are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — 2026-07-16
+
+### Changed
+- **Full resume checkpoint renamed** `network-snapshot.pkl` → **`network-snapshot-latest.pt`**
+  (`torch_utils/misc.get_ckpt_path`). Behaviour is unchanged — it is still a single file
+  overwritten in place every snapshot tick (never accumulates) and still carries the
+  `G`/`D`/`G_ema` networks + resume `progress` (no optimizer state, as before). The
+  per-tick `network-snapshot-<kimg>-inference.pkl` history snapshots serve as the
+  accumulating record; the `-latest.pt` file is purely for `--resume`.
+  **Migration:** existing runs must rename their on-disk `network-snapshot.pkl` to
+  `network-snapshot-latest.pt` to keep auto-resuming.
+- **`timm` unpinned to 1.x** (`timm>=1.0.0`, was `timm==0.4.12`) in `requirements.txt`
+  and `pyproject.toml`. Updated feature-network model ids for the new timm registry:
+  `tf_efficientnet_b0_ns` → `tf_efficientnet_b0.ns_jft_in1k` (`feature_networks/constants.py`);
+  `vit_deit_base_patch16_384` → `deit_base_patch16_384`,
+  `vit_deit_base_distilled_patch16_384` → `deit_base_distilled_patch16_384`,
+  `vit_base_resnet50_384` → `vit_base_r50_s16_384` (`feature_networks/vit.py`, legacy
+  DPT-ViT helpers not on the default projected-discriminator path). All other deps
+  already used `>=` (latest-compatible); `glob` is stdlib.
+  **⚠ Breaking:** checkpoints that embed the projected discriminator's timm feature
+  networks (`best_model.pkl` stems used as `--path_stem`, and `network-snapshot-latest.pt`)
+  were saved under timm 0.4.12 and will **not** unpickle under timm 1.x — the progressive
+  16²→1024² stem chain must be regenerated from scratch. Inference-only `G_ema` snapshots
+  are unaffected. This migration was **not** runtime-tested (timm 1.x unavailable in the
+  authoring env); verify with `tests/test_san_modules.py` on the cluster before a long run.
+
 ## [Unreleased] — 2026-06-25
 
 ### Added

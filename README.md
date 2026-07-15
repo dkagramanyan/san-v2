@@ -230,8 +230,9 @@ full and cutting evaluation latency.
 
 There are three kinds of artifacts the training loop can write — in **decreasing size**:
 
-- **Full resume checkpoint** — `network-snapshot.pkl` (written when `--restart_every`
-  is set). It contains the `G`/`D`/`G_ema` networks **and** the training progress
+- **Full resume checkpoint** — `network-snapshot-latest.pt` (written when `--restart_every`
+  is set). A **single file overwritten in place** every snapshot tick — it never
+  accumulates. It contains the `G`/`D`/`G_ema` networks **and** the training progress
   (`cur_nimg`, tick, augmentation `p`, `pl_mean`, best FID) needed to resume training.
 - **Weights-only snapshot** — pass `--save-weights-only=true` to also write
   `network-snapshot-<kimg>.pkl` every snapshot tick. These contain the `G`/`D`/`G_ema`
