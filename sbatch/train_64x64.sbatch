@@ -45,7 +45,7 @@ python train.py --outdir=./runs/wc-cv_h200_no_cache_cleaning \
         --batch-gpu 120 \
         --kimg 20000 \
         --cond True \
-        --save-inference-only True \
+        --save-inference-only 0 \
         --syn_layers 6\
         --superres \
         --up_factor 2 \

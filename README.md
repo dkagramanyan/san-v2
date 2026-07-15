@@ -245,8 +245,11 @@ There are three kinds of artifacts the training loop can write — in **decreasi
   (`legacy.load_network_pkl` mirrors `G_ema` onto `G` on load). **Not** for resuming.
 
 The weights-only and inference-only snapshots are for inference/evaluation; use the
-full resume checkpoint to continue training. The `sbatch/train_*.sbatch` scripts pass
-`--save-inference-only True` so every run leaves small, ready-to-ship generators.
+full resume checkpoint to continue training. The production `sbatch/train_*.sbatch`
+scripts pass `--save-inference-only 0` (disabled) — a prod run keeps only the rolling
+`network-snapshot-latest.pt` resume checkpoint and the best-FID `best_model.pkl`, and
+does **not** accumulate per-tick generators. Set `--save-inference-only 1` if you want
+the small per-tick `G_ema` history back.
 
 ```bash
 python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \

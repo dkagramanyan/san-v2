@@ -6,6 +6,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased] — 2026-07-16
 
 ### Changed
+- **Production `sbatch/train_*.sbatch` now pass `--save-inference-only 0`** (was `True`).
+  A prod run keeps only the rolling `network-snapshot-latest.pt` resume checkpoint and the
+  best-FID `best_model.pkl` — no per-tick `G_ema` history is accumulated. Set
+  `--save-inference-only 1` to restore the per-tick inference snapshots.
 - **Full resume checkpoint renamed** `network-snapshot.pkl` → **`network-snapshot-latest.pt`**
   (`torch_utils/misc.get_ckpt_path`). Behaviour is unchanged — it is still a single file
   overwritten in place every snapshot tick (never accumulates) and still carries the
