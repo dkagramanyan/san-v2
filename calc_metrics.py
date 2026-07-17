@@ -8,20 +8,17 @@
 
 """Calculate quality metrics for previous training run or pretrained network pickle."""
 
-import os
-import click
-import json
-import tempfile
 import copy
+import json
+import os
+import tempfile
+
+import click
 import torch
 
 import dnnlib
-import legacy
-from metrics import metric_main
-from metrics import metric_utils
-from torch_utils import training_stats
-from torch_utils import custom_ops
-from torch_utils import misc
+from metrics import metric_main, metric_utils
+from torch_utils import checkpoint, custom_ops, misc, training_stats
 from torch_utils.ops import conv2d_gradfix
 
 #----------------------------------------------------------------------------
@@ -141,23 +138,20 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose, truncat
         ctx.fail('--network must point to a file or URL')
     if args.verbose:
         print(f'Loading network from "{network_pkl}"...')
-    with dnnlib.util.open_url(network_pkl, verbose=args.verbose) as f:
-        network_dict = legacy.load_network_pkl(f)
-        args.G = network_dict['G_ema'] # subclass of torch.nn.Module
+    # Inference snapshots are `.pt` state dicts (§3) and carry no training_set_kwargs,
+    # so --data is required to point at the reference dataset.
+    args.G = checkpoint.load_generator(network_pkl)  # subclass of torch.nn.Module
 
     # Initialize dataset options.
     if data is not None:
         args.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data)
-    elif network_dict['training_set_kwargs'] is not None:
-        args.dataset_kwargs = dnnlib.EasyDict(network_dict['training_set_kwargs'])
     else:
         ctx.fail('Could not look up dataset options; please specify --data')
 
-    # Finalize dataset options.
+    # Finalize dataset options. Datasets are never flip-doubled (§5), so --mirror has
+    # no effect on evaluation and is accepted only for backward CLI compatibility.
     args.dataset_kwargs.resolution = args.G.img_resolution
     args.dataset_kwargs.use_labels = (args.G.c_dim != 0)
-    if mirror is not None:
-        args.dataset_kwargs.xflip = mirror
 
     # Print dataset options.
     if args.verbose:

@@ -1,19 +1,18 @@
 # Code from: https://github.com/PDillis/stylegan3-fun
 
+import json
 import os
 import re
-import json
-
-from typing import List, Tuple, Union, Optional
 from collections import OrderedDict
 from locale import atof
+from typing import List, Optional, Tuple, Union
 
 import click
 import numpy as np
 import torch
 import torch.nn.functional as F
-import dnnlib
 
+import dnnlib
 
 # ----------------------------------------------------------------------------
 

@@ -25,6 +25,7 @@ try:
     torch = pytest.importorskip("torch")
 except ImportError:
     import types
+
     import torch
     pytest = types.SimpleNamespace(
         importorskip=lambda name: __import__(name),
@@ -36,10 +37,10 @@ import torch.nn.functional as F  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pg_modules.san_modules import (  # noqa: E402
-    SANLinear,
     SANConv1d,
     SANConv2d,
     SANEmbedding,
+    SANLinear,
 )
 
 
@@ -203,7 +204,7 @@ def download_models() -> int:
 
     print("\n[2/2] combra image-metric backbones (InceptionV3 / CLIP / DINOv2):")
     try:
-        from combra.metrics import compute_fid, compute_cmmd, compute_fd_dinov2
+        from combra.metrics import compute_cmmd, compute_fd_dinov2, compute_fid
     except ImportError:
         print("  combra not installed; skipping (only needed for --combra-metrics)")
     else:

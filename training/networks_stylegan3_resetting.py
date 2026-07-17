@@ -14,19 +14,16 @@
 
 import os
 import pickle
-import sys
-import numpy as np
-import scipy.signal
-import scipy.optimize
-import torch
-from torch_utils import misc
-from torch_utils import persistence
-from torch_utils.ops import conv2d_gradfix
-from torch_utils.ops import filtered_lrelu
-from torch_utils.ops import bias_act
-import dnnlib
-import legacy
 import time
+
+import numpy as np
+import scipy.optimize
+import scipy.signal
+import torch
+
+import dnnlib
+from torch_utils import checkpoint, misc, persistence
+from torch_utils.ops import bias_act, conv2d_gradfix, filtered_lrelu
 
 # #region debug logging
 # Global debug configuration - set from training loop
@@ -237,7 +234,7 @@ class MappingNetwork(torch.nn.Module):
         print(f'loaded imagenet embeddings from {embed_path}: {self.embed}')
         if rand_embedding:
             self.embed.__init__(num_embeddings=self.embed.num_embeddings, embedding_dim=self.embed.embedding_dim)
-            print(f'initialized embeddings with random weights')
+            print('initialized embeddings with random weights')
 
         # Construct layers.
         self.embed_proj = FullyConnectedLayer(self.embed.embedding_dim, self.z_dim, activation='lrelu') if self.c_dim > 0 else None
@@ -799,9 +796,9 @@ class SuperresGenerator(torch.nn.Module):
         self.path_stem = path_stem
         self.up_factor = up_factor
 
-        # load pretrained stem
-        with dnnlib.util.open_url(path_stem) as f:
-            G_stem = legacy.load_network_pkl(f)['G_ema']
+        # load pretrained stem (weights-only warm start, §3): rebuild the stem
+        # generator from its `.pt` state-dict snapshot.
+        G_stem = checkpoint.load_generator(path_stem)
         self.mapping = G_stem.mapping
         self.synthesis = G_stem.synthesis
 
@@ -864,8 +861,7 @@ class SuperresGenerator(torch.nn.Module):
 
     def reinit_stem(self):
         print("Reinitialize stem")
-        with dnnlib.util.open_url(self.path_stem) as f:
-            G_stem = legacy.load_network_pkl(f)['G_ema']
+        G_stem = checkpoint.load_generator(self.path_stem)
 
         # cut off critically sampled layers
         for name in reversed(G_stem.synthesis.layer_names):

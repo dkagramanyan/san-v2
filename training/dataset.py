@@ -8,14 +8,16 @@
 
 """Streaming images and labels from datasets created with dataset_tool.py."""
 
-import os
-import numpy as np
-import zipfile
-import PIL.Image
-import json
-import torch
-import dnnlib
 import copy
+import json
+import os
+import zipfile
+
+import numpy as np
+import PIL.Image
+import torch
+
+import dnnlib
 
 try:
     import pyspng
@@ -28,9 +30,8 @@ class Dataset(torch.utils.data.Dataset):
     def __init__(self,
         name,                   # Name of the dataset.
         raw_shape,              # Shape of the raw image data (NCHW).
-        max_size    = None,     # Artificially limit the size of the dataset. None = no limit. Applied before xflip.
+        max_size    = None,     # Artificially limit the size of the dataset. None = no limit.
         use_labels  = False,    # Enable conditioning labels? False = label dimension is zero.
-        xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
         random_seed = 1,        # Random seed to use when applying max_size.
     ):
         self._name = name
@@ -38,6 +39,7 @@ class Dataset(torch.utils.data.Dataset):
         self._use_labels = use_labels
         self._raw_labels = None
         self._label_shape = None
+        self._class_names = None  # index-aligned grain-class names, from dataset.json (§5)
 
         # Apply max_size.
         self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
@@ -46,23 +48,8 @@ class Dataset(torch.utils.data.Dataset):
             np.random.RandomState(random_seed).shuffle(self._raw_idx)
             self._raw_idx = np.sort(self._raw_idx[:max_size])
 
-        # Apply xflip.
-        self._xflip = np.zeros(self._raw_idx.size, dtype=np.uint8)
-        if xflip:
-            self._raw_idx = np.tile(self._raw_idx, 2)
-            self._xflip = np.concatenate([self._xflip, np.ones_like(self._xflip)])
-
     def set_dyn_len(self, new_len):
         self._raw_idx = self._base_raw_idx[:new_len]
-
-    def set_classes(self, cls_list):
-        self._raw_labels = self._load_raw_labels()
-        new_idcs = [self._raw_labels == cl for cl in cls_list]
-        new_idcs = np.sum(np.vstack(new_idcs), 0)  # logical or
-        new_idcs = np.where(new_idcs)  # find location
-        self._raw_idx = self._base_raw_idx[new_idcs]
-        assert all(sorted(cls_list) == np.unique(self._raw_labels[self._raw_idx]))
-        print(f"Training on the following classes: {cls_list}")
 
     def _get_raw_labels(self):
         if self._raw_labels is None:
@@ -103,9 +90,6 @@ class Dataset(torch.utils.data.Dataset):
         assert isinstance(image, np.ndarray)
         assert list(image.shape) == self.image_shape
         assert image.dtype == np.uint8
-        if self._xflip[idx]:
-            assert image.ndim == 3 # CHW
-            image = image[:, :, ::-1]
         return image.copy(), self.get_label(idx)
 
     def get_label(self, idx):
@@ -119,7 +103,6 @@ class Dataset(torch.utils.data.Dataset):
     def get_details(self, idx):
         d = dnnlib.EasyDict()
         d.raw_idx = int(self._raw_idx[idx])
-        d.xflip = (int(self._xflip[idx]) != 0)
         d.raw_label = self._get_raw_labels()[d.raw_idx].copy()
         return d
 
@@ -147,7 +130,15 @@ class Dataset(torch.utils.data.Dataset):
         if self._label_shape is None:
             raw_labels = self._get_raw_labels()
             if raw_labels.dtype == np.int64:
-                self._label_shape = [int(np.max(raw_labels)) + 1]
+                # The class count is the number of grain classes named in
+                # dataset.json (§5), not max(label)+1 -- a split that happens to
+                # miss the highest class must not silently shrink c_dim and shift
+                # every class index. Fall back to max(label)+1 only when the zip
+                # predates the class_names contract.
+                if self._class_names is not None:
+                    self._label_shape = [len(self._class_names)]
+                else:
+                    self._label_shape = [int(np.max(raw_labels)) + 1]
             else:
                 self._label_shape = raw_labels.shape[1:]
         return list(self._label_shape)
@@ -162,8 +153,10 @@ class Dataset(torch.utils.data.Dataset):
         return any(x != 0 for x in self.label_shape)
 
     @property
-    def has_onehot_labels(self):
-        return self._get_raw_labels().dtype == np.int64
+    def class_names(self):
+        """Index-aligned grain-class names from dataset.json, or None if absent."""
+        self._get_raw_labels()  # ensures _class_names is populated as a side effect
+        return list(self._class_names) if self._class_names is not None else None
 
 #----------------------------------------------------------------------------
 
@@ -240,9 +233,13 @@ class ImageFolderDataset(Dataset):
         if fname not in self._all_fnames:
             return None
         with self._open_file(fname) as f:
-            labels = json.load(f)['labels']
+            meta = json.load(f)
+        labels = meta['labels']
         if labels is None:
             return None
+        # Names travel with the artifact (§5): dataset.json carries an
+        # index-aligned "class_names" list written at build time.
+        self._class_names = meta.get('class_names')
         labels = dict(labels)
         labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
         labels = np.array(labels)

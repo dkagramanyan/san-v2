@@ -11,17 +11,16 @@
 
 """Loss functions."""
 
+import time
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.transforms import Normalize
+
 from torch_utils import training_stats
-from torch_utils.ops import conv2d_gradfix
-from torch_utils.ops import upfirdn2d
-import dnnlib
-import legacy
-import time
+from torch_utils.ops import conv2d_gradfix, upfirdn2d
 
 # #region debug logging
 # Disabled by default. training_loop.set_debug_enabled() turns this on and points
@@ -55,8 +54,9 @@ def _debug_log(location, message, data=None, hypothesis_id=None):
         pass
 # #endregion
 
-from pg_modules.blocks import Interpolate
 import timm
+
+from pg_modules.blocks import Interpolate
 from pg_modules.projector import get_backbone_normstats
 
 #----------------------------------------------------------------------------

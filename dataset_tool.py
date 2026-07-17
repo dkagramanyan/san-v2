@@ -20,9 +20,9 @@ import tarfile
 import zipfile
 from pathlib import Path
 from typing import Callable, Optional, Tuple, Union
-import imageio
 
 import click
+import imageio
 import numpy as np
 import PIL.Image
 from tqdm import tqdm
@@ -78,32 +78,23 @@ def png_to_rgb(arr):
 
 def open_image_folder(source_dir, *, max_images: Optional[int]):
     input_images = [str(f) for f in sorted(Path(source_dir).rglob('*')) if is_image_ext(f) and os.path.isfile(f)]
-    # input_images = np.load('in_filenames.npz', allow_pickle=True)['input_images']
-
-    # Load labels.
-    labels = {}
-    meta_fname = os.path.join(source_dir, 'dataset.json')
-    if os.path.isfile(meta_fname):
-        with open(meta_fname, 'r') as file:
-            labels = json.load(file)['labels']
-            if labels is not None:
-                labels = { x[0]: x[1] for x in labels }
-            else:
-                labels = {}
 
     max_idx = maybe_min(len(input_images), max_images)
 
     def iterate_images():
         for idx, fname in enumerate(input_images):
-            arch_fname = os.path.relpath(fname, source_dir)
-            arch_fname = arch_fname.replace('\\', '/')
+            arch_fname = os.path.relpath(fname, source_dir).replace('\\', '/')
             img = imageio.imread(fname)
 
             # alpha conversion
-            if img.shape[-1] == 4:
+            if img.ndim == 3 and img.shape[-1] == 4:
                 img = png_to_rgb(img)
 
-            yield dict(img=img, label=labels.get(arch_fname))
+            # The grain class is the top-level folder the image lives in (§5,
+            # Rule 1): labels are derived from the folder layout, never copied
+            # from a source dataset.json.
+            cls = arch_fname.split('/')[0] if '/' in arch_fname else None
+            yield dict(img=img, class_name=cls)
             if idx >= max_idx-1:
                 break
     return max_idx, iterate_images()
@@ -114,16 +105,6 @@ def open_image_zip(source, *, max_images: Optional[int]):
     with zipfile.ZipFile(source, mode='r') as z:
         input_images = [str(f) for f in sorted(z.namelist()) if is_image_ext(f)]
 
-        # Load labels.
-        labels = {}
-        if 'dataset.json' in z.namelist():
-            with z.open('dataset.json', 'r') as file:
-                labels = json.load(file)['labels']
-                if labels is not None:
-                    labels = { x[0]: x[1] for x in labels }
-                else:
-                    labels = {}
-
     max_idx = maybe_min(len(input_images), max_images)
 
     def iterate_images():
@@ -132,7 +113,9 @@ def open_image_zip(source, *, max_images: Optional[int]):
                 with z.open(fname, 'r') as file:
                     img = PIL.Image.open(file) # type: ignore
                     img = np.array(img)
-                yield dict(img=img, label=labels.get(fname))
+                # Grain class = top-level folder (§5, Rule 1).
+                cls = fname.split('/')[0] if '/' in fname else None
+                yield dict(img=img, class_name=cls)
                 if idx >= max_idx-1:
                     break
     return max_idx, iterate_images()
@@ -267,6 +250,21 @@ def make_transform(
         canvas[(width - height) // 2 : (width + height) // 2, :] = img
         return canvas
 
+    def center_crop_dhariwal(width, height, img):
+        # Dhariwal (ADM) center crop, shared across the v2 repos: repeatedly halve
+        # with a box filter while at least 2x oversized, then resize the short side
+        # to the target and center-crop. Produces cleaner downsampling than a single
+        # LANCZOS resize for large sources.
+        pil = PIL.Image.fromarray(img, 'RGB')
+        while min(*pil.size) >= 2 * width:
+            pil = pil.resize((pil.size[0] // 2, pil.size[1] // 2), PIL.Image.BOX)
+        scale = width / min(*pil.size)
+        pil = pil.resize((round(pil.size[0] * scale), round(pil.size[1] * scale)), PIL.Image.BICUBIC)
+        arr = np.array(pil)
+        crop_y = (arr.shape[0] - height) // 2
+        crop_x = (arr.shape[1] - width) // 2
+        return arr[crop_y : crop_y + height, crop_x : crop_x + width]
+
     if transform is None:
         return functools.partial(scale, output_width, output_height)
     if transform == 'center-crop':
@@ -277,6 +275,10 @@ def make_transform(
         if (output_width is None) or (output_height is None):
             error ('must specify --resolution=WxH when using ' + transform + ' transform')
         return functools.partial(center_crop_wide, output_width, output_height)
+    if transform == 'center-crop-dhariwal':
+        if (output_width is None) or (output_height is None):
+            error ('must specify --resolution=WxH when using ' + transform + ' transform')
+        return functools.partial(center_crop_dhariwal, output_width, output_height)
     assert False, 'unknown transform'
 
 #----------------------------------------------------------------------------
@@ -298,6 +300,45 @@ def open_dataset(source, *, max_images: Optional[int]):
             assert False, 'unknown archive type'
     else:
         error(f'Missing input file or directory: {source}')
+
+#----------------------------------------------------------------------------
+
+def _build_label_metadata(arch_fnames, class_names_per_img, int_labels_per_img):
+    """Assemble ``dataset.json`` metadata from per-image class identity (§5).
+
+    Two rules:
+      * Rule 1 -- the integer label is the index of the class name in ``sorted()``
+        (alphabetical) order, so the mapping is a stable property of the folder
+        layout, not of ingestion order.
+      * Rule 2 -- an index-aligned ``class_names`` list travels with the archive.
+
+    Missing labels are a hard error, never a silent drop of the whole label set:
+    a single unlabeled image in an otherwise-labeled folder tree is a mistake, not
+    a request for an unconditional dataset.
+    """
+    has_folder_classes = any(c is not None for c in class_names_per_img)
+    has_int_labels = any(x is not None for x in int_labels_per_img)
+
+    if has_folder_classes:
+        missing = [f for f, c in zip(arch_fnames, class_names_per_img) if c is None]
+        if missing:
+            error(f'{len(missing)} image(s) have no class folder (e.g. {missing[0]}); '
+                  'every image must live in a class subfolder, or none may.')
+        class_names = sorted(set(class_names_per_img))
+        index = {name: i for i, name in enumerate(class_names)}
+        labels = [[f, index[c]] for f, c in zip(arch_fnames, class_names_per_img)]
+        return {'labels': labels, 'class_names': class_names}
+
+    if has_int_labels:
+        missing = [f for f, x in zip(arch_fnames, int_labels_per_img) if x is None]
+        if missing:
+            error(f'{len(missing)} image(s) have no label (e.g. {missing[0]}).')
+        labels = [[f, int(x)] for f, x in zip(arch_fnames, int_labels_per_img)]
+        class_names = [str(i) for i in range(max(x for _, x in labels) + 1)]
+        return {'labels': labels, 'class_names': class_names}
+
+    # No class information anywhere -> unconditional dataset.
+    return {'labels': None}
 
 #----------------------------------------------------------------------------
 
@@ -333,12 +374,18 @@ def open_dest(dest: str) -> Tuple[str, Callable[[str, Union[bytes, str]], None],
 
 #----------------------------------------------------------------------------
 
-@click.command()
+@click.group()
+def prepare_data():
+    """san-v2 dataset preparation (san-prepare-data)."""
+
+#----------------------------------------------------------------------------
+
+@prepare_data.command(name='convert')
 @click.pass_context
 @click.option('--source', help='Directory or archive name for input dataset', required=True, metavar='PATH')
 @click.option('--dest', help='Output directory or archive name for output dataset', required=True, metavar='PATH')
 @click.option('--max-images', help='Output only up to `max-images` images', type=int, default=None)
-@click.option('--transform', help='Input crop/resize mode', type=click.Choice(['center-crop', 'center-crop-wide']))
+@click.option('--transform', help='Input crop/resize mode', type=click.Choice(['center-crop', 'center-crop-wide', 'center-crop-dhariwal']))
 @click.option('--resolution', help='Output resolution (e.g., \'512x512\')', metavar='WxH', type=parse_tuple)
 def convert_dataset(
     ctx: click.Context,
@@ -420,7 +467,11 @@ def convert_dataset(
 
     dataset_attrs = None
 
-    labels = []
+    # Per-image class identity, gathered in output order. Folder/zip sources yield
+    # a grain-class name (str) or None; cifar/mnist yield a pre-assigned integer.
+    arch_fnames = []
+    class_names_per_img = []   # str | None
+    int_labels_per_img = []    # int | None
     for idx, image in tqdm(enumerate(input_iter), total=num_files):
         idx_str = f'{idx:08d}'
         archive_fname = f'{idx_str[:5]}/img{idx_str}.png'
@@ -432,9 +483,17 @@ def convert_dataset(
         if img is None:
             continue
 
+        # RGB everywhere (§5): grayscale sources are converted to 3 channels once,
+        # here at build time -- the training/generation code then asserts 3 channels
+        # instead of silently converting at runtime.
+        if img.ndim == 2:
+            img = np.repeat(img[:, :, np.newaxis], 3, axis=2)
+        elif img.shape[2] == 1:
+            img = np.repeat(img, 3, axis=2)
+        channels = img.shape[2]
+
         # Error check to require uniform image attributes across
         # the whole dataset.
-        channels = img.shape[2] if img.ndim == 3 else 1
         cur_image_attrs = {
             'width': img.shape[1],
             'height': img.shape[0],
@@ -446,8 +505,8 @@ def convert_dataset(
             height = dataset_attrs['height']
             if width != height:
                 error(f'Image dimensions after scale and crop are required to be square.  Got {width}x{height}')
-            if dataset_attrs['channels'] not in [1, 3]:
-                error('Input images must be stored as RGB or grayscale')
+            if dataset_attrs['channels'] != 3:
+                error('Input images must be convertible to 3-channel RGB')
             if width != 2 ** int(np.floor(np.log2(width))):
                 error('Image width/height after scale and crop are required to be power-of-two')
         elif dataset_attrs != cur_image_attrs:
@@ -455,19 +514,19 @@ def convert_dataset(
             error(f'Image {archive_fname} attributes must be equal across all images of the dataset.  Got:\n' + '\n'.join(err))
 
         # Save the image as an uncompressed PNG.
-        img = PIL.Image.fromarray(img, { 1: 'L', 3: 'RGB' }[channels])
+        img = PIL.Image.fromarray(img, 'RGB')
         image_bits = io.BytesIO()
         img.save(image_bits, format='png', compress_level=0, optimize=False)
         save_bytes(os.path.join(archive_root_dir, archive_fname), image_bits.getbuffer())
-        labels.append([archive_fname, image['label']] if image['label'] is not None else None)
+        arch_fnames.append(archive_fname)
+        class_names_per_img.append(image.get('class_name'))
+        int_labels_per_img.append(image.get('label'))
 
-    metadata = {
-        'labels': labels if all(x is not None for x in labels) else None
-    }
+    metadata = _build_label_metadata(arch_fnames, class_names_per_img, int_labels_per_img)
     save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
     close_dest()
 
 #----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    convert_dataset() # pylint: disable=no-value-for-parameter
+    prepare_data() # pylint: disable=no-value-for-parameter

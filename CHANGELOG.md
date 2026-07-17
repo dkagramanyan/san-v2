@@ -3,6 +3,50 @@
 All notable changes to this fork (`san-v2`) are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] — 2026-07-17
+
+Adoption of the v2 model API convention (wc_cv `models_api_proposal`, §12). **Breaking.**
+
+### Added
+- **Console scripts** `san-train`, `san-gen-images`, `san-eval`, `san-prepare-data`
+  (`pip install -e .`).
+- **Self-describing inference snapshots** `san-snapshot-<kimg:06d>-inference.pt` — EMA-only
+  `.pt` **state dicts** carrying `{n_classes, resolution, class_names, cur_nimg}` metadata.
+  Written **atomically** (tmp + `os.replace`) every snapshot tick **and always at the last
+  tick**, pruned to `--snapshot-keep-last` (default 3, `0` = keep all).
+- **Training flags** `--precision {fp32,fp16,bf16}`, `--tf32`, `--bench`, `--num-fid-samples`,
+  `--combra-ref-count`, `--snapshot-keep-last`.
+- **Generation**: `--classes` accepts names or indices, validated against the checkpoint;
+  unified h5 signature (`format="generated_images_shard"`, `schema_version=1`); `class_names`
+  stamped into h5 / `classes.json`; the merge **hard-fails** on incomplete shards.
+- **Dataset**: `dataset_tool` derives labels alphabetically, writes `class_names`, errors on
+  missing labels, converts grayscale→RGB at build time; `san-prepare-data convert` click group
+  with the shared transform set (incl. `center-crop-dhariwal`).
+- combra metrics mirrored into `stats.jsonl`; startup `combra_smoke_test`; normalize/denormalize
+  round-trip assert; DDP weight-consistency check before saving; `tests/test_smoke.py`; ruff CI.
+
+### Changed
+- `--fp32`→`--precision`, `--nobench`→`--bench`; progressive flags to kebab-case
+  (`--up-factor`, `--path-stem`, `--syn-layers`, `--head-layers`, `--cls-weight`);
+  `--mirror` is now a loader-level stochastic flip (was dataset x-flip doubling).
+- Run-dir name drops the dataset basename: `<cfg>-gpus<G>-batch<B>[-desc]`; a fresh id is
+  always allocated. combra install via the `[combra]` extra (`git+https`).
+- combra eval denorm fixed (`+128`→`+127.5`), so reals and fakes cross the uint8 boundary
+  identically; class count read from `class_names`, not `max(label)+1`.
+
+### Removed
+- **Resume / restart machinery** (`--resume`, `--restart_every`, exit-code-3, rolling
+  `network-snapshot-latest.pt`, `best_model.pkl`/`best_nimg.txt`), `--save-weights-only`,
+  `--save-inference-only`, the native `--metrics` registry from training, Hydra
+  (`train_hydra.py`, `configs/`, `hydra-core`), `requirements.txt`, pickled-module saving
+  (`legacy.py`), the GUI deps, and dead files (`networks_stylegan3.py`,
+  `dataset_tool_for_imagenet.py`, `sbatch/`).
+
+### Breaking
+- Interrupted runs can no longer be resumed (size `--kimg` to fit the job's time limit).
+- Old `.pkl` artifacts are not readable (check out a pre-0.2.0 commit for those); combra
+  metric values shift (denorm fix); commands using removed/renamed flags fail.
+
 ## [Unreleased] — 2026-07-16
 
 ### Changed
