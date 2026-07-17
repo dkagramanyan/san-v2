@@ -47,6 +47,15 @@ san-gen-images = "gen_images:generate_images"
 san-eval = "calc_metrics:calc_metrics"
 san-prepare-data = "dataset_tool:prepare_data"
 
+# Flat layout: the entry points live in top-level modules and the support code in
+# top-level packages, so discovery is declared explicitly (auto-discovery bails on
+# a flat layout with multiple top-level packages).
+[tool.setuptools]
+py-modules = ["train", "gen_images", "calc_metrics", "dataset_tool"]
+
+[tool.setuptools.packages.find]
+include = ["training*", "torch_utils*", "metrics*", "dnnlib*", "pg_modules*", "feature_networks*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
