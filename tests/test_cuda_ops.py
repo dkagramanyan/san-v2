@@ -6,15 +6,14 @@ performance benchmarking, and CUDA 13 / H200 Hopper architecture compatibility.
 """
 
 import os
-import sys
 import shutil
 import subprocess
+import sys
 import time
 import traceback
-from typing import Dict, List, Tuple, Optional
+from typing import Dict
 
 import torch
-import numpy as np
 
 # Make the repo root importable whether run as `python tests/test_cuda_ops.py` or via pytest.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,7 +32,7 @@ if __name__ != "__main__":
 
 # Import custom ops modules
 from torch_utils import custom_ops
-from torch_utils.ops import upfirdn2d, bias_act, filtered_lrelu
+from torch_utils.ops import bias_act, filtered_lrelu, upfirdn2d
 
 
 def run(cmd: str) -> int:

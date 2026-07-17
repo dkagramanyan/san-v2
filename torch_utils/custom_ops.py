@@ -9,16 +9,15 @@
 import glob
 import hashlib
 import importlib
+import json
 import os
 import re
 import shutil
-import uuid
 import time
-import json
+import uuid
 
 import torch
 import torch.utils.cpp_extension
-from torch.utils.file_baton import FileBaton
 
 #----------------------------------------------------------------------------
 # Global options.

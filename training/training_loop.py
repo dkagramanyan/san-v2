@@ -8,34 +8,23 @@
 
 """Main training loop."""
 
+import copy
+import importlib.util
+import json
 import os
 import time
-import copy
-import json
-import dill
-import psutil
 import warnings
-import importlib.util
 from datetime import datetime
-import PIL.Image
+
 import numpy as np
+import PIL.Image
+import psutil
 import torch
-import torch.nn.functional as F
+
 import dnnlib
-import pickle
-from torch_utils import misc
-from torch_utils import training_stats
-from torch_utils.ops import conv2d_gradfix
-from torch_utils.ops import grid_sample_gradfix
-
-import legacy
-from metrics import metric_main
+from torch_utils import checkpoint, misc, training_stats
+from torch_utils.ops import conv2d_gradfix, grid_sample_gradfix
 from training import networks_stylegan3_resetting
-
-# Number of fake images generated each snapshot for the combra image metrics
-# (combra_fid10k / combra_cmmd10k / combra_fd_dinov2_10k). Scored against the
-# whole training set as the real reference.
-COMBRA_NUM_GEN = 10000
 
 #----------------------------------------------------------------------------
 # Unified debug logging (TXT format)
@@ -83,34 +72,6 @@ def _debug_log(location, message, data=None):
 
 #----------------------------------------------------------------------------
 
-def save_weights_snapshot(snapshot_data, path):
-    """Save only model weights (G, D, G_ema modules) to ``path``.
-
-    The resulting pickle is loadable by ``legacy.load_network_pkl`` and therefore
-    by ``gen_images.py`` / ``calc_metrics.py``, but it deliberately omits the
-    training-resume state (``progress``, augmentation/dataset kwargs). It is meant
-    for inference/evaluation, NOT for resuming training -- use the full checkpoint
-    written by ``misc.get_ckpt_path`` for that.
-    """
-    weights_data = {k: snapshot_data[k] for k in ('G', 'D', 'G_ema') if k in snapshot_data}
-    with open(path, 'wb') as f:
-        dill.dump(weights_data, f)
-
-#----------------------------------------------------------------------------
-
-def save_inference_snapshot(snapshot_data, path):
-    """Save only the EMA generator (``G_ema``) -- the smallest inference artifact.
-
-    Contains just the network ``gen_images.py`` / ``calc_metrics.py`` actually use,
-    dropping the discriminator, the non-EMA generator and all training-resume state.
-    ``legacy.load_network_pkl`` mirrors ``G_ema`` onto ``G`` on load, so the pickle
-    stays loadable. NOT usable for resuming training -- use the full checkpoint.
-    """
-    inference_data = {'G_ema': snapshot_data['G_ema']}
-    with open(path, 'wb') as f:
-        dill.dump(inference_data, f)
-
-#----------------------------------------------------------------------------
 # CUDA kernel warmup to pre-trigger all kernel configurations
 
 def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
@@ -136,10 +97,10 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
     if rank == 0:
         print(f'[Warmup] Running {num_iterations} warmup iterations to pre-compile CUDA kernels...', flush=True)
         print(f'[Warmup] cuDNN benchmark={torch.backends.cudnn.benchmark} (True=auto-select optimal algorithms)', flush=True)
-        print(f'[Warmup] NOTE: First iteration may take 5-10 min on H200 due to:', flush=True)
-        print(f'[Warmup]   1. PTX JIT compilation for custom kernels (sm_90)', flush=True)
-        print(f'[Warmup]   2. cuDNN algorithm selection for feature networks (EfficientNet)', flush=True)
-        print(f'[Warmup] This is a one-time cost - subsequent runs will use cached kernels.', flush=True)
+        print('[Warmup] NOTE: First iteration may take 5-10 min on H200 due to:', flush=True)
+        print('[Warmup]   1. PTX JIT compilation for custom kernels (sm_90)', flush=True)
+        print('[Warmup]   2. cuDNN algorithm selection for feature networks (EfficientNet)', flush=True)
+        print('[Warmup] This is a one-time cost - subsequent runs will use cached kernels.', flush=True)
     
     # CRITICAL: Use actual batch_gpu to compile kernels for correct tensor shapes
     # Using smaller batch causes PTX JIT during training (224s+ delays on H200)
@@ -167,7 +128,7 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
             # This triggers cuDNN benchmark algorithm selection for all feature network layers
             t0 = time.time()
             with torch.no_grad():
-                d_out = D(fake_img, c)
+                D(fake_img, c)
             torch.cuda.synchronize(device)
             t_disc_fwd = time.time() - t0
             
@@ -222,8 +183,6 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
                     "time_sec": round(t_backward_d, 3)
                 })
             # #endregion
-            
-            t_backward = t_backward_g + t_backward_d
             
             iter_time = time.time() - iter_start
             iteration_times.append(iter_time)
@@ -291,6 +250,21 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
     for param in G.parameters():
         if param.grad is not None:
             param.grad = None
+
+#----------------------------------------------------------------------------
+
+# Normalization contract (§5): san-v2's float training space is [-1, 1]. Exactly
+# one denorm formula converts back to uint8 [0, 255], used for every artifact and
+# every combra batch, so reals and fakes cross the boundary identically (the legacy
+# eval path used a `+128` offset for fakes while reals entered as raw uint8, biasing
+# every reported metric). ``x`` is a float array/tensor in [-1, 1]; NCHW is preserved.
+def denorm_to_uint8(x):
+    x = np.asarray(x.cpu() if isinstance(x, torch.Tensor) else x, dtype=np.float32)
+    return np.rint((x + 1) * 127.5).clip(0, 255).astype(np.uint8)
+
+# Inverse used by the training loader: uint8 [0, 255] -> float [-1, 1].
+def norm_from_uint8(x):
+    return x.to(torch.float32) / 127.5 - 1
 
 #----------------------------------------------------------------------------
 
@@ -452,7 +426,7 @@ def _combra_gather_pooled_angles(images_u8, device, rank, num_gpus):
     return gathered.reshape(-1) if gathered is not None else None
 
 
-def _combra_precompute_reference(training_set, device, rank, num_gpus):
+def _combra_precompute_reference(training_set, device, rank, num_gpus, ref_count=None, seed=0):
     # All ranks: extract the pooled angles and the three feature sets from this rank's
     # deterministic slice of the training set (the combra reference) and gather them to
     # rank 0. Returns {'angles': [M], 'feat': {name: [N, D]}} on rank 0 (None elsewhere).
@@ -460,9 +434,17 @@ def _combra_precompute_reference(training_set, device, rank, num_gpus):
     # extraction is sharded instead of rank-0-only and the cached result is reused every
     # tick -- no reference work or collective recurs per tick. Every rank runs the same
     # gathers, so the caller MUST invoke this on all ranks (gated by a rank-uniform flag).
+    #
+    # ref_count caps the reference to a SEEDED RANDOM subset (§6) -- never the first N:
+    # dataset zips are class-sorted, so a first-N slice is class-biased. The same seed on
+    # every rank selects the same subset, then it is sharded by rank stride.
     from combra.metrics import cmmd_features, fd_dinov2_features, fid_features
     n = len(training_set)
-    idx = range(rank, n, num_gpus)
+    if ref_count is not None and ref_count < n:
+        sel = np.sort(np.random.RandomState(seed).choice(n, size=ref_count, replace=False))
+    else:
+        sel = np.arange(n)
+    idx = sel[rank::num_gpus]
     local_u8 = np.stack([training_set[i][0] for i in idx])  # NCHW uint8
     angles = _combra_gather_pooled_angles(local_u8, device, rank, num_gpus)
     extractors = (('fid', fid_features), ('cmmd', cmmd_features), ('fd_dinov2', fd_dinov2_features))
@@ -482,14 +464,20 @@ def _combra_eval_distributed(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, d
     # so the caller MUST invoke this on all ranks (gated by a rank-uniform flag) or the
     # ranks that skip it will hang the ones that don't. combra_ref is the precomputed
     # sharded reference from _combra_precompute_reference (rank 0 only; None elsewhere).
-    from combra.metrics import (angle_density_metrics_from_pooled,
-        cmmd_features, cmmd_from_features, fd_dinov2_features, fd_dinov2_from_features,
-        fid_features, fid_from_features)
+    from combra.metrics import (
+        angle_density_metrics_from_pooled,
+        cmmd_features,
+        cmmd_from_features,
+        fd_dinov2_features,
+        fd_dinov2_from_features,
+        fid_features,
+        fid_from_features,
+    )
 
     # 1. Generate this rank's shard and denormalize float [-1, 1] -> uint8 [0, 255]
     #    (combra's angle path is scale-sensitive, so both sides must be uint8).
     local = _combra_generate_local_shard(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank)
-    local_u8 = np.rint(local * 127.5 + 128).clip(0, 255).astype(np.uint8)
+    local_u8 = denorm_to_uint8(local)
 
     # 2. Extract image features on the local shard; gather feature rows to rank 0.
     extractors = (('fid', fid_features), ('cmmd', cmmd_features), ('fd_dinov2', fd_dinov2_features))
@@ -531,7 +519,6 @@ def training_loop(
     D_opt_kwargs            = {},       # Options for discriminator optimizer.
     augment_kwargs          = None,     # Options for augmentation pipeline. None = disable.
     loss_kwargs             = {},       # Options for loss function.
-    metrics                 = [],       # Metrics to evaluate during training.
     random_seed             = 0,        # Global random seed.
     num_gpus                = 1,        # Number of GPUs participating in the training.
     rank                    = 0,        # Rank of the current process in [0, num_gpus[.
@@ -549,16 +536,17 @@ def training_loop(
     kimg_per_tick           = 4,        # Progress snapshot interval.
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
-    save_weights_only       = False,    # Save only model weights (G/D/G_ema) without resume state. Full checkpoint (resume) is unaffected.
-    save_inference_only     = False,    # Save a small inference-only snapshot (G_ema only, no D/resume state) every snapshot tick.
-    combra_metrics          = True,     # Compute combra generative-quality metrics each snapshot tick (independent of --metrics).
-    resume_pkl              = None,     # Network pickle to resume training from.
-    resume_kimg             = 0,        # First kimg to report when resuming training.
+    snapshot_keep_last      = 3,        # How many inference snapshots to keep (0 = keep all).
+    mirror                  = False,    # Stochastic per-item horizontal flip in the training loader (§5).
+    combra_metrics          = True,     # Compute combra generative-quality metrics each snapshot tick.
+    combra_num_gen          = 10000,    # Number of fakes for the combra metrics (0 disables eval).
+    combra_ref_count        = None,     # Cap the combra reference to a seeded random subset.
+    precision               = 'fp16',   # Training precision: fp32 / fp16 / bf16.
+    allow_tf32              = True,      # Enable TF32 matmul / cuDNN.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
-    restart_every           = -1,       # Time interval in seconds to exit code
-    debug                   = False,    # Enable debug logging to file
+    debug                   = False,    # Enable debug logging to file (unused; retained for the warmup helpers).
 ):
     # Initialize.
     start_time = time.time()
@@ -572,17 +560,24 @@ def training_loop(
     set_debug_enabled(debug, debug_log_path)
     if debug and rank == 0:
         print(f'[Debug] Debug logging enabled, writing to: {debug_log_path}', flush=True)
-    torch.backends.cuda.matmul.allow_tf32 = True       # Improves numerical accuracy.
-    torch.backends.cudnn.allow_tf32 = True             # Improves numerical accuracy.
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+
+    # Normalization contract (§5): assert the one normalize/denormalize pair round-trips
+    # exactly, so every artifact and every combra batch crosses the uint8 boundary
+    # losslessly.
+    if rank == 0:
+        _probe = torch.randint(0, 256, [4, 3, 8, 8], dtype=torch.uint8)
+        assert np.array_equal(denorm_to_uint8(norm_from_uint8(_probe)), _probe.numpy()), \
+            'normalize/denormalize pair must round-trip uint8 exactly'
+
     conv2d_gradfix.enabled = True                       # Improves training speed.
     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
-    __RESTART__ = torch.tensor(0., device=device)       # will be broadcasted to exit loop
-    __CUR_NIMG__ = torch.tensor(resume_kimg * 1000, dtype=torch.long, device=device)
+    __CUR_NIMG__ = torch.tensor(0, dtype=torch.long, device=device)
     __CUR_TICK__ = torch.tensor(0, dtype=torch.long, device=device)
     __BATCH_IDX__ = torch.tensor(0, dtype=torch.long, device=device)
     __AUGMENT_P__ = torch.tensor(augment_p, dtype=torch.float, device=device)
     __PL_MEAN__ = torch.zeros([], device=device)
-    best_fid = 9999
 
     # Stage logging helper (rank 0 only).
     def stage(msg):
@@ -618,28 +613,9 @@ def training_loop(
             for _, disc in discriminator.mini_discs.items():
                 disc.last_layer.normalize_weight()
 
-    # Check for existing checkpoint
-    ckpt_pkl = None
-    if restart_every > 0 and os.path.isfile(misc.get_ckpt_path(run_dir)):
-        ckpt_pkl = resume_pkl = misc.get_ckpt_path(run_dir)
-
-
-    if (resume_pkl is not None) and (rank == 0):
-        stage(f'Resuming from "{resume_pkl}"')
-
-        with dnnlib.util.open_url(resume_pkl) as f:
-            resume_data = legacy.load_network_pkl(f)
-        for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
-            misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
-        stage('Loaded model weights from resume pickle')
-
-        if ckpt_pkl is not None:            # Load ticks
-            __CUR_NIMG__ = resume_data['progress']['cur_nimg'].to(device)
-            __CUR_TICK__ = resume_data['progress']['cur_tick'].to(device)
-            __BATCH_IDX__ = resume_data['progress']['batch_idx'].to(device)
-            __AUGMENT_P__ = resume_data['progress'].get('augment_p', torch.tensor(0.)).to(device)
-            __PL_MEAN__ = resume_data['progress'].get('pl_mean', torch.zeros([])).to(device)
-            best_fid = resume_data['progress']['best_fid']       # only needed for rank == 0
+    # No resume (§3): training runs start-to-finish; a fresh run id is always
+    # allocated and no checkpoint is loaded here. The only warm start is the
+    # progressive stem, loaded weights-only inside SuperresGenerator via --path-stem.
 
     # this is relevant when you continue training a lower-res model
     # ie. train 16 model, start training 32 model but continue training 16 model
@@ -708,49 +684,66 @@ def training_loop(
     if rank == 0:
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
 
-    grid_z = torch.randn([labels.shape[0], G.z_dim], device=device, generator=torch.Generator(device=device).manual_seed(random_seed * num_gpus))
+    # Grid/eval latents derive from --seed ALONE (§2), never scaled by the GPU count,
+    # so the same seed draws the same latents at any --gpus.
+    grid_z = torch.randn([labels.shape[0], G.z_dim], device=device, generator=torch.Generator(device=device).manual_seed(random_seed))
     grid_c = torch.from_numpy(labels).to(device)
     images = generate_snapshot_grid_images(G_ema=G_ema, grid_z=grid_z, grid_c=grid_c, batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
 
     if rank == 0:
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
 
-    # combra metric reference: the whole training set, scored against COMBRA_NUM_GEN
-    # generated images (fid10k / cmmd10k / fd_dinov2_10k -> 10k fakes vs all reals;
+    # combra metric reference: the training set, scored against combra_num_gen
+    # generated images (fid10k / cmmd10k / fd_dinov2_10k -> N fakes vs the reals;
     # the image metrics estimate per-side statistics, so the counts need not match).
-    # Built once (the reference is fixed across training): every rank extracts the
-    # angles + features for its deterministic slice of the reals and the rows are
-    # gathered to rank 0, so the expensive reference extraction is sharded (not
-    # rank-0-only) and the cached result is reused every tick. Latents/labels live on
-    # every rank for distributed generation.
-    combra_num = COMBRA_NUM_GEN
+    # --num-fid-samples=0 disables the combra eval entirely. --combra-ref-count caps
+    # the reference to a seeded random subset (§6). Built once (the reference is fixed
+    # across training): every rank extracts the angles + features for its deterministic
+    # slice of the reals and the rows are gathered to rank 0, so the expensive reference
+    # extraction is sharded (not rank-0-only) and the cached result is reused every
+    # tick. Latents/labels live on every rank for distributed generation.
+    combra_enabled = combra_metrics and combra_num_gen > 0
+    combra_num = combra_num_gen
     # Labels for the fakes: sample the training-set label distribution with
     # replacement (seeded identically on every rank so all ranks generate the same
     # batch). For an unconditional G, get_label returns a zero-length vector.
-    combra_label_idx = np.random.RandomState(random_seed).randint(0, len(training_set), size=combra_num)
-    combra_labels = np.stack([training_set.get_label(i) for i in combra_label_idx])
-    combra_c = torch.from_numpy(combra_labels).to(device)
-    combra_z = torch.randn([combra_num, G.z_dim], device=device,
-        generator=torch.Generator(device=device).manual_seed(random_seed * num_gpus + 1))
+    combra_ref = None
+    if combra_enabled and (rank == 0) and (importlib.util.find_spec('combra') is not None):
+        # Startup smoke test (§6): fail fast / warn early if the combra backends are
+        # unusable, using combra's own shared implementation when present.
+        try:
+            from combra.metrics import combra_smoke_test
+            combra_smoke_test()
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f'[combra] smoke test reported a problem: {e}', flush=True)
+    if combra_enabled:
+        combra_label_idx = np.random.RandomState(random_seed).randint(0, len(training_set), size=combra_num)
+        combra_labels = np.stack([training_set.get_label(i) for i in combra_label_idx])
+        combra_c = torch.from_numpy(combra_labels).to(device)
+        # Eval latents derive from --seed alone (§2), never scaled by the GPU count.
+        combra_z = torch.randn([combra_num, G.z_dim], device=device,
+            generator=torch.Generator(device=device).manual_seed(random_seed + 1))
     # combra_active must be rank-UNIFORM (it gates the precompute collectives, just
     # like the per-tick eval): combra_metrics is broadcast config and find_spec is a
     # rank-independent filesystem check. Runs on every rank so the gathers stay matched.
-    combra_ref = None
-    if combra_metrics and (importlib.util.find_spec('combra') is not None):
+    if combra_enabled and (importlib.util.find_spec('combra') is not None):
         # A broken combra backend (e.g. no network for DINOv2/CLIP weights) fails the
         # same way on every rank -- before any gather in the loop below -- so the except
         # is reached symmetrically and leaves combra_ref None on all ranks rather than
         # half-completing a collective. Per-tick eval then no-ops via its own guard, so
         # an unusable combra never breaks training.
         try:
-            combra_ref = _combra_precompute_reference(training_set, device, rank, num_gpus)
+            combra_ref = _combra_precompute_reference(
+                training_set, device, rank, num_gpus, ref_count=combra_ref_count, seed=random_seed)
         except Exception as e:
             if rank == 0:
                 print(f'[combra] reference precompute failed, disabling combra metrics: {e}', flush=True)
 
     # Warn early (once, on rank 0) if combra metrics are requested but the package is
     # missing, so the user is not left wondering why no combra_* values ever appear.
-    if combra_metrics and (rank == 0) and (importlib.util.find_spec('combra') is None):
+    if combra_enabled and (rank == 0) and (importlib.util.find_spec('combra') is None):
         warnings.warn(
             'combra_metrics=True but the `combra` package is not installed -- combra '
             'metrics will be skipped. Install it (e.g. `pip install -e ../wc_cv/combra`) '
@@ -869,7 +862,14 @@ def training_loop(
 
         with torch.autograd.profiler.record_function('data_fetch'):
             phase_real_img, phase_real_c = next(training_set_iterator)
-            phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
+            phase_real_img = phase_real_img.to(device).to(torch.float32)
+            # --mirror (§5): stochastic per-item horizontal flip, in the TRAINING loader
+            # only. The eval / combra-reference / grid loaders read the dataset directly
+            # and never flip, and the dataset is never flip-doubled.
+            if mirror:
+                flip = torch.rand([phase_real_img.shape[0], 1, 1, 1], device=device) < 0.5
+                phase_real_img = torch.where(flip, phase_real_img.flip(-1), phase_real_img)
+            phase_real_img = (phase_real_img / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
@@ -1005,19 +1005,7 @@ def training_loop(
                 print()
                 print('Aborting...')
 
-        # Check for restart.
-        if (rank == 0) and (restart_every > 0) and (time.time() - start_time > restart_every):
-            print('Restart job...')
-            __RESTART__ = torch.tensor(1., device=device)
-        if num_gpus > 1:
-            torch.distributed.broadcast(__RESTART__, 0)
-        if __RESTART__:
-            done = True
-            print(f'Process {rank} leaving...')
-            if num_gpus > 1:
-                torch.distributed.barrier()
-
-        # Save image snapshot.
+        # Save image snapshot (fakes grid). The last tick always snapshots (§3).
         if (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             stage(f'Saving image snapshot (kimg={cur_nimg/1e3:.1f})')
             images = generate_snapshot_grid_images(G_ema=G_ema, grid_z=grid_z, grid_c=grid_c, batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
@@ -1025,130 +1013,64 @@ def training_loop(
                 save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
             stage(f'Image snapshot saved (kimg={cur_nimg/1e3:.1f})')
 
-        # Save network snapshot.
-        snapshot_pkl = None
-        snapshot_data = None
-        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
-            stage(f'Preparing network snapshot data (kimg={cur_nimg/1e3:.1f})')
-            snapshot_data = dict(G=G, D=D, G_ema=G_ema, augment_pipe=augment_pipe, training_set_kwargs=dict(training_set_kwargs))
-            for key, value in snapshot_data.items():
-                if isinstance(value, torch.nn.Module):
-                    # value = copy.deepcopy(value).eval().requires_grad_(False)
-                    # value = misc.spectral_to_cpu(value)
-                    # if num_gpus > 1:
-                    #     misc.check_ddp_consistency(value, ignore_regex=r'.*\.[^.]+_(avg|ema)')
-                    #     for param in misc.params_and_buffers(value):
-                    #         torch.distributed.broadcast(param, src=0)
-                    snapshot_data[key] = value #.cpu()
-                del value # conserve memory
-            stage(f'Network snapshot data prepared (kimg={cur_nimg/1e3:.1f})')
-
-            # Save a weights-only snapshot for the current step (no resume state).
-            # This is independent of the full resume checkpoint below.
-            if save_weights_only and (rank == 0):
-                weights_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
-                stage(f'Saving weights-only snapshot "{weights_pkl}"')
-                save_weights_snapshot(snapshot_data, weights_pkl)
-                stage(f'Weights-only snapshot saved (kimg={cur_nimg/1e3:.1f})')
-
-            # Save a small inference-only snapshot (G_ema only) for the current step.
-            if save_inference_only and (rank == 0):
-                inference_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}-inference.pkl')
-                stage(f'Saving inference-only snapshot "{inference_pkl}"')
-                save_inference_snapshot(snapshot_data, inference_pkl)
-                stage(f'Inference-only snapshot saved (kimg={cur_nimg/1e3:.1f})')
-
-        # Save Checkpoint if needed
-        if (rank == 0) and (restart_every > 0) and (network_snapshot_ticks is not None) and (
-                done or cur_tick % network_snapshot_ticks == 0):
-            snapshot_pkl = misc.get_ckpt_path(run_dir)
-            stage(f'Saving checkpoint "{snapshot_pkl}"')
-            # save as tensors to avoid error for multi GPU
-            # when saving checkpoint progress
-            snapshot_data['progress'] = {
-                'cur_nimg': torch.tensor(cur_nimg, dtype=torch.long),
-                'cur_tick': torch.tensor(cur_tick, dtype=torch.long),
-                'batch_idx': torch.tensor(batch_idx, dtype=torch.long),
-                'best_fid': best_fid,
-            }
-            if augment_pipe is not None:
-                snapshot_data['progress']['augment_p'] = augment_pipe.p.cpu()
-            if hasattr(loss, 'pl_mean'):
-                snapshot_data['progress']['pl_mean'] = loss.pl_mean.cpu()
-
-            with open(snapshot_pkl, 'wb') as f:
-                dill.dump(snapshot_data, f)
-
-            stage(f'Checkpoint saved (kimg={snapshot_pkl})')
-
-        # Evaluate metrics. Standard metrics (--metrics) and combra metrics
-        # (--combra-metrics) are independent: either one alone enables this block.
-        if cur_tick and (snapshot_data is not None) and (len(metrics) > 0 or combra_metrics):
-            if len(metrics) > 0:
-                stage('Evaluating metrics')
-                for metric in metrics:
-                    result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
-                                                          dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
-                    if rank == 0:
-                        metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
-                    stats_metrics.update(result_dict.results)
-
-            # combra in-memory generative-quality metrics (optional dependency),
-            # scored over the whole training set vs an equal number of fakes. Both the
-            # image-feature extraction (fid/cmmd/fd_dinov2) and the angle-density
-            # metrics are sharded across ranks (each rank handles its own fakes);
-            # only the final distances run on rank 0. A missing/uninstallable combra
-            # must never break training.
-            #
-            # combra_active must be rank-UNIFORM: it gates the collectives inside
-            # _combra_eval_distributed, so every rank must agree. combra_metrics comes
-            # from the broadcast config and find_spec is a rank-independent filesystem
-            # check -- do NOT gate on combra_ref (rank 0 only) or the gathers deadlock.
-            combra_active = combra_metrics and (importlib.util.find_spec('combra') is not None)
-            if combra_active:
-                stage('Evaluating combra metrics')
-                # image_metrics run via the sharded path; any backend that is
-                # unavailable (e.g. no network for DINOv2/CLIP weights) fails the same
-                # way on every rank, so the except is reached symmetrically and skips.
-                try:
-                    combra_results = _combra_eval_distributed(
-                        snapshot_data['G_ema'], combra_z, combra_c, batch_gpu,
-                        num_gpus, rank, device, combra_ref)
-                except Exception as e:
-                    combra_results = None
-                    if rank == 0:
-                        print(f'[combra] metric evaluation failed: {e}', flush=True)
-                if rank == 0 and combra_results is not None:
-                    # Cast to float so the TensorBoard scalar writer (Metrics/combra_*)
-                    # accepts every value, including numpy scalars and NaNs. The three
-                    # image-feature metrics carry their 10k sample size in the key.
-                    combra_image_rename = {
-                        'fid': 'fid10k', 'cmmd': 'cmmd10k', 'fd_dinov2': 'fd_dinov2_10k'}
-                    for name, value in combra_results.items():
-                        key = combra_image_rename.get(name, name)
-                        stats_metrics[f'combra_{key}'] = float(value)
-                    print('combra metrics: ' + ', '.join(
-                        f'{k}={v:.4f}' for k, v in combra_results.items()), flush=True)
-
-            # save best fid ckpt
-            snapshot_pkl = os.path.join(run_dir, f'best_model.pkl')
-            cur_nimg_txt = os.path.join(run_dir, f'best_nimg.txt')
+        # Save network snapshot (§3): EMA-only weights as a `.pt` state dict, written
+        # atomically every snapshot tick AND always at the last tick, so the newest
+        # snapshot IS the final model. No resume/best/full checkpoints exist. History
+        # is pruned to --snapshot-keep-last.
+        did_snapshot = (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0)
+        if did_snapshot:
+            stage(f'Saving inference snapshot (kimg={cur_nimg/1e3:.1f})')
+            # DDP weight-consistency check before saving so silently diverged ranks
+            # (which would otherwise persist rank 0's weights undetected) are caught.
+            # Must run on every rank.
+            if num_gpus > 1:
+                misc.check_ddp_consistency(G_ema, ignore_regex=r'.*\.[^.]+_(avg|ema)')
             if rank == 0:
-                # Prefer the standard fid50k_full; fall back to combra's InceptionV3
-                # FID when fid50k_full is disabled (combra metrics replace it).
-                fid_key = 'fid50k_full' if 'fid50k_full' in stats_metrics else (
-                    'combra_fid10k' if 'combra_fid10k' in stats_metrics else None)
-                if fid_key is not None and stats_metrics[fid_key] < best_fid:
-                    best_fid = stats_metrics[fid_key]
+                metadata = dict(
+                    n_classes=int(training_set.label_dim),
+                    resolution=int(training_set.resolution),
+                    class_names=training_set.class_names,
+                    cur_nimg=int(cur_nimg),
+                )
+                snap_path = os.path.join(run_dir, f'san-snapshot-{cur_nimg//1000:06d}-inference.pt')
+                checkpoint.save_inference_snapshot(snap_path, G_ema, metadata)
+                checkpoint.prune_snapshots(run_dir, snapshot_keep_last)
+            stage(f'Inference snapshot saved (kimg={cur_nimg/1e3:.1f})')
 
-                    with open(snapshot_pkl, 'wb') as f:
-                        dill.dump(snapshot_data, f)
-                    # save curr iteration number (directly saving it to pkl leads to problems with multi GPU)
-                    with open(cur_nimg_txt, 'w') as f:
-                        f.write(str(cur_nimg))
-            stage(f'Best FID saved')
-
-        del snapshot_data # conserve memory
+        # combra in-memory generative-quality metrics (optional dependency), scored
+        # over the reference vs combra_num_gen fakes. Both the image-feature extraction
+        # (fid/cmmd/fd_dinov2) and the angle-density metrics are sharded across ranks
+        # (each rank handles its own fakes); only the final distances run on rank 0.
+        # A missing/uninstallable combra must never break training. Values are mirrored
+        # into stats.jsonl (§6), not TensorBoard-only, so post-hoc snapshot selection
+        # survives loss of the tfevents file.
+        #
+        # combra_active must be rank-UNIFORM: it gates the collectives inside
+        # _combra_eval_distributed, so every rank must agree. It comes from the broadcast
+        # config + a rank-independent filesystem check -- do NOT gate on combra_ref
+        # (rank 0 only) or the gathers deadlock.
+        combra_active = combra_enabled and (importlib.util.find_spec('combra') is not None)
+        if cur_tick and did_snapshot and combra_active:
+            stage('Evaluating combra metrics')
+            try:
+                combra_results = _combra_eval_distributed(
+                    G_ema, combra_z, combra_c, batch_gpu, num_gpus, rank, device, combra_ref)
+            except Exception as e:
+                combra_results = None
+                if rank == 0:
+                    print(f'[combra] metric evaluation failed: {e}', flush=True)
+            if rank == 0 and combra_results is not None:
+                # Cast to float so the scalar writers (Metrics/combra_*) accept every
+                # value, including numpy scalars and NaNs. The three image-feature
+                # metrics carry their 10k sample size in the key (the `10k` suffix is
+                # literal and never changes with --num-fid-samples).
+                combra_image_rename = {
+                    'fid': 'fid10k', 'cmmd': 'cmmd10k', 'fd_dinov2': 'fd_dinov2_10k'}
+                for name, value in combra_results.items():
+                    key = combra_image_rename.get(name, name)
+                    stats_metrics[f'combra_{key}'] = float(value)
+                print('combra metrics: ' + ', '.join(
+                    f'{k}={v:.4f}' for k, v in combra_results.items()), flush=True)
 
         # Collect statistics.
         for phase in phases:
@@ -1161,10 +1083,18 @@ def training_loop(
         stats_collector.update()
         stats_dict = stats_collector.as_dict()
 
-        # Update logs.
+        # Update logs. combra metrics are mirrored into stats.jsonl under the same
+        # Metrics/combra_* keys as TensorBoard (§6) -- stats.jsonl is the machine-
+        # readable source of truth, so losing the tfevents file no longer loses the
+        # run's FID/CMMD/angle history (and it is what enables post-hoc snapshot
+        # selection). wall_time / datetime columns are added per §7.
         timestamp = time.time()
         if stats_jsonl is not None:
             fields = dict(stats_dict, timestamp=timestamp)
+            fields['wall_time'] = timestamp - start_time
+            fields['datetime'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            for name, value in stats_metrics.items():
+                fields[f'Metrics/{name}'] = value
             stats_jsonl.write(json.dumps(fields) + '\n')
             stats_jsonl.flush()
         if stats_tfevents is not None:

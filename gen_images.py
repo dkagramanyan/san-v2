@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import json
 import os
-import time
 from pathlib import Path
-from typing import List, Optional, Union, Dict, Any, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import click
+import h5py
 import numpy as np
+import PIL.Image
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tqdm import tqdm
-import h5py
-import PIL.Image
 
-import legacy
-import dnnlib
-from torch_utils import gen_utils
+from torch_utils import checkpoint, gen_utils
+
+# Unified h5 signature across all four v2 repos (§4): downstream code sniffs any
+# model's output identically.
+H5_FORMAT_SHARD = "generated_images_shard"
+H5_SCHEMA_VERSION = 1
 
 
 # ---------------------------
@@ -34,6 +37,38 @@ def parse_range(s: Union[str, List]) -> List[int]:
             out.extend(range(int(lo), int(hi) + 1))
         else:
             out.append(int(part))
+    return out
+
+
+def resolve_classes(spec: str, n_classes: int, class_names: Optional[List[str]]) -> List[int]:
+    """Resolve a --classes spec to validated integer indices.
+
+    Accepts indices, ranges (``0,1,4-6``) OR grain-class names
+    (``Ultra_Co11,Ultra_Co6_2``) -- see the label contract (§5). Every resolved
+    index is validated against the checkpoint's ``n_classes`` / ``class_names``
+    metadata, so an out-of-range or unknown class fails fast with a clear message
+    instead of an ``IndexError`` deep in ``w_avg`` indexing.
+    """
+    name_to_idx = {n: i for i, n in enumerate(class_names)} if class_names else {}
+    out: List[int] = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if part == "":
+            continue
+        lo_hi = part.split("-", 1)
+        if len(lo_hi) == 2 and lo_hi[0].isdigit() and lo_hi[1].isdigit():
+            out.extend(range(int(lo_hi[0]), int(lo_hi[1]) + 1))
+        elif part.isdigit():
+            out.append(int(part))
+        elif part in name_to_idx:
+            out.append(name_to_idx[part])
+        else:
+            raise click.ClickException(
+                f"--classes: unknown class {part!r}; known names: {class_names}")
+    for c in out:
+        if c < 0 or c >= n_classes:
+            raise click.ClickException(
+                f"--classes: index {c} out of range [0, {n_classes}) for this checkpoint")
     return out
 
 
@@ -81,12 +116,14 @@ class RankH5Writer:
         samples_per_class: int,
         compression: Optional[str],
         chunk_images: int,
+        class_names: Optional[List[str]] = None,
     ):
         self.shard_path = shard_path
         self.classes = [int(c) for c in classes]
         self.samples_per_class = int(samples_per_class)
         self.compression = compression
         self.chunk_images = int(chunk_images)
+        self.class_names = list(class_names) if class_names is not None else None
 
         self.f: Optional[h5py.File] = None
         self.initialized = False
@@ -105,10 +142,13 @@ class RankH5Writer:
         H, W, C = [int(x) for x in img_shape]
         self.img_shape = (H, W, C)
 
-        self.f.attrs["format"] = "stylegan_generated_images_shard"
+        self.f.attrs["format"] = H5_FORMAT_SHARD
+        self.f.attrs["schema_version"] = H5_SCHEMA_VERSION
         self.f.attrs["image_shape_hwc"] = self.img_shape
         self.f.attrs["samples_per_class"] = int(self.samples_per_class)
         self.f.attrs["classes"] = np.array(self.classes, dtype=np.int32)
+        if self.class_names is not None:
+            self.f.attrs["class_names"] = list(self.class_names)
 
         chunks0 = max(1, min(self.chunk_images, self.samples_per_class))
 
@@ -117,6 +157,8 @@ class RankH5Writer:
             g.attrs["class_idx"] = int(c)
             g.attrs["samples_per_class"] = int(self.samples_per_class)
             g.attrs["image_shape_hwc"] = self.img_shape
+            if self.class_names is not None:
+                g.attrs["class_name"] = self.class_names[c]
 
             dimg = g.create_dataset(
                 "images",
@@ -208,10 +250,13 @@ def _merge_shards_to_one_h5(
     compression: Optional[str],
     chunk_images: int,
     world_size: int,
+    class_names: Optional[List[str]] = None,
 ):
     """
     Merge per-rank shards into one big HDF5.
     Deterministic: for each class and index, take the first shard that has written=True.
+    The merge HARD-FAILS (§4) if any slot is missing across all shards: a crashed
+    generation run must never feed zero-filled black images downstream.
     """
     merged_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -229,13 +274,17 @@ def _merge_shards_to_one_h5(
 
         H, W, C = [int(x) for x in img_shape]
 
+        total_missing = 0
         with h5py.File(str(merged_path), "w") as out:
-            out.attrs["format"] = "stylegan_generated_images"
+            out.attrs["format"] = H5_FORMAT_SHARD
+            out.attrs["schema_version"] = H5_SCHEMA_VERSION
             out.attrs["image_shape_hwc"] = (H, W, C)
             out.attrs["samples_per_class"] = int(samples_per_class)
             out.attrs["classes"] = np.array([int(c) for c in classes], dtype=np.int32)
             out.attrs["world_size"] = int(world_size)
             out.attrs["merged_from"] = str(shards_dir)
+            if class_names is not None:
+                out.attrs["class_names"] = list(class_names)
 
             chunks0 = max(1, min(int(chunk_images), int(samples_per_class)))
 
@@ -245,6 +294,8 @@ def _merge_shards_to_one_h5(
                 g.attrs["class_idx"] = c
                 g.attrs["samples_per_class"] = int(samples_per_class)
                 g.attrs["image_shape_hwc"] = (H, W, C)
+                if class_names is not None:
+                    g.attrs["class_name"] = class_names[c]
 
                 dimg = g.create_dataset(
                     "images",
@@ -288,12 +339,27 @@ def _merge_shards_to_one_h5(
                     dw[idxs] = True
                     out.flush()
 
-                g.attrs["written_count"] = int(np.count_nonzero(dw[:]))
-                g.attrs["missing_count"] = int(samples_per_class - g.attrs["written_count"])
+                written_count = int(np.count_nonzero(dw[:]))
+                g.attrs["written_count"] = written_count
+                missing = int(samples_per_class - written_count)
+                g.attrs["missing_count"] = missing
+                total_missing += missing
                 out.flush()
+            out.attrs["missing_count"] = int(total_missing)
     finally:
         for sf in shard_files:
             sf.close()
+
+    # Hard-fail on any incomplete slot (§4): remove the partial merged file so it
+    # cannot be mistaken for a complete artifact.
+    if total_missing > 0:
+        try:
+            merged_path.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Refusing to emit {merged_path}: {total_missing} sample slot(s) missing across "
+            "shards (a generation worker did not finish). Re-run generation.")
 
 
 # ---------------------------
@@ -356,6 +422,7 @@ def _generate_worker(
     device = torch.device("cuda", device_id)
 
     classes: List[int] = list(cfg["classes"])
+    class_names: Optional[List[str]] = cfg.get("class_names")
     samples_per_class: int = int(cfg["samples_per_class"])
     batch_gpu: int = int(cfg["batch_gpu"])
     truncation_psi: float = float(cfg["truncation_psi"])
@@ -384,15 +451,23 @@ def _generate_worker(
             samples_per_class=samples_per_class,
             compression=hdf5_compression,
             chunk_images=hdf5_chunk_images,
+            class_names=class_names,
         )
         shard_writer.open()
+
+    # dir mode: rank 0 drops a classes.json manifest next to the class_<c>/ folders (§5).
+    if save_mode == "dir" and rank == 0 and class_names is not None:
+        outdir = Path(cfg["outdir"])
+        outdir.mkdir(parents=True, exist_ok=True)
+        with open(outdir / "classes.json", "w") as jf:
+            json.dump({"class_names": class_names,
+                       "classes": [int(c) for c in classes]}, jf, indent=2)
 
     if rank == 0:
         print(f'Loading network from "{cfg["network_pkl"]}"...')
 
     with torch.inference_mode():
-        with dnnlib.util.open_url(cfg["network_pkl"]) as f:
-            G = legacy.load_network_pkl(f)["G_ema"].eval().requires_grad_(False).to(device)
+        G = checkpoint.load_generator(cfg["network_pkl"], device)
 
         local_done_since_sync = 0
         sync_every = max(256, batch_gpu * 4)
@@ -476,29 +551,24 @@ def _generate_worker(
 # ---------------------------
 
 @click.command()
-@click.option("--network", "network_pkl", required=True, help="Network pickle filename")
+@click.option("--network", "network_pkl", required=True, help="Inference snapshot (.pt) filename or URL")
 @click.option("--trunc", "truncation_psi", type=float, default=1.0, show_default=True, help="Truncation psi")
 @click.option("--seed", type=int, default=42, show_default=True, help="Random seed base")
 @click.option("--centroids-path", type=str, default=None, help="Path to precomputed centroids for multimodal truncation")
-@click.option("--classes", type=parse_range, required=True, help="List of classes, e.g. '0,1,4-6'")
+@click.option("--classes", type=str, required=True, help="Classes by index/range/name, e.g. '0,1,4-6' or 'Ultra_Co11,Ultra_Co6_2'")
 @click.option("--samples-per-class", type=int, default=4, show_default=True, help="Samples per class")
 @click.option("--batch-gpu", type=int, default=32, show_default=True, help="Samples per GPU pass")
-@click.option("--gpus", type=click.IntRange(min=1), help="GPUs to use (defaults to all)")
-@click.option("--outdir", type=str, required=True, metavar="DIR", help="Where to save outputs (dir or HDF5)")
-@click.option("--desc", type=str, metavar="STR", help="String to include in result filename")
+@click.option("--gpus", type=click.IntRange(min=1), help="GPUs to use (self-spawns one worker per GPU; defaults to all)")
+@click.option("--outdir", type=str, required=True, metavar="DIR", help="Where to save outputs")
+@click.option("--desc", type=str, metavar="STR", help="Merged filename stem (default: network stem)")
 @click.option(
     "--save-mode",
     type=click.Choice(["hdf5", "dir"], case_sensitive=False),
     default="hdf5",
     show_default=True,
 )
-@click.option(
-    "--merge/--no-merge",
-    default=True,
-    show_default=True,
-    help="If save-mode=hdf5: merge per-rank shards into one big HDF5 after generation.",
-)
-@click.option("--output-hdf5", type=str, metavar="FILE", help="Final merged HDF5 filename (only if --merge)")
+@click.option("--merge", type=bool, default=True, show_default=True,
+              help="If save-mode=hdf5: merge per-rank shards into one <desc>.h5 after generation.")
 @click.option(
     "--image-format",
     type=click.Choice(["png", "jpg", "jpeg"], case_sensitive=False),
@@ -522,7 +592,7 @@ def generate_images(
     truncation_psi: float,
     seed: int,
     centroids_path: Optional[str],
-    classes: List[int],
+    classes: str,
     samples_per_class: int,
     batch_gpu: int,
     gpus: Optional[int],
@@ -530,7 +600,6 @@ def generate_images(
     desc: Optional[str],
     save_mode: str,
     merge: bool,
-    output_hdf5: Optional[str],
     image_format: str,
     hdf5_compression: str,
     hdf5_chunk_images: int,
@@ -538,10 +607,13 @@ def generate_images(
     outdir_p = Path(outdir)
     outdir_p.mkdir(parents=True, exist_ok=True)
 
-    desc_full = f"{Path(network_pkl).stem}_trunc_{truncation_psi}" + (f"-{desc}" if desc else "")
-    run_dir = Path(gen_utils.make_run_dir(str(outdir_p), desc_full))
+    # Resolve + validate --classes against the checkpoint metadata (§4/§5).
+    meta = checkpoint.read_metadata(network_pkl)
+    n_classes = int(meta.get("n_classes", 0))
+    class_names = meta.get("class_names")
+    class_list = resolve_classes(classes, n_classes, class_names)
 
-    # Normalize compression
+    desc_full = desc or Path(network_pkl).stem
     compression_norm = None if hdf5_compression.lower() == "none" else hdf5_compression.lower()
 
     cfg = dict(
@@ -549,10 +621,11 @@ def generate_images(
         truncation_psi=truncation_psi,
         seed=seed,
         centroids_path=centroids_path,
-        classes=classes,
+        classes=class_list,
+        class_names=class_names,
         samples_per_class=samples_per_class,
         batch_gpu=batch_gpu,
-        outdir=str(run_dir if save_mode.lower() == "hdf5" else outdir_p),
+        outdir=str(outdir_p),
         desc_full=desc_full,
         save_mode=save_mode.lower(),
         image_format=image_format.lower(),
@@ -560,76 +633,37 @@ def generate_images(
         hdf5_chunk_images=hdf5_chunk_images,
     )
 
-    # If launched with torchrun/srun, respect that world
-    env_world = int(os.environ.get("WORLD_SIZE", "1"))
-    if env_world > 1:
-        rank = int(os.environ.get("RANK", "0"))
-        _generate_worker(rank, env_world, cfg, "env://", run_dir)
-        # Merge only on rank0
-        if save_mode.lower() == "hdf5" and merge and rank == 0:
-            shards_dir = run_dir / "shards"
-            final_path = (run_dir / (output_hdf5 or f"{desc_full}.h5"))
-            _merge_shards_to_one_h5(
-                merged_path=final_path,
-                shards_dir=shards_dir,
-                classes=classes,
-                samples_per_class=samples_per_class,
-                compression=compression_norm,
-                chunk_images=hdf5_chunk_images,
-                world_size=env_world,
-            )
-            size_mb = final_path.stat().st_size / (1024 * 1024)
-            print(f'✓ Merged HDF5: "{final_path}" ({size_mb:.1f} MB)')
-        return
-
-    # Otherwise local spawn
+    # Self-spawn one worker per GPU (the same launch model as training; no torchrun).
     num_gpus = gpus or (torch.cuda.device_count() or 1)
     if num_gpus == 1:
-        _generate_worker(0, 1, cfg, None, run_dir)
-        if save_mode.lower() == "hdf5" and merge:
-            shards_dir = run_dir / "shards"
-            final_path = (run_dir / (output_hdf5 or f"{desc_full}.h5"))
-            _merge_shards_to_one_h5(
-                merged_path=final_path,
-                shards_dir=shards_dir,
-                classes=classes,
-                samples_per_class=samples_per_class,
-                compression=compression_norm,
-                chunk_images=hdf5_chunk_images,
-                world_size=1,
+        _generate_worker(0, 1, cfg, None, outdir_p)
+    else:
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_method = f"file://{os.path.join(temp_dir, '.torch_distributed_init')}"
+            mp.set_start_method("spawn", force=True)
+            mp.spawn(
+                _generate_worker,
+                args=(num_gpus, cfg, init_method, outdir_p),
+                nprocs=num_gpus,
+                join=True,
             )
-            size_mb = final_path.stat().st_size / (1024 * 1024)
-            print(f'✓ Merged HDF5: "{final_path}" ({size_mb:.1f} MB)')
-        return
 
-    import tempfile
-    with tempfile.TemporaryDirectory() as temp_dir:
-        init_file = os.path.join(temp_dir, ".torch_distributed_init")
-        init_method = f"file://{init_file}"
-
-        mp.set_start_method("spawn", force=True)
-        mp.spawn(
-            _generate_worker,
-            args=(num_gpus, cfg, init_method, run_dir),
-            nprocs=num_gpus,
-            join=True,
-        )
-
-    # Merge after spawn (single-process here)
+    # Merge per-rank shards into <outdir>/<desc>.h5 (§12).
     if save_mode.lower() == "hdf5" and merge:
-        shards_dir = run_dir / "shards"
-        final_path = (run_dir / (output_hdf5 or f"{desc_full}.h5"))
+        final_path = outdir_p / f"{desc_full}.h5"
         _merge_shards_to_one_h5(
             merged_path=final_path,
-            shards_dir=shards_dir,
-            classes=classes,
+            shards_dir=outdir_p / "shards",
+            classes=class_list,
             samples_per_class=samples_per_class,
             compression=compression_norm,
             chunk_images=hdf5_chunk_images,
             world_size=num_gpus,
+            class_names=class_names,
         )
         size_mb = final_path.stat().st_size / (1024 * 1024)
-        print(f'✓ Merged HDF5: "{final_path}" ({size_mb:.1f} MB)')
+        print(f'Merged HDF5: "{final_path}" ({size_mb:.1f} MB)')
 
 
 if __name__ == "__main__":
