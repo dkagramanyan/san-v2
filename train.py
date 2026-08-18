@@ -128,7 +128,8 @@ def init_dataset_kwargs(data):
 @click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'fastgan']), required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
-@click.option('--batch-gpu',    help='Batch size per GPU (total batch = batch-gpu * gpus)', metavar='INT', type=click.IntRange(min=1), required=True)
+@click.option('--batch-gpu',    help='Batch size per GPU (total batch = batch-gpu * gpus * grad-accum)', metavar='INT', type=click.IntRange(min=1), required=True)
+@click.option('--grad-accum',    help='Gradient-accumulation micro-steps per optimizer step', metavar='INT', type=click.IntRange(min=1), default=1, show_default=True)
 
 # Optional features.
 @click.option('--cond',         help='Train conditional model', metavar='BOOL',                 type=bool, default=False, show_default=True)
@@ -150,7 +151,7 @@ def init_dataset_kwargs(data):
 @click.option('--snapshot-keep-last', help='How many inference snapshots to keep (0 = keep all)', metavar='INT', type=click.IntRange(min=0), default=3, show_default=True)
 @click.option('--combra-metrics', help='Compute combra generative-quality metrics each snapshot tick', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--num-fid-samples', help='Number of fakes for the combra metrics (0 disables eval)', metavar='INT', type=click.IntRange(min=0), default=10000, show_default=True)
-@click.option('--combra-ref-count', help='Cap the combra reference to a seeded random subset', metavar='INT', type=click.IntRange(min=1), default=None)
+@click.option('--combra-ref-count', help='Cap the combra reference to a seeded random subset (0 = whole set)', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--precision',    help='Training precision', metavar='STR',                       type=click.Choice(['fp32', 'fp16', 'bf16']), default='fp16', show_default=True)
 @click.option('--tf32',         help='Enable TF32 matmul/cuDNN', metavar='BOOL',                type=bool, default=True, show_default=True)
@@ -194,7 +195,11 @@ def build_config(opts):
     # Hyperparameters & settings.
     c.num_gpus = opts.gpus
     c.batch_gpu = opts.batch_gpu
-    c.batch_size = c.batch_gpu * c.num_gpus  # Total batch = batch_gpu * num_gpus
+    # Total batch = batch_gpu * num_gpus * grad_accum. The loop already splits each
+    # batch_size-sized round into batch_gpu chunks, so a larger batch_size *is* the
+    # accumulation -- no separate loop argument (and none may be added to `c`, which
+    # is splatted straight into training_loop()).
+    c.batch_size = c.batch_gpu * c.num_gpus * opts.grad_accum
     c.G_kwargs.channel_base = opts.cbase
     c.G_kwargs.channel_max = opts.cmax
     c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
@@ -206,7 +211,7 @@ def build_config(opts):
     c.mirror = opts.mirror
     c.combra_metrics = opts.combra_metrics
     c.combra_num_gen = opts.num_fid_samples
-    c.combra_ref_count = opts.combra_ref_count
+    c.combra_ref_count = opts.combra_ref_count or None  # 0 = whole reference set
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
 

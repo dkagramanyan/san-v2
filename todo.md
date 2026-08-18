@@ -9,11 +9,17 @@ actionable; none block the driver, which works around them.
   `FileNotFoundError`. Ship the vocab file (it's the standard CLIP BPE table) or
   make the load lazy so `--help` works.
 
-- [ ] **README references a non-existent `requirements.txt`.** README §1 says
+- [x] **README references a non-existent `requirements.txt`.** Resolved 2026-08-18:
+  README now says `pip install -e .` / `.[combra]`.
+
+  Original report: README §1 says
   `pip install -r requirements.txt`, but there is no such file — deps live in
   `pyproject.toml`. Fix to `pip install -e .` (or `.[dev]` / `.[combra]`).
 
-- [ ] **README `dataset_tool.py` command is stale.** README §3 shows
+- [x] **README `dataset_tool.py` command is stale.** Resolved 2026-08-18: the
+  README shows `dataset_tool.py convert`.
+
+  Original report: README §3 shows
   `python dataset_tool.py --source=… --dest=… --resolution=…`, but the CLI is now
   a click group: the flags live under the `convert` subcommand
   (`python dataset_tool.py convert --source=… --dest=… --resolution=…`).

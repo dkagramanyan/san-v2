@@ -43,13 +43,19 @@ conda install -c nvidia cuda-nvcc -y      # match torch's CUDA major (13.x)
 The training/inference scripts use this conda toolkit directly — they set
 `CUDA_HOME=$CONDA_PREFIX` and load **no** system CUDA module.
 
-Install the remaining dependencies (torch and ninja are intentionally not in
-`requirements.txt`, so this won't disturb the versions above):
+Install the package (torch and ninja are intentionally *not* declared as
+dependencies, so this won't disturb the versions above). Add the `combra` extra to
+enable the in-training generative-quality metrics:
 
 ```bash
 cd san-v2
-pip install -r requirements.txt
+pip install -e .                 # or: pip install -e '.[combra]'
 ```
+
+The `combra` extra pulls `combra[metrics]`, not bare `combra` — since combra 0.5.0
+the torch / `pytorch-fid` / `open-clip-torch` stack lives behind that extra, and
+without it `combra_fid`, `combra_cmmd` and `combra_fd_dinov2` come back `nan`.
+combra also floors Python at **3.12**, which is why this package does too.
 
 Re-pin `timm` last. combra's CMMD metric pulls `open-clip-torch`, which drags in a
 newer `timm` that **can't unpickle the trained `best_model.pkl` stems** (they were saved
@@ -108,11 +114,12 @@ for when you have a working interpreter.)
 ## 3. Data preparation
 
 `dataset_tool.py` packs a preprocessed image folder into a resolution-specific `.zip`.
+The flags live under the `convert` subcommand (the CLI is a click group).
 Build one zip per stage of the progressive recipe (16² → 1024²):
 
 ```bash
 for res in 16x16 32x32 64x64 128x128 256x256 512x512 1024x1024; do
-  python dataset_tool.py \
+  python dataset_tool.py convert \
     --source=/home/david/mnt/ssd_2_sata/python/phd/datasets/preprocessed/imagenet_9to4_1024x1024 \
     --dest=./datasets/imagenet_9to4_1024x1024_${res}.zip \
     --resolution=${res}

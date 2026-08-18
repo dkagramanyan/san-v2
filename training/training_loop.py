@@ -412,6 +412,13 @@ def _combra_gather_to_rank0(local, device, rank, num_gpus):
     return np.concatenate(rows, axis=0)
 
 
+def _combra_angle_workers(num_gpus):
+    # Per-rank CPU processes for the angle extraction. Divided by the rank count:
+    # every rank on an 8-GPU node asking for min(32, cpu_count) oversubscribes the
+    # box eightfold and each pool then runs slower than a single shared one.
+    return max(1, min(32, (os.cpu_count() or 1) // max(1, num_gpus)))
+
+
 def _combra_gather_pooled_angles(images_u8, device, rank, num_gpus):
     # Extract this rank's pooled vertex angles and gather the 1-D arrays to rank 0
     # (concatenated, None on other ranks). The angle counterpart of the sharded
@@ -420,7 +427,7 @@ def _combra_gather_pooled_angles(images_u8, device, rank, num_gpus):
     # Reuses _combra_gather_to_rank0 by treating the angles as [k, 1] rows.
     from combra.metrics import images_to_pooled_angles
     pooled = np.asarray(
-        images_to_pooled_angles(images_u8, workers=min(32, os.cpu_count() or 1)),
+        images_to_pooled_angles(images_u8, workers=_combra_angle_workers(num_gpus)),
         np.float32).reshape(-1, 1)
     gathered = _combra_gather_to_rank0(pooled, device, rank, num_gpus)
     return gathered.reshape(-1) if gathered is not None else None
@@ -438,23 +445,49 @@ def _combra_precompute_reference(training_set, device, rank, num_gpus, ref_count
     # ref_count caps the reference to a SEEDED RANDOM subset (§6) -- never the first N:
     # dataset zips are class-sorted, so a first-N slice is class-biased. The same seed on
     # every rank selects the same subset, then it is sharded by rank stride.
-    from combra.metrics import cmmd_features, fd_dinov2_features, fid_features
+    from combra.metrics import (
+        cmmd_features,
+        fd_dinov2_features,
+        fid_features,
+        images_to_pooled_angles,
+    )
     n = len(training_set)
     if ref_count is not None and ref_count < n:
         sel = np.sort(np.random.RandomState(seed).choice(n, size=ref_count, replace=False))
     else:
         sel = np.arange(n)
     idx = sel[rank::num_gpus]
-    local_u8 = np.stack([training_set[i][0] for i in idx])  # NCHW uint8
-    angles = _combra_gather_pooled_angles(local_u8, device, rank, num_gpus)
-    extractors = (('fid', fid_features), ('cmmd', cmmd_features), ('fd_dinov2', fd_dinov2_features))
-    feat = {}
-    for name, fn in extractors:
-        feats = fn(local_u8, device=device).astype(np.float32)
-        feat[name] = _combra_gather_to_rank0(feats, device, rank, num_gpus)
+
+    # Purely local extraction first, then ONE rank-uniform handshake, then the
+    # gathers. Doing the handshake in between is what stops a single-rank failure
+    # (an absent CLIP download, an OOM) from stranding the survivors in all_gather.
+    ok = True
+    local = None
+    try:
+        local_u8 = np.stack([training_set[i][0] for i in idx])  # NCHW uint8
+        pooled = np.asarray(
+            images_to_pooled_angles(local_u8, workers=_combra_angle_workers(num_gpus)),
+            np.float32).reshape(-1, 1)
+        feats = {name: fn(local_u8, device=device).astype(np.float32)
+                 for name, fn in (('fid', fid_features), ('cmmd', cmmd_features),
+                                  ('fd_dinov2', fd_dinov2_features))}
+        local = {'angles': pooled, 'feat': feats}
+    except Exception as e:
+        ok = False
+        print(f'[combra][rank {rank}] reference precompute failed: {e}', flush=True)
+    if num_gpus > 1:
+        flag = torch.tensor([1.0 if ok else 0.0], device=device)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+        ok = bool(flag.item() > 0.5)
+    if not ok:
+        return None
+
+    angles = _combra_gather_to_rank0(local['angles'], device, rank, num_gpus)
+    feat = {name: _combra_gather_to_rank0(local['feat'][name], device, rank, num_gpus)
+            for name in local['feat']}
     if rank != 0:
         return None
-    return {'angles': angles, 'feat': feat}
+    return {'angles': angles.reshape(-1), 'feat': feat}
 
 
 def _combra_eval_distributed(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, device,
@@ -469,9 +502,8 @@ def _combra_eval_distributed(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, d
         cmmd_features,
         cmmd_from_features,
         fd_dinov2_features,
-        fd_dinov2_from_features,
         fid_features,
-        fid_from_features,
+        frechet_from_features,
     )
 
     # 1. Generate this rank's shard and denormalize float [-1, 1] -> uint8 [0, 255]
@@ -496,7 +528,8 @@ def _combra_eval_distributed(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, d
     #    angles, then the image-feature distances from the gathered generated features
     #    vs the precomputed (cached) reference features.
     metrics = dict(angle_density_metrics_from_pooled(combra_ref['angles'], gen_angles))
-    combiners = {'fid': fid_from_features, 'cmmd': cmmd_from_features, 'fd_dinov2': fd_dinov2_from_features}
+    combiners = {'fid': frechet_from_features, 'cmmd': cmmd_from_features,
+                 'fd_dinov2': frechet_from_features}
     for name in ('fid', 'cmmd', 'fd_dinov2'):
         metrics[name] = combiners[name](combra_ref['feat'][name], gen_feats[name])
     return metrics
@@ -712,8 +745,8 @@ def training_loop(
         # Startup smoke test (§6): fail fast / warn early if the combra backends are
         # unusable, using combra's own shared implementation when present.
         try:
-            from combra.metrics import combra_smoke_test
-            combra_smoke_test()
+            from combra.metrics import self_test
+            self_test()
         except ImportError:
             pass
         except Exception as e:
@@ -753,6 +786,7 @@ def training_loop(
     stage('Initializing logs (stats.jsonl, tensorboard)')
     stats_collector = training_stats.Collector(regex='.*')
     stats_metrics = dict()
+    best_fid = float('inf')   # running best combra FID -> Metrics/combra_fid_best
     stats_jsonl = None
     stats_tfevents = None
     if rank == 0:
@@ -1049,6 +1083,11 @@ def training_loop(
         # _combra_eval_distributed, so every rank must agree. It comes from the broadcast
         # config + a rank-independent filesystem check -- do NOT gate on combra_ref
         # (rank 0 only) or the gathers deadlock.
+        # Clear the combra row first: the metrics are only recomputed at snapshot
+        # ticks, so a dict that persists across ticks re-emits the previous tick's
+        # values at a new step -- turning the metric curves into step functions and
+        # letting post-hoc snapshot selection resolve to a kimg never evaluated.
+        stats_metrics = {}
         combra_active = combra_enabled and (importlib.util.find_spec('combra') is not None)
         if cur_tick and did_snapshot and combra_active:
             stage('Evaluating combra metrics')
@@ -1061,14 +1100,16 @@ def training_loop(
                     print(f'[combra] metric evaluation failed: {e}', flush=True)
             if rank == 0 and combra_results is not None:
                 # Cast to float so the scalar writers (Metrics/combra_*) accept every
-                # value, including numpy scalars and NaNs. The three image-feature
-                # metrics carry their 10k sample size in the key (the `10k` suffix is
-                # literal and never changes with --num-fid-samples).
-                combra_image_rename = {
-                    'fid': 'fid10k', 'cmmd': 'cmmd10k', 'fd_dinov2': 'fd_dinov2_10k'}
+                # value, including numpy scalars and NaNs. Keys are bare (combra_fid,
+                # not combra_fid10k): the old `10k` suffix was a literal that stayed
+                # 10k whatever --num-fid-samples said, so every chart built from it was
+                # mislabelled. The count is logged once, as its own scalar.
                 for name, value in combra_results.items():
-                    key = combra_image_rename.get(name, name)
-                    stats_metrics[f'combra_{key}'] = float(value)
+                    stats_metrics[f'combra_{name}'] = float(value)
+                stats_metrics['combra_num_fid_samples'] = float(combra_num)
+                if 'combra_fid' in stats_metrics:
+                    best_fid = min(best_fid, stats_metrics['combra_fid'])
+                    stats_metrics['combra_fid_best'] = best_fid
                 print('combra metrics: ' + ', '.join(
                     f'{k}={v:.4f}' for k, v in combra_results.items()), flush=True)
 
