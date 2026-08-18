@@ -31,6 +31,10 @@ Repairs the combra integration and closes the remaining v2-convention gaps.
   each tick.
 - README pointed at a `requirements.txt` that does not exist, and showed
   `dataset_tool.py --source=…` without the `convert` subcommand the click group needs.
+- **`distutils` import broke `dnnlib` on Python 3.12+.** `dnnlib/util.py` imported
+  `strtobool` from `distutils`, removed from the standard library in 3.12 — the floor
+  this release moves to — and available only through setuptools' own deprecated shim.
+  Replaced with a local `_strtobool`.
 - **`pkg_resources` import broke the custom ops on Python 3.12+.**
   `torch_utils/ops/conv2d_gradfix.py` and `grid_sample_gradfix.py` imported
   `parse_version` from `pkg_resources`, which setuptools no longer ships, so
