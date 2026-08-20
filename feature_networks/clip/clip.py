@@ -2,6 +2,7 @@ import hashlib
 import os
 import urllib
 import warnings
+from functools import lru_cache
 from typing import Union, List
 
 import torch
@@ -14,7 +15,20 @@ from .model import build_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 __all__ = ["available_models", "load", "tokenize"]
-_tokenizer = _Tokenizer()
+
+
+@lru_cache(maxsize=1)
+def _get_tokenizer():
+    """Build the BPE tokenizer on first use.
+
+    Deferred rather than built at import time. This fork is unconditional -- nothing
+    calls `tokenize()`, only the image tower via `load(...)[0].visual` -- and the
+    vendored `bpe_simple_vocab_16e6.txt.gz` is not in the repo. Building it eagerly
+    made every importer of `feature_networks` die at import with FileNotFoundError,
+    including `calc_metrics.py` and the `san-eval` console script, so even `--help`
+    was unreachable.
+    """
+    return _Tokenizer()
 
 _MODELS = {
     "RN50": "https://openaipublic.azureedge.net/clip/models/afeb0e10f9e5a86da6080e35cf09123aca3b358a0c3e3b6c78a7b63bc04b6762/RN50.pt",
@@ -181,9 +195,10 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77) -> torch.Lo
     if isinstance(texts, str):
         texts = [texts]
 
-    sot_token = _tokenizer.encoder["<|startoftext|>"]
-    eot_token = _tokenizer.encoder["<|endoftext|>"]
-    all_tokens = [[sot_token] + _tokenizer.encode(text) + [eot_token] for text in texts]
+    tokenizer = _get_tokenizer()
+    sot_token = tokenizer.encoder["<|startoftext|>"]
+    eot_token = tokenizer.encoder["<|endoftext|>"]
+    all_tokens = [[sot_token] + tokenizer.encode(text) + [eot_token] for text in texts]
     result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
 
     for i, tokens in enumerate(all_tokens):

@@ -3,7 +3,12 @@
 Real problems surfaced while driving the app in a clean container. All are
 actionable; none block the driver, which works around them.
 
-- [ ] **`calc_metrics.py` fails at import.** It opens
+- [x] **`calc_metrics.py` fails at import.** Resolved 2026-08-20: the vendored CLIP
+  tokenizer is now built lazily (nothing in this fork calls `tokenize()`), and the
+  undeclared `dill` dependency behind it was added. `tests/test_entry_points.py`
+  pins both.
+
+  Original report: It opens
   `feature_networks/clip/bpe_simple_vocab_16e6.txt.gz` at module load, but that
   file isn't in the repo, so even `python calc_metrics.py --help` crashes with
   `FileNotFoundError`. Ship the vocab file (it's the standard CLIP BPE table) or
