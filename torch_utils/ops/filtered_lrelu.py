@@ -276,6 +276,8 @@ def _filtered_lrelu_cuda(up=1, down=1, padding=0, gain=np.sqrt(2), slope=0.2, cl
 
             # Call C++/Cuda plugin if datatype is supported.
             if x.dtype in [torch.float16, torch.float32, torch.bfloat16]:
+                if torch.cuda.current_stream(x.device) != torch.cuda.default_stream(x.device):
+                    warnings.warn("filtered_lrelu called with non-default cuda stream but concurrent execution is not supported", RuntimeWarning)
                 y, so, return_code = _plugin.filtered_lrelu(x, fu, fd, b, si, up, down, px0, px1, py0, py1, sx, sy, gain, slope, clamp, flip_filter, write_signs)
                 # #region agent log
                 torch.cuda.synchronize()

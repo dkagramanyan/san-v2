@@ -48,60 +48,73 @@ def _debug_log(location, message, data=None, hypothesis_id=None):
 # #endregion
 
 #----------------------------------------------------------------------------
-# Get CUDA architecture flags for H200/Hopper (sm_90) and A100 (sm_80)
+# CUDA architecture detection and flags for Hopper (sm_90) and newer.
 
 def _get_cuda_arch_flags():
-    """Return CUDA architecture flags targeting Hopper (sm_90) and Ampere (sm_80)."""
-    try:
-        major, minor = torch.cuda.get_device_capability()
-        device_name = torch.cuda.get_device_name()
-
-        # Get additional Hopper-specific info (fixed property name for PyTorch 2.9+)
-        props = torch.cuda.get_device_properties(0)
-        shared_mem = props.shared_memory_per_block
-        multiprocessor_count = props.multi_processor_count
-        total_memory = props.total_memory
-    except Exception:
-        major, minor = 9, 0  # Default to Hopper
-        device_name = "unknown"
-        shared_mem = 0
-        multiprocessor_count = 0
-        total_memory = 0
+    """Get CUDA architecture flags for compilation, supporting H200/Hopper (sm_90)."""
+    arch_flags = []
     
-    # #region agent log
-    _debug_log("custom_ops.py:_get_cuda_arch_flags", "Detected GPU capability", {
-        "major": major,
-        "minor": minor,
-        "device_name": device_name,
-        "compute_capability": f"sm_{major}{minor}",
-        "shared_mem_per_block_bytes": shared_mem,
-        "shared_mem_per_block_kb": shared_mem / 1024,
-        "multiprocessor_count": multiprocessor_count,
-        "total_memory_gb": total_memory / (1024**3),
-        "cuda_version": torch.version.cuda,
-        "pytorch_version": torch.__version__
-    }, "A")
-    # #endregion
-    
-    # Always include Hopper (sm_90) for H200 and Ampere (sm_80) for A100
-    arch_flags = [
-        '-gencode=arch=compute_80,code=sm_80',   # A100 (Ampere)
-        '-gencode=arch=compute_90,code=sm_90',   # H100/H200 (Hopper)
-        '-gencode=arch=compute_90,code=compute_90'  # PTX for forward compatibility
-    ]
-    
-    # Add current device's arch explicitly if different
-    current_arch = f'-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}'
-    if current_arch not in arch_flags:
-        arch_flags.insert(0, current_arch)
-    
-    # #region agent log
-    _debug_log("custom_ops.py:_get_cuda_arch_flags", "Architecture flags selected", {
-        "arch_flags": arch_flags
-    }, "A")
-    # #endregion
+    # Detect current GPU compute capability
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device)
+        cc = major * 10 + minor
+        
+        # Build gencode flags for detected architecture
+        # Support architectures from Ampere (80) to Hopper (90) and beyond
+        supported_archs = []
+        
+        # Add current GPU architecture
+        if cc >= 70:  # Volta and newer
+            supported_archs.append(cc)
+        
+        # Ensure we have at least Ampere support
+        if 80 not in supported_archs and cc >= 80:
+            supported_archs.append(80)
+            
+        # Add Hopper support for H200
+        if 90 not in supported_archs and cc >= 90:
+            supported_archs.append(90)
+        
+        # Generate flags
+        for arch in sorted(set(supported_archs)):
+            arch_flags.append(f'-gencode=arch=compute_{arch},code=sm_{arch}')
+        
+        # Add PTX for forward compatibility with the highest supported arch
+        if supported_archs:
+            max_arch = max(supported_archs)
+            arch_flags.append(f'-gencode=arch=compute_{max_arch},code=compute_{max_arch}')
     
     return arch_flags
+
+def _get_cuda_extra_cflags():
+    """Get extra CUDA compilation flags optimized for modern architectures."""
+    cflags = [
+        '--use_fast_math',
+        '-O3',
+        '--expt-relaxed-constexpr',
+        # Note: -fPIC is already added by PyTorch's cpp_extension loader
+    ]
+    
+    # Add architecture-specific optimizations
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device)
+        
+        # Hopper (sm_90) specific optimizations
+        if major >= 9:
+            cflags.extend([
+                '-DHOPPER_ARCH',
+                '--threads', '4',  # Parallel compilation
+            ])
+        # Ampere (sm_80) optimizations
+        elif major >= 8:
+            cflags.extend([
+                '-DAMPERE_ARCH',
+                '--threads', '4',
+            ])
+    
+    return cflags
 
 #----------------------------------------------------------------------------
 # Internal helper funcs.
@@ -206,6 +219,24 @@ def get_plugin(module_name, sources, headers=None, source_dir=None, **build_kwar
     }, "A")
     # #endregion
 
+    # Merge user-provided CUDA flags with architecture-specific flags
+    extra_cuda_cflags = build_kwargs.pop('extra_cuda_cflags', [])
+    if isinstance(extra_cuda_cflags, str):
+        extra_cuda_cflags = [extra_cuda_cflags]
+    else:
+        extra_cuda_cflags = list(extra_cuda_cflags)
+    
+    # Add optimized flags for modern CUDA/architectures
+    extra_cuda_cflags.extend(_get_cuda_extra_cflags())
+    
+    # Get architecture flags (gencode for Hopper/H200 support)
+    arch_flags = _get_cuda_arch_flags()
+    if arch_flags:
+        extra_cuda_cflags.extend(arch_flags)
+    
+    # Restore extra_cuda_cflags to build_kwargs
+    build_kwargs['extra_cuda_cflags'] = extra_cuda_cflags
+
     try:
         if os.name == 'nt' and os.system("where cl.exe >nul 2>nul") != 0:
             compiler_bindir = _find_compiler_bindir()
@@ -222,9 +253,8 @@ def get_plugin(module_name, sources, headers=None, source_dir=None, **build_kwar
                 with open(src, 'rb') as f:
                     hash_md5.update(f.read())
             
-            # Include architecture flags in hash to invalidate cache when flags change
-            arch_flag_str = '|'.join(cuda_arch_flags)
-            hash_md5.update(arch_flag_str.encode('utf-8'))
+            # Include CUDA flags in hash to rebuild when flags change
+            hash_md5.update(str(extra_cuda_cflags).encode())
 
             source_digest = hash_md5.hexdigest()
             build_top_dir = torch.utils.cpp_extension._get_build_directory(module_name, verbose=verbose_build)  # pylint: disable=protected-access
