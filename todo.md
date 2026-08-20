@@ -29,7 +29,14 @@ actionable; none block the driver, which works around them.
   a click group: the flags live under the `convert` subcommand
   (`python dataset_tool.py convert --source=… --dest=… --resolution=…`).
 
-- [ ] **`ninja` must be on `PATH` for the custom CUDA ops** (`bias_act`,
+- [x] **`ninja` must be on `PATH` for the custom CUDA ops.** Resolved 2026-08-20:
+  `custom_ops.get_plugin` now prepends `os.path.dirname(sys.executable)` to `PATH`
+  before building — the same trick the run skill's driver used, moved into the one
+  place all three ops funnel through. `tests/test_custom_ops_path.py` pins it,
+  including a subprocess check that ninja is unresolvable from a stripped `PATH`
+  until the repair runs (no GPU or compiler needed).
+
+  Original report: (`bias_act`,
   `filtered_lrelu`, …). Calling the env's python by absolute path (not
   `conda activate`) leaves the env `bin/` off `PATH`, so the ops fail with
   "Ninja is required to load C++ extensions." Consider documenting this, or

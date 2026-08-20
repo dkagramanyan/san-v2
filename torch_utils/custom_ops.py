@@ -132,6 +132,25 @@ def _get_mangled_gpu_name():
     return ''.join(out)
 
 #----------------------------------------------------------------------------
+
+def _ensure_interpreter_bin_on_path():
+    """Put the running interpreter's own ``bin/`` on ``PATH``.
+
+    torch's C++ extension builder shells out to ``ninja`` found on ``PATH``.
+    Calling this env's python by absolute path -- which every launcher that does
+    not ``conda activate`` does, including the run-skill driver and the sh/
+    scripts -- leaves the env's ``bin/`` off ``PATH``, so the build fails with
+    "Ninja is required to load C++ extensions" even though ninja is installed
+    right next to the interpreter.
+    """
+    import sys
+    bindir = os.path.dirname(sys.executable)
+    path = os.environ.get('PATH', '')
+    if bindir and bindir not in path.split(os.pathsep):
+        os.environ['PATH'] = bindir + os.pathsep + path if path else bindir
+    return bindir
+
+#----------------------------------------------------------------------------
 # Main entry point for compiling and loading C++/CUDA plugins.
 
 _cached_plugins = dict()
@@ -154,6 +173,7 @@ def get_plugin(module_name, sources, headers=None, source_dir=None, **build_kwar
         # #endregion
         return _cached_plugins[module_name]
 
+    _ensure_interpreter_bin_on_path()
     start_time = time.time()
     
     # #region agent log
