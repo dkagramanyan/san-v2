@@ -31,6 +31,10 @@ def subprocess_fn(rank, c, temp_dir):
 
     # Init torch.distributed.
     if c.num_gpus > 1:
+        # Potential fix for H200 distributed training slowdown
+        os.environ["NCCL_P2P_DISABLE"] = "1" 
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
+
         init_file = os.path.abspath(os.path.join(temp_dir, '.torch_distributed_init'))
         if os.name == 'nt':
             init_method = 'file:///' + init_file.replace('\\', '/')

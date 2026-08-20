@@ -570,6 +570,9 @@ def training_loop(
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
     training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
     if rank == 0:
+        print(f"conv2d_gradfix.enabled: {conv2d_gradfix.enabled}")
+        print(f"torch.backends.cudnn.benchmark: {torch.backends.cudnn.benchmark}")
+        
         print()
         print('Num images: ', len(training_set))
         print('Image shape:', training_set.image_shape)
@@ -890,9 +893,12 @@ def training_loop(
             if phase.name in ['Dmain', 'Dboth', 'Dreg'] and hasattr(phase.module, 'feature_networks'):
                 phase.module.feature_networks.requires_grad_(False)
 
+            t_start_accum = time.time()
             for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
                 loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
             phase.module.requires_grad_(False)
+            if rank == 0 and batch_idx % 20 == 0:
+                 print(f'Phase {phase.name} accumulate_gradients: {time.time() - t_start_accum:.4f}s', flush=True)
 
             # Update weights.
             with torch.autograd.profiler.record_function(phase.name + '_opt'):
@@ -900,7 +906,10 @@ def training_loop(
                 if len(params) > 0:
                     flat = torch.cat([param.grad.flatten() for param in params])
                     if num_gpus > 1:
+                        t_start_reduce = time.time()
                         torch.distributed.all_reduce(flat)
+                        if rank == 0 and batch_idx % 20 == 0:
+                            print(f'Phase {phase.name} all_reduce: {time.time() - t_start_reduce:.4f}s', flush=True)
                         flat /= num_gpus
                     misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
                     grads = flat.split([param.numel() for param in params])
