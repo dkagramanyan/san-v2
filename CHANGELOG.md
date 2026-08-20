@@ -168,7 +168,14 @@ Adoption of the v2 model API convention (wc_cv `models_api_proposal`, §12). **B
 - Old `.pkl` artifacts are not readable (check out a pre-0.2.0 commit for those); combra
   metric values shift (denorm fix); commands using removed/renamed flags fail.
 
-## [Unreleased] — 2026-07-16
+## Pre-release development — 2026-07-16
+
+> Kept for history. This predates the 0.2.0 release below and was previously
+> mislabelled `[Unreleased]`, which put shipped work under a heading implying it
+> was pending. Much of it — `--resume`, `best_model.pkl`,
+> `--save-inference-only`, `network-snapshot-latest.pt` — was **removed** by the
+> v2 convention, so read it as a record of what changed then, not as current
+> behaviour.
 
 ### Changed
 - **Production `sbatch/train_*.sbatch` now pass `--save-inference-only 0`** (was `True`).
@@ -198,7 +205,14 @@ Adoption of the v2 model API convention (wc_cv `models_api_proposal`, §12). **B
   are unaffected. This migration was **not** runtime-tested (timm 1.x unavailable in the
   authoring env); verify with `tests/test_san_modules.py` on the cluster before a long run.
 
-## [Unreleased] — 2026-06-25
+## Pre-release development — 2026-06-25
+
+> Kept for history. This predates the 0.2.0 release below and was previously
+> mislabelled `[Unreleased]`, which put shipped work under a heading implying it
+> was pending. Much of it — `--resume`, `best_model.pkl`,
+> `--save-inference-only`, `network-snapshot-latest.pt` — was **removed** by the
+> v2 convention, so read it as a record of what changed then, not as current
+> behaviour.
 
 ### Added
 - **`--save-inference-only` training flag** — writes a tiny `network-snapshot-<kimg>-inference.pkl`
