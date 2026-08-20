@@ -5,9 +5,10 @@ Run this to identify potential bottlenecks and compatibility issues.
 """
 
 import os
-import sys
 import subprocess
+
 import torch
+
 
 def print_section(title):
     print("\n" + "="*60)
@@ -75,7 +76,7 @@ def check_custom_ops():
     print_section("Custom CUDA Operations Test")
     
     try:
-        from torch_utils.ops import bias_act, filtered_lrelu, upfirdn2d
+        from torch_utils.ops import bias_act, upfirdn2d
         
         device = torch.device('cuda:0')
         
@@ -88,13 +89,13 @@ def check_custom_ops():
         
         # Warmup
         for _ in range(10):
-            y = bias_act.bias_act(x, b, act='lrelu')
+            bias_act.bias_act(x, b, act='lrelu')
         torch.cuda.synchronize()
         
         # Benchmark
         start = time.time()
         for _ in range(100):
-            y = bias_act.bias_act(x, b, act='lrelu')
+            bias_act.bias_act(x, b, act='lrelu')
         torch.cuda.synchronize()
         elapsed = time.time() - start
         print(f"  bias_act CUDA: {elapsed*10:.2f} ms per call")
@@ -102,7 +103,7 @@ def check_custom_ops():
         # Test with ref implementation
         start = time.time()
         for _ in range(100):
-            y = bias_act.bias_act(x, b, act='lrelu', impl='ref')
+            bias_act.bias_act(x, b, act='lrelu', impl='ref')
         torch.cuda.synchronize()
         elapsed_ref = time.time() - start
         print(f"  bias_act ref:  {elapsed_ref*10:.2f} ms per call")
@@ -118,19 +119,19 @@ def check_custom_ops():
         
         # Warmup
         for _ in range(10):
-            y = upfirdn2d.upfirdn2d(x, f, up=2)
+            upfirdn2d.upfirdn2d(x, f, up=2)
         torch.cuda.synchronize()
         
         start = time.time()
         for _ in range(100):
-            y = upfirdn2d.upfirdn2d(x, f, up=2)
+            upfirdn2d.upfirdn2d(x, f, up=2)
         torch.cuda.synchronize()
         elapsed = time.time() - start
         print(f"  upfirdn2d CUDA: {elapsed*10:.2f} ms per call")
         
         start = time.time()
         for _ in range(100):
-            y = upfirdn2d.upfirdn2d(x, f, up=2, impl='ref')
+            upfirdn2d.upfirdn2d(x, f, up=2, impl='ref')
         torch.cuda.synchronize()
         elapsed_ref = time.time() - start
         print(f"  upfirdn2d ref:  {elapsed_ref*10:.2f} ms per call")

@@ -8,8 +8,8 @@ Usage:
     python disable_custom_ops.py disable  # Re-enable custom CUDA ops
 """
 
-import sys
 import os
+import sys
 
 # Files to patch
 FILES_TO_PATCH = [
@@ -35,11 +35,11 @@ def patch_files(use_ref=True):
         if use_ref:
             # Replace cuda with ref
             new_content = content.replace(cuda_str, ref_str)
-            change_desc = f"CUDA -> ref"
+            change_desc = "CUDA -> ref"
         else:
             # Replace ref with cuda
             new_content = content.replace(ref_str, cuda_str)
-            change_desc = f"ref -> CUDA"
+            change_desc = "ref -> CUDA"
         
         if content != new_content:
             with open(full_path, 'w') as f:
