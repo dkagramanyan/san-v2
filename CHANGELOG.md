@@ -3,6 +3,35 @@
 All notable changes to this fork (`san-v2`) are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+- **The combra contract test fed a unimodal sample to a bimodal-fit metric.**
+  `test_angle_metrics_run_on_pooled_angles` drew two near-identical normals
+  (mu 120 and 126), so the second Gaussian had no mode to sit on. combra now
+  reports that as `nan` rather than dividing by the phantom, which turned the
+  assertion red. The fixture is now genuinely bimodal (a 70/30 mixture at
+  100 deg and 240 deg), which is what a WC-Co vertex-angle distribution
+  actually looks like.
+- **`scipy.linalg.sqrtm(..., disp=False)` raises under SciPy >= 1.18**, which
+  removed the `disp` parameter. Fixed in `metrics/frechet_inception_distance.py`. Calling `sqrtm(X)` without `disp` returns
+  the matrix alone on every SciPy version, so the fix is version-agnostic. This
+  surfaced when the environment moved to SciPy 1.18 (see below); before that the
+  call would have failed at runtime the moment anyone upgraded.
+
+### Changed
+- **The conda environment is now `san-v2`** (Python 3.12, torch 2.13+cu130,
+  numpy 2.5, SciPy 1.18), rebuilt alongside the previous `san` env rather
+  than replacing it. `requires-python` has said `>=3.12` since the v2 convention
+  landed, but the working env was still 3.11 — so `pip install -e .` could not
+  succeed, which is why the console scripts were missing and combra was absent.
+  README and `sh/` launch scripts point at the new name.
+- **CI installs combra and arms the contract test.** `tests/test_combra_contract.py`
+  is entirely `skipif(not combra_installed)`, and no CI job installed combra, so the
+  file could go green by doing nothing. CI now installs combra when a `COMBRA_TOKEN`
+  secret is present and sets `COMBRA_REQUIRED=1`; a new always-on test fails if
+  combra is missing under that flag.
+
 ## [0.3.0] — 2026-08-18
 
 Repairs the combra integration and closes the remaining v2-convention gaps.

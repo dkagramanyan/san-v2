@@ -22,8 +22,8 @@ all four steps run on **H200 GPUs** via the ready-made Slurm scripts in
 Create and activate a Python 3.12 conda env:
 
 ```bash
-conda create -n san python=3.12 -y
-conda activate san
+conda create -n san-v2 python=3.12 -y
+conda activate san-v2
 ```
 
 Install, all into the conda env:

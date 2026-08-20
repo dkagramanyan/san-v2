@@ -38,7 +38,9 @@ def compute_fid(opts, max_real, num_gen, sfid=False, rfid=False):
         return float('nan')
 
     m = np.square(mu_gen - mu_real).sum()
-    s, _ = scipy.linalg.sqrtm(np.dot(sigma_gen, sigma_real), disp=False) # pylint: disable=no-member
+    # scipy >= 1.18 removed sqrtm's `disp`; without it sqrtm returns the matrix
+    # alone on every version.
+    s = scipy.linalg.sqrtm(np.dot(sigma_gen, sigma_real)) # pylint: disable=no-member
     fid = np.real(m + np.trace(sigma_gen + sigma_real - s * 2))
     return float(fid)
 
