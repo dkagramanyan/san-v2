@@ -286,3 +286,16 @@ def print_module_summary(module, inputs, max_nesting=3, skip_redundant=True):
     return outputs
 
 #----------------------------------------------------------------------------
+
+
+def parse_version(version_string):
+    """Comparable version tuple from a torch version string.
+
+    Replaces ``pkg_resources.parse_version``, which setuptools removed and which is
+    unimportable on Python 3.12+ — the floor this package now requires. Only the
+    numeric release segment is compared, which is all the two gradfix modules need
+    (``torch.__version__ >= '1.11.0a'``); any local/dev suffix is ignored, so a
+    prerelease still compares equal to its release.
+    """
+    numeric = re.match(r'\d+(\.\d+)*', str(version_string))
+    return tuple(int(part) for part in numeric.group(0).split('.')) if numeric else ()

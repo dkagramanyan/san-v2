@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "san-v2"
-version = "0.2.0"
+version = "0.3.0"
 description = "StyleSAN-XL fork: Slicing Adversarial Network (SAN) training framework (StyleGAN3 + Projected Discriminator)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 
 # NOTE: PyTorch / torchvision are intentionally NOT listed here. They must be
 # installed separately against the correct CUDA build (see README), e.g.:
@@ -39,7 +39,13 @@ dev = ["pytest>=7.0", "ruff>=0.4"]
 # Optional: enables combra angle-Wasserstein + CMMD/FD-DINOv2/FID metrics during
 # training evaluation. Training works without it (the import is guarded). Pulled
 # from the private repo over git+https -- one source everywhere (§1).
-combra = ["combra @ git+https://github.com/dkagramanyan/combra.git"]
+#
+# The [metrics] extra is REQUIRED, not optional: combra 0.5.0 moved torch,
+# torchvision, pytorch-fid and open-clip-torch out of its base dependencies, so a
+# bare `combra` install has no FID / CMMD / FD-DINOv2 backend and those three
+# metrics come back nan. combra also floors Python at 3.12, which is why this
+# package does too.
+combra = ["combra[metrics] @ git+https://github.com/dkagramanyan/combra.git"]
 
 [project.scripts]
 san-train = "train:main"

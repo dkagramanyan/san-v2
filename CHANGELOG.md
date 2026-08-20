@@ -3,6 +3,66 @@
 All notable changes to this fork (`san-v2`) are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.0] — 2026-08-18
+
+Repairs the combra integration and closes the remaining v2-convention gaps.
+
+### Fixed
+- **combra metrics were silently disabled.** The eval path imported
+  `angle_density_metrics_from_pooled`, `fid_from_features` and
+  `fd_dinov2_from_features`, which combra removed in 0.5.0, plus `combra_smoke_test`,
+  which it renamed to `self_test`. The `except` around the per-tick eval swallowed the
+  resulting `ImportError` and printed "metric evaluation failed", so
+  `--combra-metrics true` produced no metrics at all. Now imports
+  `frechet_from_features` (one helper for both Fréchet metrics) and `self_test`;
+  combra ≥ 0.7.0 restores `angle_density_metrics_from_pooled`.
+- **`[combra]` installed a combra with no metric backends.** The extra pulled bare
+  `combra`; since combra 0.5.0 the torch / `pytorch-fid` / `open-clip-torch` stack is
+  behind `combra[metrics]`, so FID / CMMD / FD-DINOv2 would have returned `nan` even
+  after the import fix. Now `combra[metrics] @ git+…`.
+- **A one-rank failure could deadlock the run.** The reference precompute went
+  straight into `all_gather`, so a rank that failed to extract (absent CLIP weights,
+  OOM) left the survivors blocked in a collective that never completed. A rank-uniform
+  success handshake now runs between the local extraction and the first gather.
+- **Stale metric rows.** `stats_metrics` persisted across ticks while combra only ran
+  at snapshot ticks, so every intermediate row re-emitted the previous evaluation's
+  values at a new step — turning the curves into step functions and letting post-hoc
+  snapshot selection resolve to a kimg that was never evaluated. The row is cleared
+  each tick.
+- README pointed at a `requirements.txt` that does not exist, and showed
+  `dataset_tool.py --source=…` without the `convert` subcommand the click group needs.
+- **`distutils` import broke `dnnlib` on Python 3.12+.** `dnnlib/util.py` imported
+  `strtobool` from `distutils`, removed from the standard library in 3.12 — the floor
+  this release moves to — and available only through setuptools' own deprecated shim.
+  Replaced with a local `_strtobool`.
+- **`pkg_resources` import broke the custom ops on Python 3.12+.**
+  `torch_utils/ops/conv2d_gradfix.py` and `grid_sample_gradfix.py` imported
+  `parse_version` from `pkg_resources`, which setuptools no longer ships, so
+  `import training.training_loop` failed outright on the Python floor this release
+  moves to. Replaced with a small `torch_utils.misc.parse_version`.
+
+### Changed
+- **Metric keys lost the literal `10k`.** `Metrics/combra_fid10k` was emitted whatever
+  `--num-fid-samples` said, so any chart built from it was mislabelled. Keys are now
+  bare — `Metrics/combra_fid`, `combra_cmmd`, `combra_fd_dinov2` — and the count is
+  logged once as `Metrics/combra_num_fid_samples`. combra's `load_fid_by_kimg` reads
+  the bare key and still falls back to the old one for archived runs.
+- **`--combra-ref-count 0` now means "the whole reference set"**, matching the other
+  three repos. It was `IntRange(min=1)` with default `None` here, so the same launch
+  script failed on this repo alone.
+- **Angle-extraction workers scale with the rank count** (`cpu_count // gpus`, capped
+  at 32). Every rank asking for `min(32, cpu_count)` oversubscribed an 8-GPU node
+  eightfold.
+- `requires-python` raised to **3.12** to match combra.
+
+### Added
+- `--grad-accum` (default 1), completing the shared training CLI — the other three
+  repos already had it. Total batch = `batch-gpu × gpus × grad-accum`.
+- `Metrics/combra_fid_best`, the running best FID, in `stats.jsonl` and TensorBoard.
+- `tests/test_combra_contract.py` — asserts every combra symbol this repo imports
+  actually exists. CPU-only, no GPU/dataset/network, so it runs in every CI job. This
+  is the check whose absence let the breakage above survive a whole release.
+
 ## [0.2.0] — 2026-07-17
 
 Adoption of the v2 model API convention (wc_cv `models_api_proposal`, §12). **Breaking.**
@@ -22,7 +82,7 @@ Adoption of the v2 model API convention (wc_cv `models_api_proposal`, §12). **B
 - **Dataset**: `dataset_tool` derives labels alphabetically, writes `class_names`, errors on
   missing labels, converts grayscale→RGB at build time; `san-prepare-data convert` click group
   with the shared transform set (incl. `center-crop-dhariwal`).
-- combra metrics mirrored into `stats.jsonl`; startup `combra_smoke_test`; normalize/denormalize
+- combra metrics mirrored into `stats.jsonl`; startup combra self-test; normalize/denormalize
   round-trip assert; DDP weight-consistency check before saving; `tests/test_smoke.py`; ruff CI.
 
 ### Changed
