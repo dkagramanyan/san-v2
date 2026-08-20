@@ -5,7 +5,41 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **`bfloat16` support in the three custom CUDA ops.** `bias_act`, `upfirdn2d` and
+  `filtered_lrelu` accepted only `float16`/`float32`; `bfloat16` either tripped the
+  `TORCH_CHECK` in the C++ layer or fell through to the slow reference path with no
+  warning. Adds the `c10::BFloat16` template instantiations across `bias_act.cu`,
+  `upfirdn2d.cu` and all three `filtered_lrelu` sign-mode variants, the matching
+  dispatch branches, and the dtype guard in `filtered_lrelu.py`. Verified against the
+  reference implementations on sm_86: max abs error 1.6e-2 in bf16, consistent with
+  its 8-bit mantissa.
+- **Per-phase timing in the distributed path.** `training_loop` reports
+  `accumulate_gradients` and `all_reduce` wall time every 20 batches on rank 0, which
+  is what separates a slow optimiser step from a slow collective.
+- **H200 diagnostic scripts** — `diagnose_performance.py`, `disable_custom_ops.py`
+  and `setup_h200_env.sh`.
+
 ### Removed
+- **The agent debug logger in the custom CUDA ops.** Four files carried an NDJSON
+  logger hardcoded to `/home/dgkagramanyan/.cursor/debug.log`, a path that does not
+  exist here; every call opened it, raised, and was swallowed by a bare
+  `except Exception: pass`. The expensive part was not the logging:
+  `FilteredLReluCuda.forward` held seven **unguarded** `torch.cuda.synchronize()`
+  calls used only to timestamp the debug records, so every `filtered_lrelu` call
+  stalled the entire GPU pipeline. 30 `#region agent log` blocks removed, with the
+  imports, globals and dead timers they fed. The opt-in timing under `training/` is
+  guarded by `_DEBUG_ENABLED` / call-count and is left in place.
+- **Two hardcoded environment variables in `train.py`.** A merged branch set
+  `NCCL_P2P_DISABLE=1` and `TORCH_CUDA_ARCH_LIST="9.0"` for every `num_gpus > 1` run,
+  under a comment reading "Potential fix". The arch pin forces the JIT to build for
+  Hopper regardless of the actual device — wrong on any non-Hopper card, and
+  `custom_ops._get_cuda_arch_flags()` already detects the real compute capability.
+  `NCCL_P2P_DISABLE=1` disables peer-to-peer transfer, which slows multi-GPU training
+  on NVLink rather than speeding it up. Both are still settable from the environment.
+- **`test.py`.** A 483-line standalone CUDA check at the repo root, resurrected by a
+  merge after `c56e5e9` had deleted it. `tests/test_cuda_ops.py` covers the same
+  ground and pytest actually collects it.
 - **`todo.md`.** Every item in it was closed, so the file said nothing a reader
   needed; the fixes are described in this changelog instead.
 
@@ -44,6 +78,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   nothing checked. See below for this repo's share.
 
 ### Changed
+- **One `_get_cuda_arch_flags()` instead of two.** Merging the CUDA branch left two
+  definitions of it and injected `-gencode` flags into the same compile twice. The
+  surviving version detects the device's real compute capability; the discarded one
+  hardcoded `sm_80 + sm_90` and fell back to `major, minor = 9, 0  # Default to Hopper`
+  when detection threw.
+- **Four branches deleted upstream in January were merged back into `main`**, which
+  is now the only branch on the remote: `10-very-long-loading-and-training`,
+  `cursor/background-process-setup-ea47`, `cursor/missing-task-description-25a5` and
+  `cursor/missing-task-description-4760`.
 - **The sharded eval harness moved into combra** (`combra.metrics.distributed`). This
   repo kept only what is model-specific: producing a shard of generated images and the
   float->uint8 denormalisation. The four private copies had drifted three ways --
