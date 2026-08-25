@@ -404,7 +404,7 @@ def _combra_precompute_reference(training_set, device, rank, num_gpus, ref_count
     Returns ``(reference, ok)``; ``ok`` is rank-uniform, so the caller can gate the
     per-tick eval on it (``reference`` is None on every non-zero rank regardless).
     """
-    from combra.metrics.distributed import precompute_reference
+    from combra.metrics.distributed import all_ranks_ok, precompute_reference
 
     n = len(training_set)
     if ref_count is not None and ref_count < n:
@@ -412,7 +412,18 @@ def _combra_precompute_reference(training_set, device, rank, num_gpus, ref_count
     else:
         sel = np.arange(n)
     idx = sel[rank::num_gpus]
-    local_u8 = np.stack([training_set[i][0] for i in idx])  # NCHW uint8
+    # Loading this rank's slice happens BEFORE combra's own handshake, so it needs its
+    # own: a decode error or MemoryError on one rank used to return ok=False there while
+    # every other rank was already blocked in the precompute's all_reduce. Ranks then
+    # also disagreed on combra_ref_ok, desyncing every later tick.
+    local_u8, ok = None, True
+    try:
+        local_u8 = np.stack([training_set[i][0] for i in idx])  # NCHW uint8
+    except Exception as e:  # noqa: BLE001 -- agreed across ranks below
+        ok = False
+        print(f'[combra][rank {rank}] reference load failed: {e}', flush=True)
+    if not all_ranks_ok(ok, device, num_gpus):
+        return None, False
     return precompute_reference(local_u8, device, rank, num_gpus)
 
 
@@ -725,8 +736,8 @@ def training_loop(
                 training_set, device, rank, num_gpus, ref_count=combra_ref_count, seed=random_seed)
         except Exception as e:
             combra_ref_ok = False
-            if rank == 0:
-                print(f'[combra] reference precompute failed, disabling combra metrics: {e}', flush=True)
+            print(f'[combra][rank {rank}] reference precompute failed, disabling combra '
+                  f'metrics: {e}', flush=True)
 
     # Warn early (once, on rank 0) if combra metrics are requested but the package is
     # missing, so the user is not left wondering why no combra_* values ever appear.
@@ -1077,8 +1088,15 @@ def training_loop(
                     G_ema, combra_z, combra_c, batch_gpu, num_gpus, rank, device, combra_ref)
             except Exception as e:
                 combra_results = None
-                if rank == 0:
-                    print(f'[combra] metric evaluation failed: {e}', flush=True)
+                # Every rank prints: the rank that fails is rarely rank 0, and a
+                # rank-0-only print left the actual error invisible while the run
+                # reported only that "combra metrics failed" somewhere.
+                print(f'[combra][rank {rank}] metric evaluation failed: {e}', flush=True)
+            # Outside the rank guard on purpose. report0 registers the counter NAME on
+            # whichever rank calls it (before it discards non-zero ranks' values), and
+            # Collector.update() all_reduces over the registered set -- so a name only
+            # rank 0 ever reported makes that reduction disagree on shape.
+            training_stats.report0('Timing/eval_sec', time.time() - eval_start)
             if rank == 0 and combra_results is not None:
                 # Cast to float so the scalar writers (Metrics/combra_*) accept every
                 # value, including numpy scalars and NaNs. Keys are bare (combra_fid,
@@ -1088,7 +1106,6 @@ def training_loop(
                 for name, value in combra_results.items():
                     stats_metrics[f'combra_{name}'] = float(value)
                 stats_metrics['combra_num_fid_samples'] = float(combra_num)
-                training_stats.report0('Timing/eval_sec', time.time() - eval_start)
                 if 'combra_fid' in stats_metrics:
                     best_fid = min(best_fid, stats_metrics['combra_fid'])
                     stats_metrics['combra_fid_best'] = best_fid

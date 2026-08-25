@@ -52,6 +52,27 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   needed; the fixes are described in this changelog instead.
 
 ### Fixed
+- **`Timing/eval_sec` was reported on rank 0 only, desyncing the stats reduction.**
+  `training_stats.report0` registers the counter *name* on whichever rank calls it —
+  it discards non-zero ranks' values, not the registration — and `Collector.update()`
+  all-reduces over the registered set, which the module's own docstring says must
+  match across processes. The call sat inside `if rank == 0 and combra_results is not
+  None`, so rank 0 carried a name no other rank had and the reduction disagreed on
+  shape from the first snapshot tick of any multi-GPU run. It is now called by every
+  rank, outside the guard.
+
+- **Loading the reference slice happened before combra's rank handshake.** A decode
+  error or `MemoryError` while stacking this rank's images raised outside
+  `precompute_reference`, so that rank set `combra_ref_ok = False` and walked on while
+  the others were already blocked in the precompute's `all_reduce`. Ranks then also
+  disagreed on `combra_ref_ok`, desyncing every later tick. The stack is now guarded
+  and agreed through `all_ranks_ok` before any collective.
+
+- **Eval failures printed on rank 0 only, hiding the rank that actually failed.**
+  Both the per-tick eval and the reference precompute logged under `if rank == 0`,
+  so the common case — a non-zero rank OOMing — produced a run that reported a
+  failure with no error attached. Every rank now prints, tagged with its rank.
+
 - **A rank with no work crashed `gen_images` teardown and left a broken shard.**
   With `samples_per_class < world_size` the contiguous block split assigns tail
   ranks zero samples, so `RankH5Writer._init` never runs: `close()` raised
