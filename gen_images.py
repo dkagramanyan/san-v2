@@ -123,7 +123,9 @@ class RankH5Writer:
         self.samples_per_class = int(samples_per_class)
         self.compression = compression
         self.chunk_images = int(chunk_images)
-        self.class_names = list(class_names) if class_names is not None else None
+        if class_names is None:
+            raise ValueError("class_names is required: h5 shards must carry the label contract (§5)")
+        self.class_names = list(class_names)
 
         self.f: Optional[h5py.File] = None
         self.initialized = False
@@ -147,8 +149,7 @@ class RankH5Writer:
         self.f.attrs["image_shape_hwc"] = self.img_shape
         self.f.attrs["samples_per_class"] = int(self.samples_per_class)
         self.f.attrs["classes"] = np.array(self.classes, dtype=np.int32)
-        if self.class_names is not None:
-            self.f.attrs["class_names"] = list(self.class_names)
+        self.f.attrs["class_names"] = list(self.class_names)
 
         chunks0 = max(1, min(self.chunk_images, self.samples_per_class))
 
@@ -157,8 +158,7 @@ class RankH5Writer:
             g.attrs["class_idx"] = int(c)
             g.attrs["samples_per_class"] = int(self.samples_per_class)
             g.attrs["image_shape_hwc"] = self.img_shape
-            if self.class_names is not None:
-                g.attrs["class_name"] = self.class_names[c]
+            g.attrs["class_name"] = self.class_names[c]
 
             dimg = g.create_dataset(
                 "images",
@@ -224,18 +224,30 @@ class RankH5Writer:
         # Flush during generation (you requested “during script working”)
         self.f.flush()
 
-    def close(self):
+    def close(self) -> int:
+        """Close the shard; returns the number of missing sample slots."""
         if self.f is None:
-            return
+            return 0
+        if not self.initialized:
+            # This rank never received a batch (samples_per_class < world_size):
+            # the file has no schema attrs. Delete it so the merge never sees an
+            # attribute-less shard; nothing was assigned, so nothing is missing.
+            self.f.close()
+            self.f = None
+            self.shard_path.unlink()
+            return 0
         # Store counts
+        total_missing = 0
         for c in self.classes:
             written = int(np.count_nonzero(self.d_written[c][:]))
             grp = self.f[f"class_{c}"]
             grp.attrs["written_count"] = written
             grp.attrs["missing_count"] = int(self.samples_per_class - written)
+            total_missing += self.samples_per_class - written
         self.f.flush()
         self.f.close()
         self.f = None
+        return int(total_missing)
 
 
 # ---------------------------
@@ -258,10 +270,18 @@ def _merge_shards_to_one_h5(
     The merge HARD-FAILS (§4) if any slot is missing across all shards: a crashed
     generation run must never feed zero-filled black images downstream.
     """
+    if class_names is None:
+        raise ValueError("class_names is required: h5 output must carry the label contract (§5)")
     merged_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Open all shards read-only
-    shard_files = [h5py.File(str(shards_dir / f"rank_{r:03d}.h5"), "r") for r in range(world_size)]
+    # Open all shards read-only. A rank that received no samples deletes its
+    # empty shard on close(), so an absent file is legitimate; the total_missing
+    # hard-fail below is what guarantees full coverage of every slot.
+    shard_files = []
+    for r in range(world_size):
+        shard_path = shards_dir / f"rank_{r:03d}.h5"
+        if shard_path.exists():
+            shard_files.append(h5py.File(str(shard_path), "r"))
     try:
         # Determine image shape from first shard that has it
         img_shape = None
@@ -283,8 +303,7 @@ def _merge_shards_to_one_h5(
             out.attrs["classes"] = np.array([int(c) for c in classes], dtype=np.int32)
             out.attrs["world_size"] = int(world_size)
             out.attrs["merged_from"] = str(shards_dir)
-            if class_names is not None:
-                out.attrs["class_names"] = list(class_names)
+            out.attrs["class_names"] = list(class_names)
 
             chunks0 = max(1, min(int(chunk_images), int(samples_per_class)))
 
@@ -294,8 +313,7 @@ def _merge_shards_to_one_h5(
                 g.attrs["class_idx"] = c
                 g.attrs["samples_per_class"] = int(samples_per_class)
                 g.attrs["image_shape_hwc"] = (H, W, C)
-                if class_names is not None:
-                    g.attrs["class_name"] = class_names[c]
+                g.attrs["class_name"] = class_names[c]
 
                 dimg = g.create_dataset(
                     "images",
@@ -322,7 +340,7 @@ def _merge_shards_to_one_h5(
                 dw[:] = False
 
                 # Merge by scanning shards
-                for r, sf in enumerate(shard_files):
+                for sf in shard_files:
                     grp = sf.get(f"class_{c}", None)
                     if grp is None:
                         continue
@@ -611,6 +629,10 @@ def generate_images(
     meta = checkpoint.read_metadata(network_pkl)
     n_classes = int(meta.get("n_classes", 0))
     class_names = meta.get("class_names")
+    if save_mode.lower() == "hdf5" and class_names is None:
+        raise ValueError(
+            f"Checkpoint {network_pkl!r} carries no class_names metadata; h5 output "
+            "must stamp them (§5). Re-export the snapshot, or use --save-mode dir.")
     class_list = resolve_classes(classes, n_classes, class_names)
 
     desc_full = desc or Path(network_pkl).stem

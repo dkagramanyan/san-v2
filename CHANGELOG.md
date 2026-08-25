@@ -19,6 +19,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   is what separates a slow optimiser step from a slow collective.
 - **H200 diagnostic scripts** — `diagnose_performance.py`, `disable_custom_ops.py`
   and `setup_h200_env.sh`.
+- **`tests/test_rank_h5.py` — the h5 schema contract is now asserted.** CPU-only,
+  tiny arrays, no checkpoint: the unified shard signature
+  (`format="generated_images_shard"`, `schema_version=1`, `class_names`,
+  `image_shape_hwc`, `samples_per_class`, per-group `class_idx`/`class_name`,
+  uint8 NHWC images, int64 seeds, bool written), the shard→merged roundtrip, the
+  merge hard-fail on missing slots (including deletion of the partial merged
+  file), the zero-sample-rank teardown, and the mandatory-`class_names` errors.
+  Nothing in `tests/` touched the h5 output before.
 
 ### Removed
 - **The agent debug logger in the custom CUDA ops.** Four files carried an NDJSON
@@ -44,6 +52,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   needed; the fixes are described in this changelog instead.
 
 ### Fixed
+- **A rank with no work crashed `gen_images` teardown and left a broken shard.**
+  With `samples_per_class < world_size` the contiguous block split assigns tail
+  ranks zero samples, so `RankH5Writer._init` never runs: `close()` raised
+  `KeyError` and an empty, attribute-less `rank_NNN.h5` stayed on disk for the
+  merge to trip over. `close()` now deletes the empty shard (nothing was
+  assigned, so nothing is missing) and the merge skips absent rank files —
+  legitimate only because of that deletion; a crashed rank still surfaces
+  through the unchanged merged-coverage hard-fail, which counts every slot no
+  shard covered.
 - **The custom CUDA ops needed `ninja` on `PATH`.** Calling the env's interpreter by
   absolute path -- what every launcher that does not `conda activate` does -- left the
   env's `bin/` off `PATH`, so the JIT build failed with "Ninja is required to load C++
@@ -78,6 +95,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   nothing checked. See below for this repo's share.
 
 ### Changed
+- **`class_names` is now mandatory for h5 generation.** The `class_names` root
+  attr was stamped only when the checkpoint metadata happened to carry names, so
+  a name-less checkpoint silently produced h5 files outside the label contract
+  (§5). `gen_images` in hdf5 mode now raises `ValueError` before generation
+  starts, and `RankH5Writer` / the shard merge refuse a `None` `class_names`
+  instead of conditionally skipping the attr. `--save-mode dir` is unaffected.
 - **One `_get_cuda_arch_flags()` instead of two.** Merging the CUDA branch left two
   definitions of it and injected `-gencode` flags into the same compile twice. The
   surviving version detects the device's real compute capability; the discarded one
