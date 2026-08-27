@@ -5,6 +5,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- **`sh/train_{256,512,1024}.sh` and `sh/generate_{256,512,1024}.sh` rewritten to
+  the §9 launch-script shape shared by all four model repos.** Each script is now
+  self-contained (the shared `sh/_env.sh` is gone — a SLURM spool copy could not
+  find it): SLURM-spool-safe repo-root discovery, `conda.sh` sourced before
+  `conda activate`, the JIT-op toolchain (`CUDA_HOME=$CONDA_PREFIX`, arch list from
+  the GPUs present), the offline-hub contract, and one console-command call whose
+  every knob is an env var with a default plus `"$@"` passthrough. Progressive
+  stages are one env var: `PATH_STEM=<previous snapshot>` adds
+  `--superres True --up-factor 2 --head-layers 7 --path-stem`. The dataset default
+  is the shared `imagenet_9to4_1024x1024_<res>x<res>.zip` name.
+
+### Removed
+- **`sbatch/`** (ten per-stage SLURM scripts). They hardcoded an account, a
+  `--nodelist`, a retired conda env and the pre-v2 flags (`--metrics none`,
+  `--save-inference-only`, `--path_stem …/best_model.pkl`). SLURM specifics are
+  supplied on the `sbatch` line in front of the `sh/` scripts instead (§9).
+
 ### Fixed
 - **README and the `calc_metrics` docstring still documented the retired checkpoint
   kinds** — `best_model.pkl`, `network-snapshot-latest.pt` / `--restart_every`,

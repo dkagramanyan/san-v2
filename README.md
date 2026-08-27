@@ -13,8 +13,9 @@ for the engineering changes, and the combra docs page (`san_v2`) for how trainin
 evaluation is wired into [combra](https://github.com/dkagramanyan/combra).
 
 The guide below walks through **install → test → train → generate**. On the cluster
-all four steps run on **H200 GPUs** via the ready-made Slurm scripts in
-[`sbatch/`](sbatch/).
+the training and generation steps run through the launch scripts in [`sh/`](sh/)
+(`sbatch --account=<proj> --partition=<part> --gpus=2 sh/train_256.sh`); the same
+scripts run unmodified on a workstation.
 
 
 ## 1. Installation
@@ -155,22 +156,25 @@ per GPU, so total batch = `batch-gpu × gpus`):
 | 5 | 512×512 | 25  | stage 4 |
 | 6 | 1024×1024 | 14 | stage 5 |
 
-### Launching on H200 (Slurm)
+### Launching (workstation or SLURM)
 
-Each stage has a ready-made script in [`sbatch/`](sbatch/) (2× H200 each). They are
-written to be **submitted from the sbatch folder** and jobs land on the `rocky`
-partition (no reservation needed):
+[`sh/`](sh/) holds one script per resolution and task — `train_{256,512,1024}.sh` and
+`generate_{256,512,1024}.sh`. Each contains only the compute-node environment (conda
+env `san-v2`, `CUDA_HOME=$CONDA_PREFIX` for the JIT ops, `TORCH_CUDA_ARCH_LIST` from the
+GPUs present, the offline-hub flags) and one `san-train` / `san-gen-images` call whose
+knobs are env vars with defaults; anything after the script name is appended.
 
 ```bash
-cd sbatch
-sbatch train_16x16.sbatch
-sbatch train_32x32.sbatch
-# … through train_1024x1024.sbatch
+bash sh/train_256.sh                                      # workstation, defaults
+sbatch --account=<proj> --partition=<part> --gpus=2 sh/train_256.sh   # cluster
+# superres stage on top of the previous resolution's newest snapshot:
+PATH_STEM=./runs/00000-stylegan3-r-gpus2-batch64/san-snapshot-020000-inference.pt \
+    bash sh/train_512.sh
+DATA=./datasets/my.zip KIMG=200 SNAP=2 bash sh/train_256.sh   # smoke run
 ```
 
-Each script resolves the repo root itself, activates the per-node conda env, builds the
-custom ops against that env's CUDA (`CUDA_HOME=$CONDA_PREFIX`, `TORCH_CUDA_ARCH_LIST=9.0`)
-and uses a persistent kernel cache, so a resubmit skips JIT recompilation.
+No account, partition or node names live in the scripts — SLURM specifics are supplied
+on the `sbatch` line.
 
 ### Hydra entry point
 
@@ -204,10 +208,9 @@ python gen_images.py \
 By default (`--save-mode hdf5`) each GPU writes a shard and rank 0 merges them into
 `<outdir>/<desc>.h5` — the angle-pipeline input — refusing to merge an incomplete run;
 `--save-mode dir` writes `class_<c>/idx_<i:06d>_seed_<s>.png` plus a `classes.json`
-manifest. `--gpus N` self-spawns one worker per GPU (no `torchrun`). On the cluster use the
-per-resolution scripts [`sbatch/generate_256x256.sbatch`](sbatch/generate_256x256.sbatch),
-`generate_512x512.sbatch` or `generate_1024x1024.sbatch` (submit from the sbatch folder,
-same as training).
+manifest. `--gpus N` self-spawns one worker per GPU (no `torchrun`). On the cluster use
+`NETWORK=<snapshot> sbatch --account=<proj> --partition=<part> --gpus=2 sh/generate_256.sh`
+(or `_512` / `_1024`).
 
 > **Class index → grain morphology** is documented in the combra `san_v2` docs page;
 > note the SAN index order differs from DiffiT (the `Co11`↔`Co25` swap).
