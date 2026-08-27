@@ -7,8 +7,8 @@ Please cite [[1](#citation)] in your work when using this code in your experimen
 
 This fork (`san-v2`) is specialised for generating **WC-Co microstructure SEM images**
 (the `imagenet_9to4` dataset, three grain classes). It is trained **progressively**
-(low → high resolution), every stage resuming from the previous stage's
-`best_model.pkl`. See [Differences from upstream](#differences-from-the-original-sony-stylesan-xl)
+(low → high resolution), every stage warm-starting its frozen stem from the previous
+stage's inference snapshot via `--path-stem`. See [Differences from upstream](#differences-from-the-original-sony-stylesan-xl)
 for the engineering changes, and the combra docs page (`san_v2`) for how training
 evaluation is wired into [combra](https://github.com/dkagramanyan/combra).
 
@@ -57,15 +57,9 @@ the torch / `pytorch-fid` / `open-clip-torch` stack lives behind that extra, and
 without it `combra_fid`, `combra_cmmd` and `combra_fd_dinov2` come back `nan`.
 combra also floors Python at **3.12**, which is why this package does too.
 
-Re-pin `timm` last. combra's CMMD metric pulls `open-clip-torch`, which drags in a
-newer `timm` that **can't unpickle the trained `best_model.pkl` stems** (they were saved
-with `timm 0.4.12`; you'd hit `ModuleNotFoundError: timm.models.layers.patch_embed`). So
-force the pinned version back after everything else:
-
-```bash
-pip install "timm==0.4.12"
-python -c "import timm; print(timm.__version__)"   # must print 0.4.12
-```
+`timm` (`>=1.0`) is a train-time-only dependency of the projected discriminator.
+Checkpoints are EMA-only `.pt` state dicts, so loading one never needs `timm`; the
+pickled `best_model.pkl` stems that once forced a `timm==0.4.12` pin are gone.
 
 Verify the toolchain:
 
@@ -130,27 +124,28 @@ done
 ## 4. Training
 
 Training is **progressive**: the 16² stem trains from scratch, and every higher
-resolution is a super-resolution stage that resumes from the previous stage's
-`best_model.pkl` via `--path_stem`.
+resolution is a super-resolution stage that warm-starts its frozen stem from the
+previous stage's newest inference snapshot via `--path-stem` (weights only — there
+is no resume; see [Checkpoints](#checkpoints)).
 
 ```bash
 # Stage 0 — 16x16 stem (no superres)
 python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
         --data=./datasets/imagenet_9to4_1024x1024_16x16.zip \
-        --gpus=2 --mirror=0 --snap 500 --batch-gpu 320 --kimg 20000 --syn_layers 6
+        --gpus=2 --mirror False --snap 500 --batch-gpu 320 --kimg 20000 --syn-layers 6
 
-# Stage N — superres, resuming from the previous stage's best_model.pkl
+# Stage N — superres, warm-starting from the previous stage's snapshot
 python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
         --data=./datasets/imagenet_9to4_1024x1024_32x32.zip \
-        --gpus=2 --mirror=0 --snap 100 --batch-gpu 96 --kimg 20000 --syn_layers 6 \
-        --superres --up_factor 2 --head_layers 7 \
-        --path_stem ./runs/wc-cv_h200/00000-stylegan3-r-imagenet_9to4_1024x1024_16x16-gpus4-batch560/best_model.pkl
+        --gpus=2 --mirror False --snap 100 --batch-gpu 96 --kimg 20000 --syn-layers 6 \
+        --superres True --up-factor 2 --head-layers 7 \
+        --path-stem ./runs/wc-cv_h200/00000-stylegan3-r-gpus2-batch640/san-snapshot-020000-inference.pt
 ```
 
 Per-stage tuned settings (resolution → per-GPU batch on 2× H200; `--batch-gpu` is
 per GPU, so total batch = `batch-gpu × gpus`):
 
-| stage | resolution | `--batch-gpu` | resumes from |
+| stage | resolution | `--batch-gpu` | stem from |
 |---|---|---|---|
 | 0 | 16×16   | 320 | — (stem) |
 | 1 | 32×32   | 96  | stage 0 |
@@ -203,11 +198,13 @@ python gen_images.py \
   --classes 0,1,2 \
   --gpus 2 \
   --batch-gpu 60 \
-  --network=./runs/wc-cv_h200/00004-stylegan3-r-imagenet_9to4_1024x1024_256x256-gpus4-batch168/best_model.pkl
+  --network=./runs/wc-cv_h200/00004-stylegan3-r-gpus2-batch84/san-snapshot-020000-inference.pt
 ```
 
-Images are written per class into `class_<id>/<class>_<index>.png`; pass `--gpus`
-(or launch with `torchrun`) to distribute generation across GPUs. On the cluster use the
+By default (`--save-mode hdf5`) each GPU writes a shard and rank 0 merges them into
+`<outdir>/<desc>.h5` — the angle-pipeline input — refusing to merge an incomplete run;
+`--save-mode dir` writes `class_<c>/idx_<i:06d>_seed_<s>.png` plus a `classes.json`
+manifest. `--gpus N` self-spawns one worker per GPU (no `torchrun`). On the cluster use the
 per-resolution scripts [`sbatch/generate_256x256.sbatch`](sbatch/generate_256x256.sbatch),
 `generate_512x512.sbatch` or `generate_1024x1024.sbatch` (submit from the sbatch folder,
 same as training).
@@ -233,36 +230,22 @@ size from the current run (capped between 32 and 512), keeping the detector queu
 full and cutting evaluation latency.
 
 
-## Saving checkpoints vs. weights-only vs. inference-only snapshots
+## Checkpoints
 
-There are three kinds of artifacts the training loop can write — in **decreasing size**:
+There is exactly one artifact kind: `san-snapshot-<kimg:06d>-inference.pt` — the EMA
+generator's weights plus self-describing metadata (`n_classes`, `resolution`,
+`class_names`, `cur_nimg`), as a plain `.pt` state dict. No discriminator, no
+optimizer state, no pickled modules, so loading never depends on `timm`.
 
-- **Full resume checkpoint** — `network-snapshot-latest.pt` (written when `--restart_every`
-  is set). A **single file overwritten in place** every snapshot tick — it never
-  accumulates. It contains the `G`/`D`/`G_ema` networks **and** the training progress
-  (`cur_nimg`, tick, augmentation `p`, `pl_mean`, best FID) needed to resume training.
-- **Weights-only snapshot** — pass `--save-weights-only=true` to also write
-  `network-snapshot-<kimg>.pkl` every snapshot tick. These contain the `G`/`D`/`G_ema`
-  weights (no resume state) — smaller than the full checkpoint, but still carry the
-  large projected discriminator.
-- **Inference-only snapshot** — pass `--save-inference-only=true` to also write
-  `network-snapshot-<kimg>-inference.pkl` every snapshot tick. This holds **only
-  `G_ema`** (no discriminator, no non-EMA generator, no resume state), so it is by far
-  the smallest. It is exactly what `gen_images.py` / `calc_metrics.py` load
-  (`legacy.load_network_pkl` mirrors `G_ema` onto `G` on load). **Not** for resuming.
-
-The weights-only and inference-only snapshots are for inference/evaluation; use the
-full resume checkpoint to continue training. The production `sbatch/train_*.sbatch`
-scripts pass `--save-inference-only 0` (disabled) — a prod run keeps only the rolling
-`network-snapshot-latest.pt` resume checkpoint and the best-FID `best_model.pkl`, and
-does **not** accumulate per-tick generators. Set `--save-inference-only 1` if you want
-the small per-tick `G_ema` history back.
-
-```bash
-python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
-        --data=./datasets/imagenet_9to4_1024x1024_16x16.zip \
-        --gpus=2 --batch-gpu 320 --snap 10 --save-inference-only=true
-```
+- Written every `--snap` ticks **and always at the last tick**, so the newest snapshot
+  is the final model; the write is atomic (temp file + `os.replace`).
+- History is pruned to `--snapshot-keep-last` (default 3; `0` keeps all). Pick the best
+  checkpoint post-hoc from `stats.jsonl` (`Metrics/combra_fid` per kimg) — there is no
+  `best_model.*`.
+- **There is no resume.** A run goes launch → `--kimg` → stop; size `--kimg` (or split
+  stages) to fit the job's walltime. `--path-stem <snapshot>` is a weights-only warm
+  start of the frozen lower-resolution stem, not a resume.
+- `gen_images.py` and `calc_metrics.py` load these snapshots directly.
 
 
 ## Differences from the original Sony StyleSAN-XL
@@ -282,8 +265,9 @@ are engineering / infrastructure improvements:
 - **Dynamic per-GPU metric batch sizing** and NCCL all-gather based metric collection.
 - **Unified, opt-in debug/timing instrumentation** across the training stack
   (`--debug`), writing to `<run_dir>/debug.txt` (no hardcoded paths).
-- **Weights-only** (`--save-weights-only`) and **inference-only** (`--save-inference-only`,
-  `G_ema` only — the smallest artifact) snapshots, in addition to the full resume checkpoint.
+- **EMA-only inference snapshots** (`san-snapshot-<kimg:06d>-inference.pt`, atomic,
+  pruned to `--snapshot-keep-last`) as the single checkpoint kind — no resume state, no
+  discriminator, so loading never needs `timm`.
 - **CWD-independent ImageNet embedding loading** — the `in_embeddings/*.pkl` path is
   resolved relative to the repo root and overridable via the `SAN_EMBED` env var.
 - **ImageNet 1024×1024 progressive-superres recipe** (the training commands above).

@@ -5,6 +5,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **README and the `calc_metrics` docstring still documented the retired checkpoint
+  kinds** — `best_model.pkl`, `network-snapshot-latest.pt` / `--restart_every`,
+  `--save-weights-only` / `--save-inference-only`, the `timm==0.4.12` re-pin the
+  pickled stems needed, and the underscore flag spellings (`--path_stem`,
+  `--syn_layers`, …). They now describe the single `san-snapshot-<kimg:06d>-inference.pt`
+  artifact, the `--path-stem` weights-only warm start, the `<desc>.h5` / `class_<c>/`
+  generation outputs, and the kebab-case flags.
+
 ## [0.4.0] — 2026-08-27
 
 ### Fixed

@@ -100,12 +100,12 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose, truncat
     \b
     # Previous training run: look up options automatically, save result to JSONL file.
     python calc_metrics.py --metrics=eqt50k_int,eqr50k \\
-        --network=~/training-runs/00000-stylegan3-r-mydataset/network-snapshot-000000.pkl
+        --network=~/training-runs/00000-stylegan3-r-gpus2-batch640/san-snapshot-020000-inference.pt
 
     \b
-    # Pre-trained network pickle: specify dataset explicitly, print result to stdout.
-    python calc_metrics.py --metrics=fid50k_full --data=~/datasets/ffhq-1024x1024.zip --mirror=1 \\
-        --network=https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/stylegan3-t-ffhq-1024x1024.pkl
+    # Any inference snapshot: specify dataset explicitly, print result to stdout.
+    python calc_metrics.py --metrics=fid50k_full --data=~/datasets/imagenet_9to4_1024x1024_256x256.zip \\
+        --network=./runs/wc-cv_h200/00004-stylegan3-r-gpus2-batch84/san-snapshot-020000-inference.pt
 
     \b
     Recommended metrics:
