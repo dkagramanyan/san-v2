@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-27
+
 ### Fixed
 - **`tests/test_combra_contract.py` asserted combra symbols the training loop no
   longer imports.** Its `REQUIRED` list still named the eight feature / angle
