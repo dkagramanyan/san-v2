@@ -6,6 +6,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **`tests/test_combra_contract.py` asserted combra symbols the training loop no
+  longer imports.** Its `REQUIRED` list still named the eight feature / angle
+  functions from before the sharded harness moved into combra, and never named
+  `combra.metrics.distributed`'s `all_ranks_ok` / `distributed_metrics` /
+  `gather_generated` / `precompute_reference` — the four symbols the loop actually
+  depends on. That is the exact blind spot the test exists to close (combra 0.5.0
+  removing three functions hid for a release the same way). It now pins
+  `(module, name)` pairs for every combra import in the repo and the unguarded
+  import block mirrors the loop's real imports.
+
 - **The shard merge validated nothing about the files it read.** It opened
   every `shards/rank_NNN.h5` and scanned its `written` masks, never checking
   that the file was a `generated_images_shard` at all, that its
