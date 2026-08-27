@@ -156,3 +156,25 @@ def test_class_names_is_mandatory(tmp_path):
             world_size=1,
             class_names=None,
         )
+
+
+def test_merge_refuses_foreign_or_unclosed_shard(tmp_path):
+    # The merge validates what it reads: a file that is not a closed
+    # generated_images_shard must be refused, not scanned for written slots.
+    sh = tmp_path / "shards"
+    w = _writer(sh, 0)
+    for c in CLASSES:
+        _write(w, c, range(SPC))
+    w.close()
+
+    with h5py.File(sh / "rank_000.h5", "r+") as f:
+        f.attrs["format"] = "something_else"
+    with pytest.raises(RuntimeError, match="not a generated_images_shard"):
+        _merge(tmp_path, world_size=1)
+
+    # A shard whose writer never reached close() carries no per-group missing_count.
+    with h5py.File(sh / "rank_000.h5", "r+") as f:
+        f.attrs["format"] = H5_FORMAT_SHARD
+        del f["class_0"].attrs["missing_count"]
+    with pytest.raises(RuntimeError, match="never reached close"):
+        _merge(tmp_path, world_size=1)

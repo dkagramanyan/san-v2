@@ -106,7 +106,7 @@ def _split_indices_block(n: int, rank: int, world_size: int) -> np.ndarray:
 class RankH5Writer:
     """
     Each rank writes its own shard file:
-      <outdir>/<desc_full>/shards/rank_000.h5
+      <outdir>/shards/rank_<rank:03d>.h5
     Incremental (during generation), fixed-size datasets, bounded memory.
     """
     def __init__(
@@ -283,6 +283,26 @@ def _merge_shards_to_one_h5(
         if shard_path.exists():
             shard_files.append(h5py.File(str(shard_path), "r"))
     try:
+        # Refuse anything that is not a closed shard of this format (§4): the
+        # root attrs are stamped on the first batch and per-group missing_count
+        # only in close(), so a worker that died early leaves one or the other
+        # absent. The written-mask gate below still recomputes every slot.
+        for sf in shard_files:
+            name = os.path.basename(sf.filename)
+            if sf.attrs.get("format") != H5_FORMAT_SHARD:
+                raise RuntimeError(
+                    f"{name}: not a {H5_FORMAT_SHARD} shard (format="
+                    f"{sf.attrs.get('format')!r}); refusing to merge")
+            if int(sf.attrs.get("schema_version", -1)) != H5_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"{name}: schema_version {sf.attrs.get('schema_version')!r} != "
+                    f"{H5_SCHEMA_VERSION}; refusing to merge")
+            for key in sf.keys():
+                if key.startswith("class_") and "missing_count" not in sf[key].attrs:
+                    raise RuntimeError(
+                        f"{name}/{key}: no missing_count attr, so the writer never "
+                        "reached close() (its process died mid-run); refusing to merge")
+
         # Determine image shape from first shard that has it
         img_shape = None
         for sf in shard_files:
@@ -654,6 +674,15 @@ def generate_images(
         hdf5_compression=compression_norm,
         hdf5_chunk_images=hdf5_chunk_images,
     )
+
+    # Clear stale shards from an earlier run in this outdir: a worker that
+    # crashes before opening its shard would otherwise leave the old rank file
+    # in place for the merge to read as if it were this run's.
+    if save_mode.lower() == "hdf5":
+        stale_dir = outdir_p / "shards"
+        if stale_dir.is_dir():
+            for stale in stale_dir.glob("rank_*.h5"):
+                stale.unlink()
 
     # Self-spawn one worker per GPU (the same launch model as training; no torchrun).
     num_gpus = gpus or (torch.cuda.device_count() or 1)

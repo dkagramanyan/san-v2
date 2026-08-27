@@ -5,6 +5,23 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **The shard merge validated nothing about the files it read.** It opened
+  every `shards/rank_NNN.h5` and scanned its `written` masks, never checking
+  that the file was a `generated_images_shard` at all, that its
+  `schema_version` matched, or that its writer had reached `close()` — so a
+  worker that died before its first batch left a root-attr-less file to be
+  treated as "zero written", and a stale shard from an earlier run in the same
+  `--outdir` could be merged as if it were this run's. The merge now refuses a
+  shard with the wrong `format` / `schema_version` or a `class_*` group with no
+  `missing_count` attr (the closed-shard marker, §4), and `san-gen-images`
+  clears `shards/rank_*.h5` before spawning workers. The written-mask
+  recomputation still gates every slot; these checks fail earlier and name the
+  actual cause.
+
+- `RankH5Writer`'s docstring named a `<desc_full>/` shard directory that the
+  worker never used; shards live at `<outdir>/shards/rank_<rank:03d>.h5`.
+
 ### Added
 - **`bfloat16` support in the three custom CUDA ops.** `bias_act`, `upfirdn2d` and
   `filtered_lrelu` accepted only `float16`/`float32`; `bfloat16` either tripped the
