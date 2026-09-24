@@ -91,3 +91,14 @@ def test_angle_metrics_run_on_pooled_angles():
     )
     for key in ("w1", "w2", "circular_w1", "circular_w2", "mu1", "sigma1", "pi"):
         assert np.isfinite(out[key]), f"{key} is not finite"
+
+
+@requires_combra
+def test_write_hparams_accepts_step():
+    # The loop passes step=cur_nimg so the HPARAMS land in the run's own event file
+    # (combra >= 0.15.3); an older combra raises TypeError at the end of every run.
+    import inspect
+
+    from combra.io import write_hparams
+
+    assert "step" in inspect.signature(write_hparams).parameters

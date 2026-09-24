@@ -32,16 +32,35 @@ def _row():
     # The collector nests every scalar as {num, mean, std}; build_stats_row must
     # flatten it to the mean, which is what TensorBoard receives too.
     stats_dict = {
-        "Progress/kimg": SimpleNamespace(mean=403.2),
-        "Loss/G/loss": SimpleNamespace(mean=1.25),
+        "Progress/kimg": SimpleNamespace(num=1, mean=403.2),
+        "Progress/tick": SimpleNamespace(num=1, mean=7.0),
+        "Loss/G/loss": SimpleNamespace(num=1, mean=1.25),
+        "Timing/Greg": SimpleNamespace(num=1, mean=float("nan")),
+        "Timing/eval_sec": SimpleNamespace(num=0, mean=float("nan")),  # not reported this tick
     }
-    return build_stats_row(stats_dict, {"combra_fid": 12.5}, 1000.0, 900.0)
+    return build_stats_row(stats_dict, {"combra_fid": 12.5, "combra_cmmd": float("inf")}, 1000.0, 900.0)
+
+
+def test_row_is_strict_json_with_null_for_non_finite():
+    row = _row()
+    line = json.dumps(row, allow_nan=False)  # raises on a bare NaN / Infinity
+    back = json.loads(line)
+    assert back["Timing/Greg"] is None
+    assert back["Metrics/combra_cmmd"] is None
+
+
+def test_row_types_and_eval_keys():
+    row = _row()
+    assert row["Progress/tick"] == 7 and isinstance(row["Progress/tick"], int)
+    assert row["Metrics/combra_fid"] == 12.5  # metrics live in the tick row
+    # A scalar nobody reported this tick is absent, never NaN or a stale repeat.
+    assert "Timing/eval_sec" not in row
 
 
 
 def test_row_contains_only_json_scalars():
     for key, value in _row().items():
-        assert isinstance(value, (int, float, str)), (
+        assert value is None or isinstance(value, (int, float, str)), (
             f"{key} is {type(value).__name__}, not a JSON scalar -- "
             "load_fid_by_kimg will shape-filter this record away"
         )
@@ -52,5 +71,5 @@ def test_row_round_trips_through_load_fid_by_kimg(tmp_path):
     from combra.metrics import load_fid_by_kimg
 
     path = tmp_path / "stats.jsonl"
-    path.write_text(json.dumps(_row()) + "\n")
+    path.write_text(json.dumps(_row(), allow_nan=False) + "\n")
     assert load_fid_by_kimg(str(path)) == {"000403": 12.5}

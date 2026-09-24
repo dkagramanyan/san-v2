@@ -23,11 +23,41 @@ from training import training_loop
 
 #----------------------------------------------------------------------------
 
+def _print_options(c):
+    print()
+    print('Training options:')
+    print(json.dumps(c, indent=2))
+    print()
+    print(f'Output directory:    {c.run_dir}')
+    print(f'Number of GPUs:      {c.num_gpus}')
+    print(f'Batch size:          {c.batch_size} images')
+    print(f'Training duration:   {c.total_kimg} kimg')
+    print(f'Dataset path:        {c.training_set_kwargs.path}')
+    print(f'Dataset size:        {c.training_set_kwargs.max_size} images')
+    print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
+    print(f'Dataset labels:      {c.training_set_kwargs.use_labels}')
+    print(f'Mirror augment:      {c.mirror}')
+    print()
+
+def _startup_header(num_gpus):
+    # One line of torch / CUDA / device / env facts so the .log is self-sufficient (§7).
+    parts = [f'torch {torch.__version__}', f'cuda {torch.version.cuda}', f'gpus {num_gpus}']
+    parts.append('device ' + (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'))
+    for v in ('CUDA_VISIBLE_DEVICES', 'TORCH_CUDA_ARCH_LIST', 'HF_HUB_OFFLINE', 'TRANSFORMERS_OFFLINE'):
+        if os.environ.get(v):
+            parts.append(f'{v}={os.environ[v]}')
+    return ' | '.join(parts)
+
+#----------------------------------------------------------------------------
+
 def subprocess_fn(rank, c, temp_dir):
     # Rank-0-only console transcript, named after the run directory (§7).
     log_name = os.path.basename(c.run_dir) + '.log' if rank == 0 else None
     log_path = os.path.join(c.run_dir, log_name) if log_name is not None else None
     dnnlib.util.Logger(file_name=log_path, file_mode='a', should_flush=True)
+    if rank == 0:
+        _print_options(c)
+        print('[startup] ' + _startup_header(c.num_gpus), flush=True)
 
     # Init torch.distributed.
     if c.num_gpus > 1:
@@ -68,24 +98,10 @@ def launch_training(c, desc, outdir, dry_run):
     c.run_dir = os.path.join(outdir, f'{cur_run_id:05d}-{desc}')
     assert not os.path.exists(c.run_dir)
 
-    # Print options.
-    print()
-    print('Training options:')
-    print(json.dumps(c, indent=2))
-    print()
-    print(f'Output directory:    {c.run_dir}')
-    print(f'Number of GPUs:      {c.num_gpus}')
-    print(f'Batch size:          {c.batch_size} images')
-    print(f'Training duration:   {c.total_kimg} kimg')
-    print(f'Dataset path:        {c.training_set_kwargs.path}')
-    print(f'Dataset size:        {c.training_set_kwargs.max_size} images')
-    print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
-    print(f'Dataset labels:      {c.training_set_kwargs.use_labels}')
-    print(f'Mirror augment:      {c.mirror}')
-    print()
-
-    # Dry run?
+    # Dry run? A real run prints the options from rank 0 once its file logger exists
+    # (§7), so they land in the run's .log and are not shown twice.
     if dry_run:
+        _print_options(c)
         print('Dry run; exiting.')
         return
 

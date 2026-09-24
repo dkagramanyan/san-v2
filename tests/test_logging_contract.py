@@ -73,3 +73,12 @@ def test_hyperparameters_are_recorded(source):
     # Without this the HPARAMS tab is empty and two runs can be compared by their
     # curves but not by the configuration that produced them.
     assert "_write_run_hparams" in source
+
+
+def test_tensorboard_uses_real_walltime(source):
+    # Passing seconds-since-start as walltime= put every run in 1970 (§7 C1).
+    assert "walltime=" not in source
+
+
+def test_reals_grid_reaches_tensorboard(source):
+    assert "'Reals'" in source

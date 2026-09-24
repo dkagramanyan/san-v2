@@ -11,6 +11,7 @@
 import copy
 import importlib.util
 import json
+import math
 import os
 import time
 import warnings
@@ -444,7 +445,7 @@ def _combra_eval_distributed(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, d
     return distributed_metrics(combra_ref, gen_angles, gen_feats, device=device)
 
 
-def _write_run_hparams(run_dir, writer, metrics):
+def _write_run_hparams(run_dir, writer, metrics, step):
     """Record this run's configuration in TensorBoard's HPARAMS tab (§7).
 
     The config is read back from ``training_options.json``, which the launcher has
@@ -465,7 +466,7 @@ def _write_run_hparams(run_dir, writer, metrics):
         return
     with open(path) as fh:
         config = json.load(fh)
-    write_hparams(writer, config, metrics)
+    write_hparams(writer, config, metrics, step=step)
 
 
 def build_stats_row(stats_dict, stats_metrics, timestamp, start_time):
@@ -479,12 +480,20 @@ def build_stats_row(stats_dict, stats_metrics, timestamp, start_time):
     ``value.mean``, so flattening also makes the file carry the same keys as the
     tags, which is what §7 asks for.
 
+    A scalar nobody reported this tick (e.g. ``Timing/eval_sec`` off eval ticks) is
+    left out rather than written as NaN, and non-finite values become ``null`` so
+    the row is strict JSON (``json.dumps(row, allow_nan=False)``); TensorBoard
+    receives the same keys and skips the nulls.
+
     Kept as a plain function so tests can exercise the real row without running a
     training loop.
     """
-    row = {name: value.mean for name, value in stats_dict.items()}
+    row = {name: value.mean for name, value in stats_dict.items() if value.num > 0}
     for name, value in stats_metrics.items():
         row[f'Metrics/{name}'] = float(value)
+    row = {k: (v if math.isfinite(v) else None) for k, v in row.items()}
+    if row.get('Progress/tick') is not None:
+        row['Progress/tick'] = int(row['Progress/tick'])
     row['timestamp'] = timestamp
     row['wall_time'] = timestamp - start_time
     row['datetime'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -572,8 +581,7 @@ def training_loop(
         if rank == 0:
             dt = time.time() - start_time
             dt_min = dt / 60.0
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            print(f'[Stage {now}] {dt_min:7.1f}m | {msg}', flush=True)
+            print(f'[Stage] {dt_min:7.1f}m | {msg}', flush=True)
 
     # Load training set.
     stage('Loading training set')
@@ -672,6 +680,7 @@ def training_loop(
     grid_c = None
     stage('Exporting sample images (reals.png, fakes_init.png)')
     grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
+    reals_images = images
     if rank == 0:
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
 
@@ -749,7 +758,9 @@ def training_loop(
 
     # Initialize logs.
     stage('Initializing logs (stats.jsonl, tensorboard)')
-    stats_collector = training_stats.Collector(regex='.*')
+    # keep_previous=False: a scalar not reported this tick must not repeat the last
+    # tick's value (Timing/eval_sec is reported on eval ticks only).
+    stats_collector = training_stats.Collector(regex='.*', keep_previous=False)
     stats_metrics = dict()
     best_fid = float('inf')   # running best combra FID -> Metrics/combra_fid_best
     stats_jsonl = None
@@ -765,6 +776,12 @@ def training_loop(
                 run_dir, filename_suffix=f'.{os.path.basename(run_dir)}')
         except ImportError as err:
             print('Skipping tfevents export:', err)
+        if stats_tfevents is not None:
+            # §7: the same grids as reals.png / fakes_init.png, at step 0.
+            stats_tfevents.add_image('Reals', image_grid_array(reals_images, [0, 255], grid_size),
+                                     global_step=0, dataformats='HWC')
+            stats_tfevents.add_image('Fakes', image_grid_array(images, [-1, 1], grid_size),
+                                     global_step=0, dataformats='HWC')
 
     # Log CUDA configuration for diagnostics
     # #region debug log
@@ -991,10 +1008,10 @@ def training_loop(
         tick_end_time = time.time()
         fields = []
         fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
-        fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<8.1f}"]
+        fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<9.1f}"]
         fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
-        fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
-        fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
+        fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<8.1f}"]
+        fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<8.2f}"]
         fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
         fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
         fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
@@ -1021,10 +1038,11 @@ def training_loop(
 
         # Save image snapshot (fakes grid). The last tick always snapshots (§3).
         if (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            stage(f'Saving image snapshot (kimg={cur_nimg/1e3:.1f})')
             images = generate_snapshot_grid_images(G_ema=G_ema, grid_z=grid_z, grid_c=grid_c, batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
             if rank == 0:
-                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+                fakes_name = f'fakes{cur_nimg//1000:06d}.png'
+                save_image_grid(images, os.path.join(run_dir, fakes_name), drange=[-1,1], grid_size=grid_size)
+                print(f'Saved {fakes_name}', flush=True)
                 # §7 lists `Fakes` as a TensorBoard image every snapshot tick. This repo
                 # is the reference implementation for the sample grid, yet it was the one
                 # repo that only ever wrote the grid to disk.
@@ -1032,7 +1050,6 @@ def training_loop(
                     stats_tfevents.add_image(
                         'Fakes', image_grid_array(images, [-1, 1], grid_size),
                         global_step=cur_nimg, dataformats='HWC')
-            stage(f'Image snapshot saved (kimg={cur_nimg/1e3:.1f})')
 
         # Save network snapshot (§3): EMA-only weights as a `.pt` state dict, written
         # atomically every snapshot tick AND always at the last tick, so the newest
@@ -1040,7 +1057,6 @@ def training_loop(
         # is pruned to --snapshot-keep-last.
         did_snapshot = (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0)
         if did_snapshot:
-            stage(f'Saving inference snapshot (kimg={cur_nimg/1e3:.1f})')
             # DDP weight-consistency check before saving so silently diverged ranks
             # (which would otherwise persist rank 0's weights undetected) are caught.
             # Must run on every rank.
@@ -1055,8 +1071,8 @@ def training_loop(
                 )
                 snap_path = os.path.join(run_dir, f'san-snapshot-{cur_nimg//1000:06d}-inference.pt')
                 checkpoint.save_inference_snapshot(snap_path, G_ema, metadata)
+                print(f'Saved {os.path.basename(snap_path)}', flush=True)
                 checkpoint.prune_snapshots(run_dir, snapshot_keep_last)
-            stage(f'Inference snapshot saved (kimg={cur_nimg/1e3:.1f})')
 
         # combra in-memory generative-quality metrics (optional dependency), scored
         # over the reference vs combra_num_gen fakes. Both the image-feature extraction
@@ -1081,7 +1097,8 @@ def training_loop(
         combra_active = (combra_enabled and combra_ref_ok
                          and (importlib.util.find_spec('combra') is not None))
         if cur_tick and did_snapshot and combra_active:
-            stage('Evaluating combra metrics')
+            if rank == 0:
+                print(f'Evaluating combra metrics ({combra_num} samples, {num_gpus} GPUs)...', flush=True)
             eval_start = time.time()
             try:
                 combra_results = _combra_eval_distributed(
@@ -1091,7 +1108,7 @@ def training_loop(
                 # Every rank prints: the rank that fails is rarely rank 0, and a
                 # rank-0-only print left the actual error invisible while the run
                 # reported only that "combra metrics failed" somewhere.
-                print(f'[combra][rank {rank}] metric evaluation failed: {e}', flush=True)
+                print(('' if rank == 0 else f'[rank {rank}] ') + f'combra metrics failed: {e}', flush=True)
             # Outside the rank guard on purpose. report0 registers the counter NAME on
             # whichever rank calls it (before it discards non-zero ranks' values), and
             # Collector.update() all_reduces over the registered set -- so a name only
@@ -1109,8 +1126,8 @@ def training_loop(
                 if 'combra_fid' in stats_metrics:
                     best_fid = min(best_fid, stats_metrics['combra_fid'])
                     stats_metrics['combra_fid_best'] = best_fid
-                print('combra metrics: ' + ', '.join(
-                    f'{k}={v:.4f}' for k, v in combra_results.items()), flush=True)
+                print('Metrics: ' + '  '.join(
+                    f'{k} {v:.4f}' for k, v in stats_metrics.items()), flush=True)
 
         # Collect statistics.
         for phase in phases:
@@ -1131,17 +1148,17 @@ def training_loop(
         timestamp = time.time()
         if stats_jsonl is not None:
             fields = build_stats_row(stats_dict, stats_metrics, timestamp, start_time)
-            stats_jsonl.write(json.dumps(fields) + '\n')
+            stats_jsonl.write(json.dumps(fields, allow_nan=False) + '\n')
             stats_jsonl.flush()
         if stats_tfevents is not None:
             # §7: the global step is cur_nimg everywhere, so curves overlay across
-            # repos, batch sizes and GPU counts. This used to be kimg here.
-            global_step = cur_nimg
-            walltime = timestamp - start_time
-            for name, value in stats_dict.items():
-                stats_tfevents.add_scalar(name, value.mean, global_step=global_step, walltime=walltime)
-            for name, value in stats_metrics.items():
-                stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
+            # repos, batch sizes and GPU counts. This used to be kimg here. The tags
+            # are the stats.jsonl keys; no walltime argument (seconds-since-start put the
+            # runs in 1970), nulls (non-finite) are skipped. Rank 0 only, so the
+            # row built for stats.jsonl above exists.
+            for name, value in fields.items():
+                if name not in ('timestamp', 'wall_time', 'datetime') and value is not None:
+                    stats_tfevents.add_scalar(name, value, global_step=cur_nimg)
             stats_tfevents.flush()
         if progress_fn is not None:
             progress_fn(cur_nimg // 1000, total_kimg)
@@ -1158,7 +1175,9 @@ def training_loop(
     if rank == 0:
         if stats_tfevents is not None:
             _write_run_hparams(run_dir, stats_tfevents,
-                               {'Metrics/combra_fid_best': float(best_fid)})
-        stage('Exiting')
+                               {'Metrics/combra_fid_best': float(best_fid)}, step=cur_nimg)
+            stats_tfevents.close()
+        stats_jsonl.close()
+        print('Training complete.', flush=True)
 
 #----------------------------------------------------------------------------
