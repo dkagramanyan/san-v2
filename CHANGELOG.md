@@ -6,6 +6,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **`in_embeddings/tf_efficientnet_lite0.pkl` is tracked again.** Every generator
+  build and snapshot load reads it (`MappingNetwork`), but it was deleted with the
+  2026-01-08 code move, so a fresh clone died with `FileNotFoundError` unless
+  `SAN_EMBED` pointed at an old copy. Restored byte-identical from upstream
+  (`d7ddbe7`, 1.3 MB, a dill pickle of the `Embedding(1000, 320)`).
 - **The startup smoke test no longer aborts 16² and 64² runs.** It called combra's
   `self_test(images=<first 4 training images>, image_metrics=True, strict=True)`:
   at 16² those 4 images yield no vertex angles ("reference angle density is empty"),
