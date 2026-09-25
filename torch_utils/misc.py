@@ -299,3 +299,14 @@ def parse_version(version_string):
     """
     numeric = re.match(r'\d+(\.\d+)*', str(version_string))
     return tuple(int(part) for part in numeric.group(0).split('.')) if numeric else ()
+
+#----------------------------------------------------------------------------
+# Normalization contract (§5): the ONE denorm from the float training space [-1, 1]
+# to uint8 [0, 255] -- round to nearest (half to even, like np.rint), then clamp.
+# Every artifact, sample and combra batch goes through it, so fakes cross the
+# boundary exactly like reals. Stays on the input's device; layout is preserved.
+
+def denorm_to_uint8(x):
+    return ((x.to(torch.float32) + 1) * 127.5).round().clamp(0, 255).to(torch.uint8)
+
+#----------------------------------------------------------------------------

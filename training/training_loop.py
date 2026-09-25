@@ -259,9 +259,10 @@ def warmup_cuda_kernels(G, D, device, batch_gpu, num_iterations=1, rank=0):
 # every combra batch, so reals and fakes cross the boundary identically (the legacy
 # eval path used a `+128` offset for fakes while reals entered as raw uint8, biasing
 # every reported metric). ``x`` is a float array/tensor in [-1, 1]; NCHW is preserved.
+# The formula itself is misc.denorm_to_uint8, shared with gen_images / calc_metrics.
 def denorm_to_uint8(x):
-    x = np.asarray(x.cpu() if isinstance(x, torch.Tensor) else x, dtype=np.float32)
-    return np.rint((x + 1) * 127.5).clip(0, 255).astype(np.uint8)
+    x = x if isinstance(x, torch.Tensor) else torch.from_numpy(np.asarray(x, dtype=np.float32))
+    return misc.denorm_to_uint8(x).cpu().numpy()
 
 # Inverse used by the training loader: uint8 [0, 255] -> float [-1, 1].
 def norm_from_uint8(x):
@@ -385,14 +386,16 @@ def _combra_generate_local_shard(G_ema, grid_z, grid_c, batch_gpu, num_gpus, ran
     # Rank r generates the fakes at indices [r, r+num_gpus, ...]; concatenating every
     # rank's shard reproduces the full set exactly (no padding duplicates). G_ema is
     # deterministic given (z, c) with noise_mode='const', so which rank generates a
-    # given latent is irrelevant. Returns a float [-1, 1] NCHW numpy array.
+    # given latent is irrelevant. Returns a uint8 NCHW numpy array: each batch goes
+    # through the one denorm (§5) on the GPU and moves to the CPU as it is generated,
+    # so the shard never sits on the GPU as fp32 (tens of GB at 1024 px).
     n = grid_z.shape[0]
     idx = torch.arange(rank, n, num_gpus, device=grid_z.device)
     z = grid_z.index_select(0, idx)
     c = grid_c.index_select(0, idx)
-    images = torch.cat([G_ema(z=zz, c=cc, noise_mode=noise_mode)
-                        for zz, cc in zip(z.split(batch_gpu), c.split(batch_gpu))], dim=0)
-    return images.cpu().numpy()
+    images = [misc.denorm_to_uint8(G_ema(z=zz, c=cc, noise_mode=noise_mode)).cpu()
+              for zz, cc in zip(z.split(batch_gpu), c.split(batch_gpu))]
+    return torch.cat(images, dim=0).numpy()
 
 
 def _combra_precompute_reference(training_set, device, rank, num_gpus, ref_count=None, seed=0):
@@ -432,14 +435,22 @@ def _combra_eval_distributed(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, d
                              combra_ref):
     """combra metrics on rank 0, None elsewhere. Every rank MUST call this: the
     gathers inside are collectives, so a rank that skips them hangs the others."""
-    from combra.metrics.distributed import distributed_metrics, gather_generated
+    from combra.metrics.distributed import all_ranks_ok, distributed_metrics, gather_generated
 
     # combra's angle path is scale-sensitive, so both sides cross the boundary as uint8
-    # through the one denorm formula (§5).
-    local_u8 = denorm_to_uint8(
-        _combra_generate_local_shard(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank))
+    # through the one denorm formula (§5). Generation runs BEFORE combra's own
+    # handshake, so it needs its own: a rank that fails here (e.g. OOM) must not leave
+    # the others blocked in gather_generated's collectives.
+    local_u8, ok = None, True
+    try:
+        local_u8 = _combra_generate_local_shard(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank)
+    except Exception as e:  # noqa: BLE001 -- agreed across ranks below
+        ok = False
+        print(f'[combra][rank {rank}] eval generation failed: {e}', flush=True)
+    if not all_ranks_ok(ok, device, num_gpus):
+        return None
     gen_feats, gen_angles = gather_generated(local_u8, device, rank, num_gpus)
-    if rank != 0:
+    if rank != 0 or gen_angles is None:  # None: some rank's extraction failed
         return None
     # device= so the CMMD reduction runs where the features were extracted.
     return distributed_metrics(combra_ref, gen_angles, gen_feats, device=device)
@@ -538,7 +549,7 @@ def training_loop(
     combra_metrics          = True,     # Compute combra generative-quality metrics each snapshot tick.
     combra_num_gen          = 10000,    # Number of fakes for the combra metrics (0 disables eval).
     combra_ref_count        = None,     # Cap the combra reference to a seeded random subset.
-    precision               = 'fp16',   # Training precision: fp32 / fp16 / bf16.
+    precision               = 'fp16',   # Training precision: fp32 / fp16. Recorded only: train.py applies it through G_kwargs (num_fp16_res / conv_clamp).
     allow_tf32              = True,      # Enable TF32 matmul / cuDNN.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
@@ -709,21 +720,28 @@ def training_loop(
     # batch). For an unconditional G, get_label returns a zero-length vector.
     combra_ref = None
     combra_ref_ok = True
-    if combra_enabled and (rank == 0) and (importlib.util.find_spec('combra') is not None):
+    if combra_enabled and (importlib.util.find_spec('combra') is not None):
         # Startup smoke test (§6): fail fast if the combra backends are unusable, using
         # combra's shared implementation. strict=True is the point -- the plain
         # self_test() this used to call defaults to image_metrics=False, so it never
         # touched InceptionV3 / CLIP / DINOv2 and a missing CLIP download surfaced only
         # as a whole run logging nan for combra_fid / combra_cmmd / combra_fd_dinov2.
-        # images= scores the real reference slice, not synthetic grains.
-        try:
-            from combra.metrics import self_test
-            sample = np.stack([training_set[i][0] for i in range(min(4, len(training_set)))])
-            self_test(images=sample, device=device, image_metrics=True, strict=True)
-        except ImportError:
-            pass
-        except Exception as e:
-            print(f'[combra] smoke test reported a problem: {e}', flush=True)
+        # images= scores the real reference slice, not synthetic grains. Rank 0 runs
+        # it; every rank (the gate above is rank-uniform) agrees on the outcome and
+        # raises together, so no rank is left waiting in a later collective.
+        from combra.metrics.distributed import all_ranks_ok
+        self_test_ok = True
+        if rank == 0:
+            try:
+                from combra.metrics import self_test
+                sample = np.stack([training_set[i][0] for i in range(min(4, len(training_set)))])
+                self_test(images=sample, device=device, image_metrics=True, strict=True)
+            except Exception as e:  # noqa: BLE001 -- agreed across ranks below
+                self_test_ok = False
+                print(f'[combra] smoke test failed: {e}', flush=True)
+        if not all_ranks_ok(self_test_ok, device, num_gpus):
+            raise RuntimeError('combra startup smoke test failed (see the error above); fix the '
+                               'combra backends or pass --combra-metrics False')
     if combra_enabled:
         combra_label_idx = np.random.RandomState(random_seed).randint(0, len(training_set), size=combra_num)
         combra_labels = np.stack([training_set.get_label(i) for i in combra_label_idx])

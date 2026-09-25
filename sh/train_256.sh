@@ -17,6 +17,9 @@ set -euo pipefail
 REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 while [[ ! -f "$REPO_DIR/pyproject.toml" && "$REPO_DIR" != / ]]; do REPO_DIR="$(dirname "$REPO_DIR")"; done
 [[ -f "$REPO_DIR/pyproject.toml" ]] || { echo "cannot find the repo root -- submit from inside the repo" >&2; exit 1; }
+# The stem path is stored in every snapshot of this stage and re-read whenever one is
+# loaded, so make it absolute (relative to where the job was launched) before the cd.
+if [[ -n "${PATH_STEM:-}" ]]; then PATH_STEM="$(realpath -e "$PATH_STEM")"; fi
 cd "$REPO_DIR"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"

@@ -78,3 +78,73 @@ def test_label_metadata_errors_on_missing_label():
     arch = ["00000/a.png", "b.png"]  # second image has no class folder
     with pytest.raises(SystemExit):
         _build_label_metadata(arch, ["ClassA", None], [None, None])
+
+
+def test_label_metadata_refuses_integer_labels_without_names():
+    # §5 Rule 2: bare integers must not be stamped with invented names ('0', '1', ...).
+    from dataset_tool import _build_label_metadata
+    with pytest.raises(SystemExit):
+        _build_label_metadata(["00000/a.png", "00000/b.png"], [None, None], [0, 1])
+
+
+def _zip(tmp_path, class_names):
+    import io
+    import json
+    import zipfile
+
+    import numpy as np
+    import PIL.Image
+    path = tmp_path / "data.zip"
+    with zipfile.ZipFile(path, "w") as zf:
+        labels = []
+        for i in range(2):
+            buf = io.BytesIO()
+            PIL.Image.fromarray(np.zeros([16, 16, 3], np.uint8)).save(buf, format="png")
+            zf.writestr(f"00000/img{i:08d}.png", buf.getvalue())
+            labels.append([f"00000/img{i:08d}.png", i])
+        meta = {"labels": labels}
+        if class_names is not None:
+            meta["class_names"] = class_names
+        zf.writestr("dataset.json", json.dumps(meta))
+    return str(path)
+
+
+def _config(tmp_path, *args, class_names=("A", "B")):
+    import dnnlib
+    from train import build_config, main
+    argv = ["--outdir", str(tmp_path), "--cfg", "stylegan3-r", "--gpus", "1", "--batch-gpu", "2",
+            "--data", _zip(tmp_path, None if class_names is None else list(class_names)), *args]
+    return build_config(dnnlib.EasyDict(main.make_context("san-train", argv).params))
+
+
+def test_cond_requires_class_names(tmp_path):
+    from click import ClickException
+    with pytest.raises(ClickException, match="class_names"):
+        _config(tmp_path, "--cond", "True", class_names=None)
+    _config(tmp_path, "--cond", "True")  # named zip is accepted
+
+
+def test_precision_bf16_is_refused_and_fp32_survives_superres(tmp_path):
+    from click import ClickException
+    with pytest.raises(ClickException, match="bf16"):
+        _config(tmp_path, "--precision", "bf16")
+    c, _ = _config(tmp_path, "--precision", "fp32", "--superres", "True", "--path-stem", "stem.pt")
+    assert c.G_kwargs.class_name.endswith("SuperresGenerator")
+    assert c.G_kwargs.num_fp16_res == 0 and c.G_kwargs.conv_clamp is None
+
+
+def test_one_denorm_rounds_to_nearest():
+    # §5: every uint8 conversion is rint((x + 1) * 127.5), clamped -- also gen_images'.
+    import numpy as np
+    import torch
+
+    from torch_utils import gen_utils, misc
+    x = torch.tensor([-1.5, -1.0, -0.9168, 0.0, 0.3, 1.0, 1.5]).reshape(1, 1, 1, 7)
+    want = np.rint((x.numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
+    assert np.array_equal(misc.denorm_to_uint8(x).numpy(), want)
+
+    class _G:
+        def synthesis(self, ws, noise_mode):
+            return x.expand(1, 3, 1, 7)
+    img = gen_utils.w_to_img(_G(), torch.zeros([1, 2, 4]))
+    assert np.array_equal(img[0, :, :, 0], want[0, 0])

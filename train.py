@@ -129,7 +129,7 @@ def init_dataset_kwargs(data):
         dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
         dataset_kwargs.use_labels = dataset_obj.has_labels # Be explicit about labels.
         dataset_kwargs.max_size = len(dataset_obj) # Be explicit about dataset size.
-        return dataset_kwargs, dataset_obj.name
+        return dataset_kwargs, dataset_obj.name, dataset_obj.class_names
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
 
@@ -203,9 +203,14 @@ def build_config(opts):
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2, persistent_workers=True)
 
     # Training set.
-    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
+    c.training_set_kwargs, dataset_name, class_names = init_dataset_kwargs(data=opts.data)
     if opts.cond and not c.training_set_kwargs.use_labels:
         raise click.ClickException('--cond=True requires labels specified in dataset.json')
+    # §5: grain-class names travel with the zip and are copied into every snapshot, so a
+    # conditional run on a zip without them would write snapshots nobody can resolve.
+    if opts.cond and class_names is None:
+        raise click.ClickException('--cond=True requires "class_names" in dataset.json (§5); '
+                                   'rebuild the zip with san-prepare-data')
     c.training_set_kwargs.use_labels = opts.cond
 
     # Hyperparameters & settings.
@@ -231,7 +236,12 @@ def build_config(opts):
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
 
-    # Precision (§2): fp32 disables the fp16 synthesis layers; fp16/bf16 keep them.
+    # Precision (§2): fp32 disables the fp16 synthesis layers; fp16 keeps them. The
+    # synthesis layers and custom CUDA ops have only fp16 / fp32 paths, so bf16 is
+    # refused rather than silently trained as fp16.
+    if opts.precision == 'bf16':
+        raise click.ClickException('--precision bf16 is not supported by san (its synthesis layers '
+                                   'run fp16 or fp32 only); use fp16 or fp32')
     c.precision = opts.precision
     c.allow_tf32 = opts.tf32
     c.cudnn_benchmark = opts.bench
@@ -321,6 +331,9 @@ def build_config(opts):
             conv_kernel=1 if opts.cfg == 'stylegan3-r' else 3,
             use_radial_filters=True if opts.cfg == 'stylegan3-r' else False,
         )
+        if opts.precision == 'fp32':  # the replaced G_kwargs dropped these
+            c.G_kwargs.num_fp16_res = 0
+            c.G_kwargs.conv_clamp = None
 
         # Loss
         c.loss_kwargs.pl_weight = 0.0

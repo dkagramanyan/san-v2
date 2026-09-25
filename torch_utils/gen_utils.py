@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 import dnnlib
+from torch_utils import misc
 
 # ----------------------------------------------------------------------------
 
@@ -403,8 +404,7 @@ def z_to_img(G, latents: torch.Tensor, label: torch.Tensor, truncation_psi: floa
     if len(latents.shape) == 1:
         latents = latents.unsqueeze(0)  # An individual latent => [1, G.z_dim]
     img = G(z=latents, c=label, truncation_psi=truncation_psi, noise_mode=noise_mode)
-    img = (img + 1) * 255 / 2  # [-1.0, 1.0] -> [0.0, 255.0]
-    img = img.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8).cpu().numpy()  # NCWH => NWHC
+    img = misc.denorm_to_uint8(img).permute(0, 2, 3, 1).cpu().numpy()  # [-1, 1] -> uint8 (§5); NCWH => NWHC
     return img
 
 
@@ -418,9 +418,10 @@ def w_to_img(G, dlatents: Union[List[torch.Tensor], torch.Tensor], noise_mode: s
         dlatents = dlatents.unsqueeze(0)  # An individual dlatent => [1, G.mapping.num_ws, G.mapping.w_dim]
 
     synth_image = G.synthesis(dlatents, noise_mode=noise_mode)
-    synth_image = (synth_image + 1) * 255/2  # [-1.0, 1.0] -> [0.0, 255.0]
     if to_np:
-        synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8).cpu().numpy()  # NCWH => NWHC
+        synth_image = misc.denorm_to_uint8(synth_image).permute(0, 2, 3, 1).cpu().numpy()  # [-1, 1] -> uint8 (§5); NCWH => NWHC
+    else:
+        synth_image = (synth_image + 1) * 255/2  # [-1.0, 1.0] -> [0.0, 255.0]
     return synth_image
 
 

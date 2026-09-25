@@ -120,7 +120,7 @@ def compile_custom_ops():
         return False
 
 
-def test_bias_act_correctness() -> Dict[str, bool]:
+def check_bias_act_correctness() -> Dict[str, bool]:
     """Test bias_act CUDA kernel correctness against reference implementation."""
     print("\n" + "-" * 50)
     print("Testing bias_act correctness...")
@@ -180,7 +180,7 @@ def test_bias_act_correctness() -> Dict[str, bool]:
     return results
 
 
-def test_upfirdn2d_correctness() -> Dict[str, bool]:
+def check_upfirdn2d_correctness() -> Dict[str, bool]:
     """Test upfirdn2d CUDA kernel correctness against reference implementation."""
     print("\n" + "-" * 50)
     print("Testing upfirdn2d correctness...")
@@ -242,7 +242,7 @@ def test_upfirdn2d_correctness() -> Dict[str, bool]:
     return results
 
 
-def test_filtered_lrelu_correctness() -> Dict[str, bool]:
+def check_filtered_lrelu_correctness() -> Dict[str, bool]:
     """Test filtered_lrelu CUDA kernel correctness against reference implementation."""
     print("\n" + "-" * 50)
     print("Testing filtered_lrelu correctness...")
@@ -296,6 +296,39 @@ def test_filtered_lrelu_correctness() -> Dict[str, bool]:
             print(f"  {test_name}: ✗ ERROR - {e}")
     
     return results
+
+
+if __name__ != "__main__":
+    @pytest.fixture(scope="module", autouse=True)
+    def _plugins_built():
+        # A plugin that cannot build makes impl='cuda' fall back to the reference
+        # path, so the comparisons below would pass against themselves: skip instead.
+        try:
+            for op in (upfirdn2d, bias_act, filtered_lrelu):
+                op._init()
+        except Exception as e:  # noqa: BLE001
+            pytest.skip(f"custom CUDA plugins could not be built: {e}")
+
+
+def _assert_all_passed(results: Dict[str, bool]):
+    failed = [name for name, ok in results.items() if not ok]
+    assert results and not failed, f"failed: {failed}"
+
+
+def test_bias_act_correctness():
+    _assert_all_passed(check_bias_act_correctness())
+
+
+def test_upfirdn2d_correctness():
+    _assert_all_passed(check_upfirdn2d_correctness())
+
+
+def test_filtered_lrelu_correctness():
+    _assert_all_passed(check_filtered_lrelu_correctness())
+
+
+def test_gradient_correctness():
+    _assert_all_passed(check_gradient_correctness())
 
 
 def benchmark_custom_ops():
@@ -375,7 +408,7 @@ def benchmark_custom_ops():
         print(f"  ✓ CUDA implementation is {speedup:.1f}x faster")
 
 
-def test_gradient_correctness():
+def check_gradient_correctness():
     """Test that gradients flow correctly through custom ops."""
     print("\n" + "-" * 50)
     print("Testing gradient correctness...")
@@ -464,10 +497,10 @@ def main():
     
     all_results = {}
     
-    all_results.update(test_bias_act_correctness())
-    all_results.update(test_upfirdn2d_correctness())
-    all_results.update(test_filtered_lrelu_correctness())
-    all_results.update(test_gradient_correctness())
+    all_results.update(check_bias_act_correctness())
+    all_results.update(check_upfirdn2d_correctness())
+    all_results.update(check_filtered_lrelu_correctness())
+    all_results.update(check_gradient_correctness())
     
     # Run performance benchmarks
     benchmark_custom_ops()

@@ -788,6 +788,8 @@ class SuperresGenerator(torch.nn.Module):
         up_factor,
         conv_kernel,
         use_radial_filters,
+        num_fp16_res = None,    # FP16 for the N highest resolutions of the head; None = the stem's (0 = --precision fp32).
+        conv_clamp = 256,       # Clamp of the head layers, None = disable clamping (--precision fp32).
         **synthesis_kwargs,
     ):
         assert up_factor in [2, 4, 8, 16], "Supported up_factors: [2, 4, 8, 16]"
@@ -812,7 +814,7 @@ class SuperresGenerator(torch.nn.Module):
         self.margin_size = G_stem.synthesis.margin_size
         self.last_stopband_rel = G_stem.synthesis.last_stopband_rel
         self.num_critical = G_stem.synthesis.num_critical
-        self.num_fp16_res = G_stem.synthesis.num_fp16_res
+        self.num_fp16_res = G_stem.synthesis.num_fp16_res if num_fp16_res is None else num_fp16_res
         self.conv_kernel = conv_kernel
         self.use_radial_filters = use_radial_filters
 
@@ -822,6 +824,12 @@ class SuperresGenerator(torch.nn.Module):
                 delattr(self.synthesis, name)
                 self.synthesis.layer_names.pop()
         stem_len = len(self.synthesis.layer_names) + 1
+
+        # --precision fp32 (num_fp16_res=0) also runs the reused stem layers in fp32.
+        if num_fp16_res == 0:
+            for name in self.synthesis.layer_names:
+                getattr(self.synthesis, name).use_fp16 = False
+                getattr(self.synthesis, name).conv_clamp = conv_clamp
 
         # update G and G.synthesis params
         self.img_resolution = G_stem.img_resolution * up_factor
@@ -852,7 +860,7 @@ class SuperresGenerator(torch.nn.Module):
                 in_sampling_rate=int(fparams.sampling_rates[prev]), out_sampling_rate=int(fparams.sampling_rates[idx]),
                 in_cutoff=fparams.cutoffs[prev], out_cutoff=fparams.cutoffs[idx],
                 in_half_width=fparams.half_widths[prev], out_half_width=fparams.half_widths[idx],
-                conv_kernel=self.conv_kernel, use_radial_filters=self.use_radial_filters,
+                conv_kernel=self.conv_kernel, use_radial_filters=self.use_radial_filters, conv_clamp=conv_clamp,
             )
             name = f'L{idx+stem_len}_{layer.out_size[0]}_{layer.out_channels}'
             setattr(self.synthesis, name, layer)

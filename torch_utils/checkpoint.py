@@ -18,11 +18,16 @@ import re
 import torch
 
 import dnnlib
+from torch_utils import persistence
 
 #----------------------------------------------------------------------------
 
 CHECKPOINT_FORMAT = 'san_inference_state_dict'
 CHECKPOINT_VERSION = 1
+
+# What snapshots up to v0.5.0 stored as ``class_name``: the persistence wrapper's own
+# path, which is not importable. Such blobs are rebuilt via _legacy_class_name().
+_DECORATOR_CLASS_NAME = 'torch_utils.persistence.persistent_class.<locals>.Decorator'
 
 #----------------------------------------------------------------------------
 
@@ -34,16 +39,29 @@ def _module_blob(module):
     instance, so the module can be rebuilt from current code and re-filled with
     the stored weights.
     """
+    cls = type(module)
+    if persistence.is_persistent(cls):
+        cls = cls.__mro__[1]  # the decorated class, not the local ``Decorator`` wrapper
     return dict(
-        class_name=f'{type(module).__module__}.{type(module).__qualname__}',
+        class_name=f'{cls.__module__}.{cls.__qualname__}',
         init_args=list(module.init_args),
         init_kwargs=dict(module.init_kwargs),
         state_dict={k: v.detach().cpu() for k, v in module.state_dict().items()},
     )
 
+def _legacy_class_name(blob):
+    # Snapshots written before the fix hold only the wrapper's name. Every G the
+    # launch scripts train (--cfg stylegan3-*) is one of these two; the kwargs tell
+    # them apart, and the strict state-dict load below rejects a wrong guess.
+    cls = 'SuperresGenerator' if 'path_stem' in blob['init_kwargs'] else 'Generator'
+    return f'training.networks_stylegan3_resetting.{cls}'
+
 def _rebuild_module(blob, device):
+    class_name = blob['class_name']
+    if class_name == _DECORATOR_CLASS_NAME:
+        class_name = _legacy_class_name(blob)
     module = dnnlib.util.construct_class_by_name(
-        *blob['init_args'], class_name=blob['class_name'], **blob['init_kwargs'])
+        *blob['init_args'], class_name=class_name, **blob['init_kwargs'])
     module.load_state_dict(blob['state_dict'], strict=True)
     return module.to(device).eval().requires_grad_(False)
 

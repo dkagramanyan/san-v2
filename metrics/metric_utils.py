@@ -28,7 +28,7 @@ import contextlib
 from pg_modules.projector import F_RandomProj
 from pathlib import Path
 import dill
-from torch_utils import gen_utils
+from torch_utils import gen_utils, misc
 
 #----------------------------------------------------------------------------
 
@@ -331,7 +331,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
             w = gen_utils.get_w_from_seed(G, batch_gen, opts.device, **opts.G_kwargs)
             img = G.synthesis(w)
 
-            img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+            img = misc.denorm_to_uint8(img)  # the one denorm (§5)
             images.append(img)
         images = torch.cat(images)
         if images.shape[1] == 1:

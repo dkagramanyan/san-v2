@@ -330,12 +330,10 @@ def _build_label_metadata(arch_fnames, class_names_per_img, int_labels_per_img):
         return {'labels': labels, 'class_names': class_names}
 
     if has_int_labels:
-        missing = [f for f, x in zip(arch_fnames, int_labels_per_img) if x is None]
-        if missing:
-            error(f'{len(missing)} image(s) have no label (e.g. {missing[0]}).')
-        labels = [[f, int(x)] for f, x in zip(arch_fnames, int_labels_per_img)]
-        class_names = [str(i) for i in range(max(x for _, x in labels) + 1)]
-        return {'labels': labels, 'class_names': class_names}
+        # Bare integers carry no class identity, and inventing names ('0', '1', ...)
+        # would stamp a guess into every downstream artifact (§5, Rule 2).
+        error('the source has integer labels but no class names; lay the images out '
+              'in one subfolder per class so the names travel with the archive (§5).')
 
     # No class information anywhere -> unconditional dataset.
     return {'labels': None}

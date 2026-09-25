@@ -5,6 +5,43 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **Inference snapshots could not be loaded.** `_module_blob` stored the class of a
+  persistence-decorated module as `torch_utils.persistence.persistent_class.<locals>.Decorator`,
+  so every `load_generator` (gen_images, calc_metrics, the `--path-stem` stage-2
+  warm start) failed with `ModuleNotFoundError`. The snapshot now stores the
+  decorated class (`training.networks_stylegan3_resetting.Generator` /
+  `SuperresGenerator`); snapshots already written with the wrapper name still load
+  (the class is recovered from the stored kwargs). New `tests/test_checkpoint.py`
+  round-trips a Generator, a SuperresGenerator built on it, and a legacy snapshot.
+- **`--precision bf16` silently trained fp16.** The synthesis layers and custom CUDA
+  ops only have fp16 / fp32 paths, so bf16 is now refused at the CLI. `--superres`
+  replaced `G_kwargs` wholesale and dropped the fp32 settings; `--precision fp32` now
+  reaches `SuperresGenerator` (new `num_fp16_res` / `conv_clamp` arguments, defaults
+  unchanged) and also runs the reused stem layers in fp32.
+- **gen_images truncated when converting to uint8** (`(x+1)*255/2` then `.to(uint8)`)
+  while training and eval round to nearest. One shared `misc.denorm_to_uint8`
+  (`rint((x+1)*127.5)`, clamped) is now used by the training loop, `gen_utils`
+  (`z_to_img` / `w_to_img`) and the legacy `metric_utils` generator path.
+- **A rank failing to generate its eval shard (e.g. OOM) hung the others** in combra's
+  gathers. Generation is now agreed across ranks with `all_ranks_ok` before
+  `gather_generated`. Each eval batch is converted to uint8 on the GPU and moved to
+  the CPU as it is generated instead of keeping the whole shard on the GPU as fp32
+  (~63 GB per rank at 1024 px).
+- **The startup combra smoke test did not fail fast**: a strict failure was printed
+  and training went on. It now raises on every rank together.
+- **`--cond True` accepted a zip without `class_names`** in `dataset.json`, writing
+  snapshots with no class names (§5); it is now refused. `san-prepare-data` no longer
+  invents class names `['0', '1', ...]` for integer-labelled sources (cifar10 /
+  mnist); it refuses them and asks for one subfolder per class.
+- **`tests/test_cuda_ops.py` never asserted** (its tests returned dicts) and passed
+  against the reference fallback when the plugins could not build. The tests now
+  assert every case and skip when the plugins cannot build.
+- **`sh/train_*.sh` passed `PATH_STEM` through as given.** The stem path is stored in
+  every snapshot of the stage and re-read on each load, so a relative path broke
+  loading from any other directory. The scripts now make it absolute (and fail
+  early if it does not exist).
+
 ## [0.5.0] — 2026-09-25
 
 ### Changed
