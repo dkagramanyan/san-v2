@@ -117,17 +117,17 @@ Build one zip per stage of the progressive recipe (16² → 1024²):
 for res in 16x16 32x32 64x64 128x128 256x256 512x512 1024x1024; do
   python dataset_tool.py convert \
     --source=<folder of the 1080 original crops> \
-    --dest=./datasets/imagenet_9to4_orig_${res}.zip \
+    --dest=./datasets/imagenet_9to4_1024x1024_${res}.zip \
     --resolution=${res}
 done
 ```
 
-**Training data = the 1080 original crops.** Each `imagenet_9to4_orig_<r>x<r>.zip`
+**Training data = the 1080 original crops.** Each `imagenet_9to4_1024x1024_<r>x<r>.zip`
 holds 1080 unique WC-Co crops, 360 per class, with `class_names`
 `['Ultra_Co25', 'Ultra_Co11', 'Ultra_Co6_2']` in `dataset.json`. One epoch is 1080
-images. The older `imagenet_9to4_1024x1024_<r>x<r>.zip` sets stored every crop in all
+images. Before v0.7.0, the zips of the same name stored every crop in all
 8 dihedral orientations (8640 images); those orientations now come from `--augment`
-at train time instead of from the zip. The shipped `orig` zips were derived from those
+at train time instead of from the zip. The current zips were derived from those
 older zips: each consecutive block of 8 entries is one crop in its 8 orientations
 (verified pixel-wise), and the first entry of every block — the unrotated, unflipped
 original — was copied byte-for-byte with its label and the same `class_names`.
@@ -146,12 +146,12 @@ stage has finished — a running stage still replaces its best snapshots.
 ```bash
 # Stage 0 — 16x16 stem (no superres)
 python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
-        --data=./datasets/imagenet_9to4_orig_16x16.zip \
+        --data=./datasets/imagenet_9to4_1024x1024_16x16.zip \
         --gpus=2 --snap 500 --batch-gpu 320 --kimg 20000 --syn-layers 6
 
 # Stage N — superres, warm-starting from the previous stage's snapshot
 python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
-        --data=./datasets/imagenet_9to4_orig_32x32.zip \
+        --data=./datasets/imagenet_9to4_1024x1024_32x32.zip \
         --gpus=2 --snap 100 --batch-gpu 96 --kimg 20000 --syn-layers 6 \
         --superres True --up-factor 2 --head-layers 7 \
         --path-stem ./runs/wc-cv_h200/00000-stylegan3-r-gpus2-batch640/san-snapshot-<best-FID kimg>-inference.pt
