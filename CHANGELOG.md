@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-25
+
 ### Changed
 - **combra pin `v0.15.3` → `v0.17.1`.** No change to training, eval, sampling or
   checkpoints: every combra call this repo makes keeps its signature and values
