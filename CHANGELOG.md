@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.7.3] — 2026-09-25
+
 ### Fixed
 - **`in_embeddings/tf_efficientnet_lite0.pkl` is tracked again.** Every generator
   build and snapshot load reads it (`MappingNetwork`), but it was deleted with the
