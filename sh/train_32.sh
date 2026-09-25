@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# san -- train at 1024x1024.
+# san -- train at 32x32.
 #
-# Workstation:  bash sh/train_1024.sh    (DATA=<zip> GPUS=<n> ... to override)
-# SLURM:        sbatch --account=<proj> --partition=<part> --nodes=1 --gpus=2 --cpus-per-task=8 --time=3-0:0 sh/train_1024.sh
+# Workstation:  bash sh/train_32.sh    (DATA=<zip> GPUS=<n> ... to override)
+# SLURM:        sbatch --account=<proj> --partition=<part> --nodes=1 --gpus=2 --cpus-per-task=8 --time=3-0:0 sh/train_32.sh
 #
 # Defaults target the production allocation: 2x H200 (sm_90), 8 CPUs, fixed seed 42.
 #
@@ -71,12 +71,12 @@ fi
 san-train \
     --outdir "${OUTDIR:-./runs}" \
     --cfg "${CFG:-stylegan3-r}" \
-    --data "${DATA:-./datasets/imagenet_9to4_1024x1024_1024x1024.zip}" \
+    --data "${DATA:-./datasets/imagenet_9to4_1024x1024_32x32.zip}" \
     --gpus "${GPUS:-2}" \
-    --batch-gpu "${BATCH_GPU:-14}" \
+    --batch-gpu "${BATCH_GPU:-96}" \
     --cond True --syn-layers "${SYN_LAYERS:-6}" \
     --precision "${PRECISION:-fp16}" \
-    --kimg "${KIMG:-20000}" --tick "${TICK:-1}" --snap "${SNAP:-100}" --snapshot-keep-last "${KEEP_LAST:-1}" \
+    --kimg "${KIMG:-20000}" --tick "${TICK:-4}" --snap "${SNAP:-100}" --snapshot-keep-last "${KEEP_LAST:-1}" \
     --combra-metrics True --num-fid-samples "${NUM_FID_SAMPLES:-10000}" \
     --seed "${SEED:-42}" --workers "${WORKERS:-3}" \
     ${STEM_ARGS[@]+"${STEM_ARGS[@]}"} \

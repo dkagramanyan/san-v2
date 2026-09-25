@@ -544,8 +544,7 @@ def training_loop(
     kimg_per_tick           = 4,        # Progress snapshot interval.
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
-    snapshot_keep_last      = 3,        # How many inference snapshots to keep (0 = keep all).
-    mirror                  = False,    # Stochastic per-item horizontal flip in the training loader (§5).
+    snapshot_keep_last      = 1,        # How many newest inference snapshots to keep on top of the best-per-metric ones (0 = keep all).
     combra_metrics          = True,     # Compute combra generative-quality metrics each snapshot tick.
     combra_num_gen          = 10000,    # Number of fakes for the combra metrics (0 disables eval).
     combra_ref_count        = None,     # Cap the combra reference to a seeded random subset.
@@ -781,6 +780,7 @@ def training_loop(
     stats_collector = training_stats.Collector(regex='.*', keep_previous=False)
     stats_metrics = dict()
     best_fid = float('inf')   # running best combra FID -> Metrics/combra_fid_best
+    best_snaps = {}           # rank 0: metric -> (value, snapshot path); never pruned
     stats_jsonl = None
     stats_tfevents = None
     if rank == 0:
@@ -901,12 +901,6 @@ def training_loop(
         with torch.autograd.profiler.record_function('data_fetch'):
             phase_real_img, phase_real_c = next(training_set_iterator)
             phase_real_img = phase_real_img.to(device).to(torch.float32)
-            # --mirror (§5): stochastic per-item horizontal flip, in the TRAINING loader
-            # only. The eval / combra-reference / grid loaders read the dataset directly
-            # and never flip, and the dataset is never flip-doubled.
-            if mirror:
-                flip = torch.rand([phase_real_img.shape[0], 1, 1, 1], device=device) < 0.5
-                phase_real_img = torch.where(flip, phase_real_img.flip(-1), phase_real_img)
             phase_real_img = (phase_real_img / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
@@ -1071,8 +1065,8 @@ def training_loop(
 
         # Save network snapshot (§3): EMA-only weights as a `.pt` state dict, written
         # atomically every snapshot tick AND always at the last tick, so the newest
-        # snapshot IS the final model. No resume/best/full checkpoints exist. History
-        # is pruned to --snapshot-keep-last.
+        # snapshot IS the final model. No resume/full checkpoints exist. History is
+        # pruned after this snapshot's combra eval below, so its metrics count first.
         did_snapshot = (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0)
         if did_snapshot:
             # DDP weight-consistency check before saving so silently diverged ranks
@@ -1090,7 +1084,6 @@ def training_loop(
                 snap_path = os.path.join(run_dir, f'san-snapshot-{cur_nimg//1000:06d}-inference.pt')
                 checkpoint.save_inference_snapshot(snap_path, G_ema, metadata)
                 print(f'Saved {os.path.basename(snap_path)}', flush=True)
-                checkpoint.prune_snapshots(run_dir, snapshot_keep_last)
 
         # combra in-memory generative-quality metrics (optional dependency), scored
         # over the reference vs combra_num_gen fakes. Both the image-feature extraction
@@ -1146,6 +1139,18 @@ def training_loop(
                     stats_metrics['combra_fid_best'] = best_fid
                 print('Metrics: ' + '  '.join(
                     f'{k} {v:.4f}' for k, v in stats_metrics.items()), flush=True)
+
+        # Snapshot retention: the --snapshot-keep-last newest snapshots plus the best one
+        # by each of checkpoint.BEST_METRICS (lower is better, nan ignored). The eval
+        # above scored the snapshot saved at this same cur_nimg, so it competes for
+        # "best" before anything is pruned. At most keep_last + 3 files remain.
+        if did_snapshot and rank == 0:
+            checkpoint.update_best_snapshots(best_snaps, snap_path, stats_metrics)
+            checkpoint.prune_snapshots(run_dir, snapshot_keep_last,
+                                       keep=[p for _, p in best_snaps.values()])
+            if best_snaps:
+                print('Best snapshots: ' + '  '.join(
+                    f'{k} {v:.4f} {os.path.basename(p)}' for k, (v, p) in best_snaps.items()), flush=True)
 
         # Collect statistics.
         for phase in phases:

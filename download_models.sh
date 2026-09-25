@@ -52,8 +52,8 @@ fetch "https://github.com/mseitzer/pytorch-fid/releases/download/fid_weights/pt_
 echo; echo "[3/4] CLIP ViT-L-14-336 'openai' (combra cmmd) -> $CLIP_DIR"
 fetch "https://openaipublic.azureedge.net/clip/models/3035c92b350959924f9f00213499208652fc7ea050643e8b385c2dac08641f02/ViT-L-14-336px.pt" "$CLIP_DIR/ViT-L-14-336px.pt"
 
-echo; echo "[4/4] DINOv2 dinov2_vitb14 (combra fd_dinov2) -> $HUB_DIR"
-fetch "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth" "$HUB_CKPT/dinov2_vitb14_pretrain.pth"
+echo; echo "[4/4] DINOv2 dinov2_vitl14 (combra fd_dinov2) -> $HUB_DIR"
+fetch "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth" "$HUB_CKPT/dinov2_vitl14_pretrain.pth"
 # torch.hub also needs the dinov2 model code (it normally fetches the repo itself).
 if [[ -d "$HUB_DIR/facebookresearch_dinov2_main" ]]; then
     echo "  exists: facebookresearch_dinov2_main/"

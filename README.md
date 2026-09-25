@@ -14,7 +14,8 @@ evaluation is wired into [combra](https://github.com/dkagramanyan/combra).
 
 The guide below walks through **install → test → train → generate**. On the cluster
 the training and generation steps run through the launch scripts in [`sh/`](sh/)
-(`sbatch --account=<proj> --partition=<part> --gpus=2 sh/train_256.sh`); the same
+(`sbatch --account=<proj> --partition=<part> --gpus=2 sh/train_16.sh`, then each
+higher stage with `PATH_STEM`); the same
 scripts run unmodified on a workstation.
 
 
@@ -125,22 +126,25 @@ done
 ## 4. Training
 
 Training is **progressive**: the 16² stem trains from scratch, and every higher
-resolution is a super-resolution stage that warm-starts its frozen stem from the
-previous stage's newest inference snapshot via `--path-stem` (weights only — there
-is no resume; see [Checkpoints](#checkpoints)).
+resolution is a super-resolution stage that warm-starts its frozen stem from one of
+the previous stage's kept inference snapshots via `--path-stem` (weights only — there
+is no resume; see [Checkpoints](#checkpoints)). Use the previous stage's **best-FID**
+snapshot: its name is on the last `Best snapshots:` line of that run's log
+(`combra_fid <value> san-snapshot-<kimg>-inference.pt`). Pick it once the previous
+stage has finished — a running stage still replaces its best snapshots.
 
 ```bash
 # Stage 0 — 16x16 stem (no superres)
 python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
         --data=./datasets/imagenet_9to4_1024x1024_16x16.zip \
-        --gpus=2 --mirror False --snap 500 --batch-gpu 320 --kimg 20000 --syn-layers 6
+        --gpus=2 --snap 500 --batch-gpu 320 --kimg 20000 --syn-layers 6
 
 # Stage N — superres, warm-starting from the previous stage's snapshot
 python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
         --data=./datasets/imagenet_9to4_1024x1024_32x32.zip \
-        --gpus=2 --mirror False --snap 100 --batch-gpu 96 --kimg 20000 --syn-layers 6 \
+        --gpus=2 --snap 100 --batch-gpu 96 --kimg 20000 --syn-layers 6 \
         --superres True --up-factor 2 --head-layers 7 \
-        --path-stem ./runs/wc-cv_h200/00000-stylegan3-r-gpus2-batch640/san-snapshot-020000-inference.pt
+        --path-stem ./runs/wc-cv_h200/00000-stylegan3-r-gpus2-batch640/san-snapshot-<best-FID kimg>-inference.pt
 ```
 
 Per-stage tuned settings (resolution → per-GPU batch on 2× H200; `--batch-gpu` is
@@ -158,39 +162,25 @@ per GPU, so total batch = `batch-gpu × gpus`):
 
 ### Launching (workstation or SLURM)
 
-[`sh/`](sh/) holds one script per resolution and task — `train_{256,512,1024}.sh` and
-`generate_{256,512,1024}.sh`. Each contains only the compute-node environment (conda
+[`sh/`](sh/) holds one script per resolution and task — `train_{16,32,64,128,256,512,1024}.sh`
+(one per stage of the progressive recipe above, defaulting to its `--batch-gpu` from the
+table, `--syn-layers 6`, `--head-layers 7`) and `generate_{256,512,1024}.sh`. Each contains only the compute-node environment (conda
 env `san-v2`, `CUDA_HOME=$CONDA_PREFIX` for the JIT ops, `TORCH_CUDA_ARCH_LIST` from the
 GPUs present, the offline-hub flags) and one `san-train` / `san-gen-images` call whose
 knobs are env vars with defaults; anything after the script name is appended.
 
 ```bash
-bash sh/train_256.sh                                      # workstation, defaults
-sbatch --account=<proj> --partition=<part> --gpus=2 sh/train_256.sh   # cluster
-# superres stage on top of the previous resolution's newest snapshot:
-PATH_STEM=./runs/00000-stylegan3-r-gpus2-batch64/san-snapshot-020000-inference.pt \
-    bash sh/train_512.sh
+bash sh/train_16.sh                                       # stage 0 (16x16 stem), workstation
+sbatch --account=<proj> --partition=<part> --gpus=2 sh/train_16.sh    # cluster
+# every higher stage: superres on top of the previous stage's best-FID snapshot
+# (the combra_fid entry of the last "Best snapshots:" line in that run's log):
+PATH_STEM=./runs/00000-stylegan3-r-gpus2-batch640/san-snapshot-<best-FID kimg>-inference.pt \
+    bash sh/train_32.sh
 DATA=./datasets/my.zip KIMG=200 SNAP=2 bash sh/train_256.sh   # smoke run
 ```
 
 No account, partition or node names live in the scripts — SLURM specifics are supplied
 on the `sbatch` line.
-
-### Hydra entry point
-
-The same runs can be launched through [Hydra](https://hydra.cc) — `train_hydra.py`
-shares `train.py`'s `build_config()`, so checkpoints and resume are interchangeable:
-
-```bash
-python train_hydra.py outdir=./runs cfg=stylegan3-r cond=true \
-        data=./datasets/imagenet_9to4_1024x1024_16x16.zip gpus=2 batch_gpu=320
-```
-
-The click CLI is the single source of truth for defaults, so
-[`configs/config.yaml`](configs/config.yaml) only declares the required fields
-(`outdir`/`cfg`/`data`/`gpus`/`batch_gpu`); override any other `train.py` flag on the
-command line using its Python name (e.g. `syn_layers=6`, `superres=true`).
-
 
 ## 5. Generating samples
 
@@ -242,9 +232,16 @@ optimizer state, no pickled modules, so loading never depends on `timm`.
 
 - Written every `--snap` ticks **and always at the last tick**, so the newest snapshot
   is the final model; the write is atomic (temp file + `os.replace`).
-- History is pruned to `--snapshot-keep-last` (default 3; `0` keeps all). Pick the best
-  checkpoint post-hoc from `stats.jsonl` (`Metrics/combra_fid` per kimg) — there is no
-  `best_model.*`.
+- **Retention.** After each snapshot's combra eval (same `cur_nimg`), the run keeps the
+  `--snapshot-keep-last` newest snapshots (default 1; `0` keeps all) **plus** the single
+  best snapshot by each of `combra_fid`, `combra_fd_dinov2` and `combra_cmmd` (lower is
+  better; `nan` never counts; one file can be best for several metrics). Best snapshots
+  are never pruned, so a default run holds at most 4 files. Each snapshot tick logs one
+  line naming them:
+  `Best snapshots: combra_fid <v> san-snapshot-…  combra_fd_dinov2 <v> …  combra_cmmd <v> …`.
+  Without combra metrics only the newest snapshots are kept. There is no `best_model.*`.
+- A superres snapshot re-reads its `--path-stem` file whenever it is loaded, so keep the
+  stem snapshot each stage was started from.
 - **There is no resume.** A run goes launch → `--kimg` → stop; size `--kimg` (or split
   stages) to fit the job's walltime. `--path-stem <snapshot>` is a weights-only warm
   start of the frozen lower-resolution stem, not a resume.
@@ -255,27 +252,62 @@ optimizer state, no pickled modules, so loading never depends on `timm`.
 
 This repository is a fork of Sony's
 [StyleSAN-XL](https://github.com/sony/san/tree/main/stylesan-xl) (which builds on
-StyleGAN-XL → StyleGAN3 + Projected GAN). The **SAN training objective, optimizer
-settings, and weight initialization are unchanged from upstream** — the changes here
-are engineering / infrastructure improvements:
+StyleGAN-XL → StyleGAN3 + Projected GAN). The SAN objective, the learning rates and Adam
+betas, and weight initialization are upstream's. Every
+difference is listed below, tagged **[improvement]** (deliberate speed or engineering
+gain, same results), **[contract]** (the shared model-repo API: checkpoints, logging,
+evaluation) or **[adaptation]** (a choice made for the WC-Co dataset or hardware).
 
-- **H200 kernel optimization** — a batched-matmul (BMM) path for 1×1 modulated
-  convolutions in the generator (`training/networks_stylegan3_resetting.py`).
-- **Fused Adam** for both G and D optimizers (`train.py`, `fused=True`).
-- **CUDA-kernel warmup** that JIT-compiles all kernel configurations before the loop
-  starts to avoid mid-training stalls (`training/training_loop.py:warmup_cuda_kernels`).
-- **Distributed image generation with HDF5 output** in `gen_images.py`.
-- **Dynamic per-GPU metric batch sizing** and NCCL all-gather based metric collection.
-- **Unified, opt-in debug/timing instrumentation** across the training stack
-  (`--debug`), writing to `<run_dir>/debug.txt` (no hardcoded paths).
-- **EMA-only inference snapshots** (`san-snapshot-<kimg:06d>-inference.pt`, atomic,
-  pruned to `--snapshot-keep-last`) as the single checkpoint kind — no resume state, no
-  discriminator, so loading never needs `timm`.
-- **CWD-independent ImageNet embedding loading** — the `in_embeddings/*.pkl` path is
-  resolved relative to the repo root and overridable via the `SAN_EMBED` env var.
-- **ImageNet 1024×1024 progressive-superres recipe** (the training commands above).
-- **combra training-evaluation integration** — optional per-snapshot scoring of
-  generated samples with `combra.metrics.compute_all_metrics`, logged to TensorBoard as
-  `Metrics/combra_*`. Toggled by `--combra-metrics` (default `true`), **independent of
-  `--metrics`**; warns at startup if enabled but combra is not installed (see the combra
-  `san_v2` docs).
+Generator / discriminator code:
+
+- **[improvement]** BMM path for 1×1 modulated convolutions in the generator
+  (`training/networks_stylegan3_resetting.py`) — a batched matmul instead of the
+  grouped convolution, faster on H200.
+- **[improvement]** `SuperresGenerator` takes `num_fp16_res` / `conv_clamp`, so the
+  superres head follows `--precision` (fp32 disables its fp16 layers and clamping).
+- **[improvement]** `pg_modules/discriminator.py` refactored; the SAN layers share one
+  `_san_dual_path` helper (`pg_modules/san_modules.py`). Outputs are identical to
+  upstream's.
+- **[improvement]** Renames for current `timm` (`>=1.0`) in the projected
+  discriminator's backbone builder.
+- **[improvement]** The ImageNet class-embedding path (`in_embeddings/*.pkl`) is
+  resolved from the repo root and can be overridden with `SAN_EMBED`, so the run no
+  longer depends on the working directory.
+
+Training loop:
+
+- **[improvement]** Fused Adam for both the G and D optimizers (`fused=True`).
+- **[improvement]** TF32 matmul / cuDNN enabled by default (`--tf32`, default on).
+- **[improvement]** `warmup_cuda_kernels` JIT-compiles every custom-op configuration
+  before the loop, so training does not stall mid-run; debug/timing instrumentation,
+  off by default (`training_loop(debug=True)`; no CLI flag), written to
+  `<run_dir>/debug.txt`.
+- **[contract]** `--precision bf16` is refused: the synthesis layers and custom ops have
+  only fp16 / fp32 paths.
+- **[contract]** The class count comes from the dataset's `class_names`
+  (`dataset.json`), not from the label array; `--cond True` refuses a zip without them.
+- **[contract]** Checkpoints are EMA-only `.pt` state dicts
+  (`san-snapshot-<kimg>-inference.pt`), loaded with `checkpoint.load_generator`. No
+  resume, no `--restart_every`, no `best_model.pkl`; snapshots are pruned to the newest
+  plus the best by FID / FD-DINOv2 / CMMD ([Checkpoints](#checkpoints)).
+- **[contract]** combra evaluation each snapshot tick (`--combra-metrics`, independent
+  of `--metrics`), logged per the shared spec: `stats.jsonl` + one TensorBoard event
+  file, step = `cur_nimg`, `Metrics/combra_*` keys.
+- **[adaptation]** Classifier guidance is off (`--cls-weight 0`): the guidance
+  classifier is an ImageNet model, whose logits mean nothing for three WC-Co classes.
+- **[adaptation]** No horizontal-flip data augmentation (upstream's `--mirror` is
+  gone). Flips inside the DiffAugment / ADA pipelines are untouched.
+- **[adaptation]** Total batch sizes 640 / 192 / 240 / 128 / 84 / 50 / 28 for
+  16² … 1024² on 2× H200 (upstream's FFHQ recipe: 2048 at 16² down to 128), and
+  `--kimg 20000` for every stage.
+
+Removed:
+
+- **[contract]** `training/networks_stylegan3.py`, `legacy.py`, the Hydra entry
+  point and the visualizer GUI. Snapshots are rebuilt from current code, so the legacy
+  pickle loader has no use.
+
+Tooling:
+
+- **[improvement]** Distributed image generation with HDF5 output (`gen_images.py`),
+  dynamic per-GPU metric batch sizes and NCCL all-gather metric collection.

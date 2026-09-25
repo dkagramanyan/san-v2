@@ -5,7 +5,69 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-25
+
+### Changed
+- **`sh/train_*.sh` follow the progressive recipe the README documents again.** The
+  scripts written in the v2 migration (2881fd6) trained 256² from scratch with the
+  default `--syn-layers 14` and per-GPU batches 32/16/8. They had dropped the
+  per-stage `sbatch/` recipe without giving a reason. That recipe is the README's
+  §4 table, and it matches the structure of upstream StyleSAN-XL / StyleGAN-XL
+  (a 16² stem, then ×2 superres stages).
+  - New `train_{16,32,64,128}.sh`. `train_16.sh` trains the stem from scratch;
+    every higher stage takes `PATH_STEM` (still optional, as before).
+  - Every script passes `--syn-layers ${SYN_LAYERS:-6}`, which matters only for the
+    stem.
+  - Per-GPU batch defaults follow the README table: 320/96/120/64/42/25/14 for
+    16…1024. That gives total batches of 640/192/240/128/84/50/28 on 2 GPUs.
+  - `--snap 500` for the stem. `--tick 1` for 128² and up, as the old per-stage
+    scripts had, so a 3-day job that walltime kills still leaves a snapshot every
+    100 kimg rather than every 400.
+  - No Python changed by this item. `--kimg 20000`, `--head-layers 7` and
+    `--cls-weight 0` are unchanged (for `--mirror` and snapshot retention see the
+    entries below).
+  - Learning rates were already upstream's: G 0.0025, D 0.002, Adam betas
+    (0, 0.99). Upstream does not scale them with batch size. It scales only the
+    G EMA half-life (`ema_kimg = batch·10/32`) and `magnitude_ema_beta`, and so
+    does this fork. The logged `LearningRate/G` 0.002 and `LearningRate/D` ≈0.00188
+    come from upstream's lazy-regularization factor `interval/(interval+1)`.
+- **Snapshot retention keeps the best snapshot per metric.** The run keeps the
+  `--snapshot-keep-last` newest snapshots (default now 1, was 3 in `train.py` /
+  `training_loop`) plus the single best by each of `combra_fid`, `combra_fd_dinov2`
+  and `combra_cmmd` (lower is better, `nan` ignored, one file may serve several
+  roles). Best snapshots are never pruned, so a default run holds at most 4 files.
+  - Pruning moved from right after the save to after that snapshot's combra eval at
+    the same `cur_nimg`, so the new snapshot competes for "best" before anything is
+    deleted. Previously the loop pruned before scoring.
+  - Each snapshot tick logs one line,
+    `Best snapshots: combra_fid <v> <file>  combra_fd_dinov2 <v> <file>  combra_cmmd <v> <file>`.
+  - New `checkpoint.update_best_snapshots` / `BEST_METRICS`; `prune_snapshots` takes
+    a `keep` list of protected paths. New `tests/test_snapshot_retention.py`.
+  - `sh/train_*.sh` keep `--snapshot-keep-last ${KEEP_LAST:-1}`, and their comments
+    and the README now point `PATH_STEM` at the previous stage's best-FID snapshot
+    (from the last `Best snapshots:` line) instead of its newest one.
+- **combra pinned to v0.18.0** (was v0.17.1). Its FD-DINOv2 uses `dinov2_vitl14`, so
+  `download_models.sh` now prefetches `dinov2_vitl14_pretrain.pth` (was
+  `dinov2_vitb14`). Runs scored with 0.17.1 are not comparable on
+  `combra_fd_dinov2`.
+- **README "Differences from the original Sony StyleSAN-XL" rewritten** to list every
+  difference from upstream, each tagged improvement / contract / adaptation. The
+  stale "Hydra entry point" section is gone (`train_hydra.py` and `configs/` were
+  deleted in 2881fd6). The README no longer claims a `--debug` flag, which
+  `train.py` never had.
+
+### Removed
+- **Horizontal-flip data augmentation.** `--mirror` is gone from `train.py` and
+  `calc_metrics.py` (where it was already a no-op), along with the training-loader
+  flip in `training_loop`, `--mirror False` in `sh/train_*.sh`, and the README
+  commands. `tests/test_smoke.py` now asserts the flag is absent. Flips inside
+  DiffAugment / ADA (`training/augment.py`) and the `flip_filter` / `flip_weight`
+  arguments of the custom ops are unrelated and unchanged.
+
 ### Fixed
+- **`calc_metrics.py` crashed on every metric.** `metrics/metric_main.py` passed
+  `xflip=False` to the dataset, whose constructor no longer takes it, so every metric
+  raised `TypeError`. The argument is removed.
 - **Inference snapshots could not be loaded.** `_module_blob` stored the class of a
   persistence-decorated module as `torch_utils.persistence.persistent_class.<locals>.Decorator`,
   so every `load_generator` (gen_images, calc_metrics, the `--path-stem` stage-2

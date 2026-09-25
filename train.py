@@ -36,7 +36,6 @@ def _print_options(c):
     print(f'Dataset size:        {c.training_set_kwargs.max_size} images')
     print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
     print(f'Dataset labels:      {c.training_set_kwargs.use_labels}')
-    print(f'Mirror augment:      {c.mirror}')
     print()
 
 def _startup_header(num_gpus):
@@ -149,7 +148,6 @@ def init_dataset_kwargs(data):
 
 # Optional features.
 @click.option('--cond',         help='Train conditional model', metavar='BOOL',                 type=bool, default=False, show_default=True)
-@click.option('--mirror',       help='Stochastic per-item horizontal flip in the training loader', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--freezed',      help='Freeze first layers of D', metavar='INT',                 type=click.IntRange(min=0), default=0, show_default=True)
 
 # Misc hyperparameters.
@@ -164,7 +162,7 @@ def init_dataset_kwargs(data):
 @click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=25000, show_default=True)
 @click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=4, show_default=True)
 @click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
-@click.option('--snapshot-keep-last', help='How many inference snapshots to keep (0 = keep all)', metavar='INT', type=click.IntRange(min=0), default=3, show_default=True)
+@click.option('--snapshot-keep-last', help='How many newest inference snapshots to keep; the best by combra_fid / combra_fd_dinov2 / combra_cmmd are always kept too (0 = keep all)', metavar='INT', type=click.IntRange(min=0), default=1, show_default=True)
 @click.option('--combra-metrics', help='Compute combra generative-quality metrics each snapshot tick', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--num-fid-samples', help='Number of fakes for the combra metrics (0 disables eval)', metavar='INT', type=click.IntRange(min=0), default=10000, show_default=True)
 @click.option('--combra-ref-count', help='Cap the combra reference to a seeded random subset (0 = whole set)', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
@@ -229,7 +227,6 @@ def build_config(opts):
     c.kimg_per_tick = opts.tick
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
     c.snapshot_keep_last = opts.snapshot_keep_last
-    c.mirror = opts.mirror
     c.combra_metrics = opts.combra_metrics
     c.combra_num_gen = opts.num_fid_samples
     c.combra_ref_count = opts.combra_ref_count or None  # 0 = whole reference set

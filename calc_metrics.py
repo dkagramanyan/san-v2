@@ -87,12 +87,11 @@ def parse_comma_separated_list(s):
 @click.option('network_pkl', '--network', help='Network pickle filename or URL', metavar='PATH', required=True)
 @click.option('--metrics', help='Quality metrics', metavar='[NAME|A,B,C|none]', type=parse_comma_separated_list, default='fid50k_full', show_default=True)
 @click.option('--data', help='Dataset to evaluate against  [default: look up]', metavar='[ZIP|DIR]')
-@click.option('--mirror', help='Enable dataset x-flips  [default: look up]', type=bool, metavar='BOOL')
 @click.option('--gpus', help='Number of GPUs to use', type=int, default=1, metavar='INT', show_default=True)
 @click.option('--verbose', help='Print optional information', type=bool, default=True, metavar='BOOL', show_default=True)
 @click.option('--truncation', help='Truncation', type=float, default=1.0, show_default=True)
 @click.option('--centroids-path', type=str, help='Pass path to precomputed centroids to enable multimodal truncation')
-def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose, truncation, centroids_path):
+def calc_metrics(ctx, network_pkl, metrics, data, gpus, verbose, truncation, centroids_path):
     """Calculate quality metrics for previous training run or pretrained network pickle.
 
     Examples:
@@ -148,8 +147,7 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose, truncat
     else:
         ctx.fail('Could not look up dataset options; please specify --data')
 
-    # Finalize dataset options. Datasets are never flip-doubled (§5), so --mirror has
-    # no effect on evaluation and is accepted only for backward CLI compatibility.
+    # Finalize dataset options.
     args.dataset_kwargs.resolution = args.G.img_resolution
     args.dataset_kwargs.use_labels = (args.G.c_dim != 0)
 

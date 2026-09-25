@@ -19,12 +19,12 @@ def test_train_cli_contract():
     from train import main
     out = _help(main)
     for flag in ["--precision", "--tf32", "--bench", "--snapshot-keep-last",
-                 "--num-fid-samples", "--combra-ref-count", "--mirror",
+                 "--num-fid-samples", "--combra-ref-count",
                  "--path-stem", "--up-factor", "--syn-layers"]:
         assert flag in out, f"missing {flag} in san-train --help"
     # Removed flags must be gone.
     for flag in ["--resume", "--metrics", "--fp32", "--nobench",
-                 "--save-inference-only", "--restart_every"]:
+                 "--save-inference-only", "--restart_every", "--mirror"]:
         assert flag not in out, f"{flag} should have been removed from san-train"
 
 

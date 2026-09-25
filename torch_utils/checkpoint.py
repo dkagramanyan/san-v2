@@ -12,6 +12,7 @@
 # under its final name is always complete.
 
 import glob
+import math
 import os
 import re
 
@@ -114,14 +115,34 @@ def read_metadata(path):
 
 #----------------------------------------------------------------------------
 
-def prune_snapshots(run_dir, keep_last):
-    """Keep only the ``keep_last`` newest ``san-snapshot-<kimg>-inference.pt``.
+# Metrics whose best snapshot is retained (lower is better for all three).
+BEST_METRICS = ('combra_fid', 'combra_fd_dinov2', 'combra_cmmd')
 
-    ``keep_last == 0`` keeps everything. Pruning runs after the newest snapshot
-    is safely on disk, so the retained history is always complete.
+def update_best_snapshots(best, snap_path, metrics):
+    """Record ``snap_path`` as the best snapshot for every metric it improves.
+
+    ``best`` maps metric name -> ``(value, path)`` and is updated in place. Lower is
+    better; a missing or non-finite value never counts. On a tie the earlier snapshot
+    stays best.
+    """
+    for name in BEST_METRICS:
+        value = metrics.get(name)
+        if value is None or not math.isfinite(value):
+            continue
+        if name not in best or value < best[name][0]:
+            best[name] = (float(value), snap_path)
+    return best
+
+def prune_snapshots(run_dir, keep_last, keep=()):
+    """Keep the ``keep_last`` newest ``san-snapshot-<kimg>-inference.pt`` plus ``keep``.
+
+    ``keep`` lists snapshot paths that are never removed (the best snapshot per
+    metric). ``keep_last == 0`` keeps everything. Pruning runs after the newest
+    snapshot is safely on disk, so the retained history is always complete.
     """
     if keep_last is None or keep_last <= 0:
         return
+    protected = {os.path.abspath(p) for p in keep}
     pat = re.compile(r'san-snapshot-(\d+)-inference\.pt$')
     snaps = []
     for p in glob.glob(os.path.join(run_dir, 'san-snapshot-*-inference.pt')):
@@ -130,6 +151,8 @@ def prune_snapshots(run_dir, keep_last):
             snaps.append((int(m.group(1)), p))
     snaps.sort()  # ascending kimg; newest last
     for _, p in snaps[:-keep_last]:
+        if os.path.abspath(p) in protected:
+            continue
         try:
             os.remove(p)
         except OSError:
