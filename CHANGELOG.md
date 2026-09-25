@@ -5,6 +5,35 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **The startup smoke test no longer aborts 16² and 64² runs.** It called combra's
+  `self_test(images=<first 4 training images>, image_metrics=True, strict=True)`:
+  at 16² those 4 images yield no vertex angles ("reference angle density is empty"),
+  and at 64² the bimodal fit on 4 images is degenerate (non-finite mu/sigma/pi), so
+  `train_16.sh` and `train_64.sh` stopped before the first tick and blocked the
+  whole progressive chain. It now probes the backends on combra's synthetic grains
+  (`self_test(image_metrics=True, strict=True, device=device)`); the rank agreement
+  around it is unchanged.
+- **An eval tick that aborts inside `_combra_eval_distributed` is now logged.** When
+  a rank's generation or feature/angle extraction failed, rank 0 printed
+  `Evaluating combra metrics...` and then neither a `Metrics:` nor a failure line.
+  Rank 0 now prints `combra metrics failed: <reason>` (spec §7).
+- **Non-zero ranks no longer print progress (spec §7).** `loaded imagenet
+  embeddings ...`, `initialized embeddings with random weights`, `Reinitialize
+  stem` and `Reinitialize mapping` print on rank 0 only; the debug-only `[TIMING]`
+  lines in `loss.py` are dropped (the same timings still reach the opt-in debug
+  log).
+- **The rank-0 `.log` no longer carries `Phase <name> accumulate_gradients` /
+  `all_reduce` lines every 20 batches.** They go through the training loop's
+  debug log (off unless `debug=True`), so the log keeps to the §7 format.
+
+### Changed
+- **combra pinned to v0.19.1** (was v0.19.0): `distributed_metrics` returns `nan`
+  angle keys instead of raising when the reference angle density is empty (the
+  16² reference has no angles), so 16² runs still log `combra_fid` /
+  `combra_fd_dinov2` / `combra_cmmd` and select best snapshots by them (`nan` angle
+  keys are skipped, as before).
+
 ## [0.7.2] — 2026-09-25
 
 ### Fixed

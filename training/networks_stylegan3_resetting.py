@@ -64,6 +64,10 @@ def _debug_log(location, message, data=None):
         pass
 # #endregion
 
+def _is_rank0():
+    """True outside DDP and on rank 0: only rank 0 prints progress (spec §7)."""
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
 #----------------------------------------------------------------------------
 
 @misc.profiled_function
@@ -231,10 +235,12 @@ class MappingNetwork(torch.nn.Module):
             'SAN_EMBED', os.path.join(_repo_root, 'in_embeddings', 'tf_efficientnet_lite0.pkl'))
         with open(embed_path, 'rb') as f:
             self.embed = pickle.Unpickler(f).load()['embed']
-        print(f'loaded imagenet embeddings from {embed_path}: {self.embed}')
+        if _is_rank0():
+            print(f'loaded imagenet embeddings from {embed_path}: {self.embed}')
         if rand_embedding:
             self.embed.__init__(num_embeddings=self.embed.num_embeddings, embedding_dim=self.embed.embedding_dim)
-            print('initialized embeddings with random weights')
+            if _is_rank0():
+                print('initialized embeddings with random weights')
 
         # Construct layers.
         self.embed_proj = FullyConnectedLayer(self.embed.embedding_dim, self.z_dim, activation='lrelu') if self.c_dim > 0 else None
@@ -868,7 +874,8 @@ class SuperresGenerator(torch.nn.Module):
             self.head_layer_names.append(name)
 
     def reinit_stem(self):
-        print("Reinitialize stem")
+        if _is_rank0():
+            print("Reinitialize stem")
         G_stem = checkpoint.load_generator(self.path_stem)
 
         # cut off critically sampled layers
@@ -887,7 +894,8 @@ class SuperresGenerator(torch.nn.Module):
         misc.copy_params_and_buffers(G_stem.mapping, self.mapping)
 
     def reinit_mapping(self):
-        print("Reinitialize mapping")
+        if _is_rank0():
+            print("Reinitialize mapping")
         self.mapping = self.new_mapping
 
     def compute_superres_filterparams(self, up_factor, img_resolution, last_stem_layer, head_layers, num_critical=2):

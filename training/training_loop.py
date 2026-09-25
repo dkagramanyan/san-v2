@@ -470,10 +470,17 @@ def _combra_eval_distributed(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, d
     except Exception as e:  # noqa: BLE001 -- agreed across ranks below
         ok = False
         print(f'[combra][rank {rank}] eval generation failed: {e}', flush=True)
+    # Rank 0 names each abort, so an eval tick never ends without a Metrics: or a
+    # `combra metrics failed:` line (§7); the failing rank printed its own error.
     if not all_ranks_ok(ok, device, num_gpus):
+        if rank == 0:
+            print('combra metrics failed: eval generation failed on a rank', flush=True)
         return None
     gen_feats, gen_angles = gather_generated(local_u8, device, rank, num_gpus)
-    if rank != 0 or gen_angles is None:  # None: some rank's extraction failed
+    if rank != 0:
+        return None
+    if gen_angles is None:  # None: some rank's extraction failed
+        print('combra metrics failed: feature/angle extraction failed on a rank', flush=True)
         return None
     # device= so the CMMD reduction runs where the features were extracted.
     return distributed_metrics(combra_ref, gen_angles, gen_feats, device=device)
@@ -751,16 +758,17 @@ def training_loop(
         # self_test() this used to call defaults to image_metrics=False, so it never
         # touched InceptionV3 / CLIP / DINOv2 and a missing CLIP download surfaced only
         # as a whole run logging nan for combra_fid / combra_cmmd / combra_fd_dinov2.
-        # images= scores the real reference slice, not synthetic grains. Rank 0 runs
-        # it; every rank (the gate above is rank-uniform) agrees on the outcome and
-        # raises together, so no rank is left waiting in a later collective.
+        # It probes the backends on combra's synthetic grains, not on training images:
+        # at 16^2 a 4-image slice yields no vertex angles and at 64^2 the bimodal fit
+        # on 4 images is degenerate, so strict=True aborted every low-res run. Rank 0
+        # runs it; every rank (the gate above is rank-uniform) agrees on the outcome
+        # and raises together, so no rank is left waiting in a later collective.
         from combra.metrics.distributed import all_ranks_ok
         self_test_ok = True
         if rank == 0:
             try:
                 from combra.metrics import self_test
-                sample = np.stack([training_set[i][0] for i in range(min(4, len(training_set)))])
-                self_test(images=sample, device=device, image_metrics=True, strict=True)
+                self_test(image_metrics=True, strict=True, device=device)
             except Exception as e:  # noqa: BLE001 -- agreed across ranks below
                 self_test_ok = False
                 print(f'[combra] smoke test failed: {e}', flush=True)
@@ -971,7 +979,7 @@ def training_loop(
                 loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
             phase.module.requires_grad_(False)
             if rank == 0 and batch_idx % 20 == 0:
-                 print(f'Phase {phase.name} accumulate_gradients: {time.time() - t_start_accum:.4f}s', flush=True)
+                 _debug_log("training_loop", f"Phase {phase.name} accumulate_gradients: {time.time() - t_start_accum:.4f}s")
 
             # Update weights.
             with torch.autograd.profiler.record_function(phase.name + '_opt'):
@@ -982,7 +990,7 @@ def training_loop(
                         t_start_reduce = time.time()
                         torch.distributed.all_reduce(flat)
                         if rank == 0 and batch_idx % 20 == 0:
-                            print(f'Phase {phase.name} all_reduce: {time.time() - t_start_reduce:.4f}s', flush=True)
+                            _debug_log("training_loop", f"Phase {phase.name} all_reduce: {time.time() - t_start_reduce:.4f}s")
                         flat /= num_gpus
                     misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
                     grads = flat.split([param.numel() for param in params])

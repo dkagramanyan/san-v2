@@ -122,7 +122,6 @@ class ProjectedGANLoss(Loss):
         _phase_start = time.time()
         _print_timing = _loss_call_count <= 10  # Print timing for first 10 calls
         if _print_timing:
-            print(f'[TIMING] loss.accumulate_gradients phase={phase} call={_loss_call_count} START', flush=True)
             _debug_log("loss.py:accumulate_gradients", f"Phase {phase} started", {
                 "phase": phase,
                 "call_count": _loss_call_count,
@@ -161,7 +160,6 @@ class ProjectedGANLoss(Loss):
                     torch.cuda.synchronize()  # Sync for accurate timing
                 _run_g_time = time.time() - _run_g_start
                 if _print_timing:
-                    print(f'[TIMING] Gmain run_G: {_run_g_time:.3f}s gen_img_shape={list(gen_img.shape)}', flush=True)
                     _debug_log("loss.py:accumulate_gradients", "Gmain run_G complete", {
                         "call_count": _loss_call_count,
                         "run_g_sec": _run_g_time,
@@ -175,7 +173,6 @@ class ProjectedGANLoss(Loss):
                     torch.cuda.synchronize()
                 _run_d_time = time.time() - _run_d_start
                 if _print_timing:
-                    print(f'[TIMING] Gmain run_D: {_run_d_time:.3f}s', flush=True)
                     _debug_log("loss.py:accumulate_gradients", "Gmain run_D complete", {
                         "call_count": _loss_call_count,
                         "run_d_sec": _run_d_time
@@ -204,7 +201,11 @@ class ProjectedGANLoss(Loss):
                 _gmain_bwd_time = time.time() - _gmain_bwd_start
                 _phase_total = time.time() - _phase_start
                 if _print_timing:
-                    print(f'[TIMING] Gmain backward: {_gmain_bwd_time:.3f}s PHASE_TOTAL={_phase_total:.3f}s', flush=True)
+                    _debug_log("loss.py:accumulate_gradients", "Gmain backward complete", {
+                        "call_count": _loss_call_count,
+                        "backward_sec": _gmain_bwd_time,
+                        "phase_total_sec": _phase_total
+                    }, "N")
                 # #endregion
 
         # Gpl: Apply path length regularization.
@@ -240,7 +241,6 @@ class ProjectedGANLoss(Loss):
                     torch.cuda.synchronize()
                 _dgen_g_time = time.time() - _dgen_g_start
                 if _print_timing:
-                    print(f'[TIMING] Dmain run_G: {_dgen_g_time:.3f}s', flush=True)
                     _debug_log("loss.py:accumulate_gradients", "Dmain run_G complete", {
                         "call_count": _loss_call_count,
                         "run_g_sec": _dgen_g_time,
@@ -254,7 +254,6 @@ class ProjectedGANLoss(Loss):
                     torch.cuda.synchronize()
                 _dgen_d_time = time.time() - _dgen_d_start
                 if _print_timing:
-                    print(f'[TIMING] Dmain run_D(gen): {_dgen_d_time:.3f}s', flush=True)
                     _debug_log("loss.py:accumulate_gradients", "Dmain run_D (gen) complete", {
                         "call_count": _loss_call_count,
                         "run_d_sec": _dgen_d_time
@@ -280,7 +279,6 @@ class ProjectedGANLoss(Loss):
                 # #region agent log
                 _dgen_bwd_time = time.time() - _dgen_bwd_start
                 if _print_timing:
-                    print(f'[TIMING] Dmain Dgen backward: {_dgen_bwd_time:.3f}s', flush=True)
                     _debug_log("loss.py:accumulate_gradients", "Dmain Dgen backward complete", {
                         "call_count": _loss_call_count,
                         "backward_sec": _dgen_bwd_time
@@ -302,7 +300,6 @@ class ProjectedGANLoss(Loss):
                     torch.cuda.synchronize()
                 _dreal_time = time.time() - _dreal_start
                 if _print_timing:
-                    print(f'[TIMING] Dmain run_D(real): {_dreal_time:.3f}s', flush=True)
                     _debug_log("loss.py:accumulate_gradients", "Dmain run_D (real) complete", {
                         "call_count": _loss_call_count,
                         "run_d_real_sec": _dreal_time
@@ -329,7 +326,6 @@ class ProjectedGANLoss(Loss):
                 _dreal_bwd_time = time.time() - _dreal_bwd_start
                 _phase_total = time.time() - _phase_start
                 if _print_timing:
-                    print(f'[TIMING] Dmain Dreal backward: {_dreal_bwd_time:.3f}s PHASE_TOTAL={_phase_total:.3f}s', flush=True)
                     _debug_log("loss.py:accumulate_gradients", "Dmain Dreal backward complete", {
                         "call_count": _loss_call_count,
                         "backward_sec": _dreal_bwd_time,

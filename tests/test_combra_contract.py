@@ -113,3 +113,19 @@ def test_precompute_reference_accepts_dihedral():
     from combra.metrics.distributed import precompute_reference
 
     assert "dihedral" in inspect.signature(precompute_reference).parameters
+
+
+def test_startup_smoke_test_uses_synthetic_grains():
+    # The startup self_test must probe the backends on combra's synthetic grains:
+    # with images=<4 training images> it found no angles at 16^2 and a degenerate
+    # bimodal fit at 64^2, so strict=True aborted every low-res run before tick 0.
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "training/training_loop.py"
+    calls = [n for n in ast.walk(ast.parse(src.read_text()))
+             if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "self_test"]
+    assert len(calls) == 1
+    kwargs = {k.arg: k.value for k in calls[0].keywords}
+    assert "images" not in kwargs and not calls[0].args
+    assert kwargs["strict"].value is True and kwargs["image_metrics"].value is True
