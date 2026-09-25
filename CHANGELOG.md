@@ -5,6 +5,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-09-25
+
+### Fixed
+- **`download_models.sh` now caches the CLIP weights where open_clip reads them.** It
+  fetched `ViT-L-14-336px.pt` into `$MODEL_CACHE/clip`, but open_clip (3.x, with
+  `huggingface_hub` installed -- one of its dependencies) loads the `openai` tag of
+  `ViT-L-14-336-quickgelu` from the HF repo `timm/vit_large_patch14_clip_336.openai`
+  and never looks there, so an offline CMMD still missed its weights. The script now
+  lays `open_clip_model.safetensors` out in the HuggingFace hub cache
+  (`$MODEL_CACHE/huggingface/hub/models--timm--vit_large_patch14_clip_336.openai`,
+  pinned revision, still wget/curl only). With `MODEL_CACHE` set, run the jobs with
+  `TORCH_HOME=$MODEL_CACHE/torch HF_HOME=$MODEL_CACHE/huggingface`.
+
 ## [0.7.1] — 2026-09-25
 
 ### Changed

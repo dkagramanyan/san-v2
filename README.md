@@ -101,8 +101,9 @@ bash download_models.sh        # pure wget/curl/git, no Python
 ```
 
 `download_models.sh` downloads each weight file straight into the caches the libraries
-read (`$HOME/.cache/torch/hub/checkpoints`, `$HOME/.cache/clip`, …) — override the root
-with `MODEL_CACHE=/shared/path` to land them on a shared filesystem. (A Python-driven
+read (`$HOME/.cache/torch/hub/checkpoints`, `$HOME/.cache/huggingface/hub`, …) — override
+the root with `MODEL_CACHE=/shared/path` to land them on a shared filesystem, and run the jobs
+with `TORCH_HOME=$MODEL_CACHE/torch HF_HOME=$MODEL_CACHE/huggingface`. (A Python-driven
 equivalent that always resolves the correct URLs is `python tests/test_san_modules.py`,
 for when you have a working interpreter.)
 
