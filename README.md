@@ -193,10 +193,13 @@ only. This is separate from DiffAugment inside the discriminator, which is uncha
 table, `--syn-layers 6`, `--head-layers 7`) and `generate_{256,512,1024}.sh`. Each contains only the compute-node environment (conda
 env `san-v2`, `CUDA_HOME=$CONDA_PREFIX` for the JIT ops, `TORCH_CUDA_ARCH_LIST` from the
 GPUs present, the offline-hub flags) and one `san-train` / `san-gen-images` call whose
-knobs are env vars with defaults; anything after the script name is appended.
+knobs are env vars with defaults; anything after the script name is appended. In a train
+script every setting sits in the block at its top: edit the block, or override one value
+for a single launch with an env var.
 
 ```bash
-bash sh/train_16.sh                                       # stage 0 (16x16 stem), workstation
+bash sh/train_16.sh                                       # stage 0 (16x16 stem), workstation: detaches
+FOREGROUND=1 bash sh/train_16.sh                          # workstation, stays attached
 sbatch --account=<proj> --partition=<part> --gpus=2 sh/train_16.sh    # cluster
 # every higher stage: superres on top of the previous stage's best-FID snapshot
 # (the combra_fid entry of the last "Best snapshots:" line in that run's log):
@@ -204,6 +207,14 @@ PATH_STEM=./runs/00000-stylegan3-r-gpus2-batch640/san-snapshot-<best-FID kimg>-i
     bash sh/train_32.sh
 DATA=./datasets/my.zip KIMG=200 SNAP=2 bash sh/train_256.sh   # smoke run
 ```
+
+On a workstation a train script re-launches itself in its own session and returns at
+once, so the run survives closing the terminal. Everything it prints goes to
+`logs/san-train_<res>-<date>-<time>.log`, with a `.pid` file beside it: follow the run with
+`tail -f <log>`, stop it (every rank) with `kill -- -<pid>`. `FOREGROUND=1` and SLURM jobs
+stay attached and copy the output to the same log. The log opens with a `Run settings:`
+block — every setting, the git commit, host, date, `CUDA_VISIBLE_DEVICES` and the full
+command.
 
 No account, partition or node names live in the scripts — SLURM specifics are supplied
 on the `sbatch` line.
