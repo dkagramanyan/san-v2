@@ -102,3 +102,14 @@ def test_write_hparams_accepts_step():
     from combra.io import write_hparams
 
     assert "step" in inspect.signature(write_hparams).parameters
+
+
+@requires_combra
+def test_precompute_reference_accepts_dihedral():
+    # --augment passes dihedral= so the reference covers all 8 dihedral transforms
+    # (combra >= 0.19.0); an older combra raises TypeError and the metrics disappear.
+    import inspect
+
+    from combra.metrics.distributed import precompute_reference
+
+    assert "dihedral" in inspect.signature(precompute_reference).parameters

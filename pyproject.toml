@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "san-v2"
-version = "0.6.0"
+version = "0.7.0"
 description = "StyleSAN-XL fork: Slicing Adversarial Network (SAN) training framework (StyleGAN3 + Projected Discriminator)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -52,7 +52,7 @@ dev = ["pytest>=7.0", "ruff>=0.4"]
 # Local development is unaffected -- the model envs carry an editable install of
 # combra that shadows this URL; the pin governs fresh installs (cluster, CI).
 # Bump it deliberately when you want combra's newer behaviour.
-combra = ["combra[metrics] @ git+https://github.com/dkagramanyan/combra.git@v0.18.0"]
+combra = ["combra[metrics] @ git+https://github.com/dkagramanyan/combra.git@v0.19.0"]
 
 [project.scripts]
 san-train = "train:main"

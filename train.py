@@ -36,6 +36,7 @@ def _print_options(c):
     print(f'Dataset size:        {c.training_set_kwargs.max_size} images')
     print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
     print(f'Dataset labels:      {c.training_set_kwargs.use_labels}')
+    print(f'Dihedral augment:    {c.augment}')
     print()
 
 def _startup_header(num_gpus):
@@ -148,6 +149,7 @@ def init_dataset_kwargs(data):
 
 # Optional features.
 @click.option('--cond',         help='Train conditional model', metavar='BOOL',                 type=bool, default=False, show_default=True)
+@click.option('--augment',      help='Random dihedral transform (rot90 x flip) per item in the training loader', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--freezed',      help='Freeze first layers of D', metavar='INT',                 type=click.IntRange(min=0), default=0, show_default=True)
 
 # Misc hyperparameters.
@@ -227,6 +229,7 @@ def build_config(opts):
     c.kimg_per_tick = opts.tick
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
     c.snapshot_keep_last = opts.snapshot_keep_last
+    c.augment = opts.augment
     c.combra_metrics = opts.combra_metrics
     c.combra_num_gen = opts.num_fid_samples
     c.combra_ref_count = opts.combra_ref_count or None  # 0 = whole reference set

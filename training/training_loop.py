@@ -398,12 +398,35 @@ def _combra_generate_local_shard(G_ema, grid_z, grid_c, batch_gpu, num_gpus, ran
     return torch.cat(images, dim=0).numpy()
 
 
-def _combra_precompute_reference(training_set, device, rank, num_gpus, ref_count=None, seed=0):
+def dihedral_augment(images, generator):
+    """--augment: one uniformly random dihedral transform per item of an NCHW batch.
+
+    Each item gets rot90 by k in {0,1,2,3} and, with probability 0.5, a horizontal flip
+    -- a uniform draw from the 8 elements of the square's symmetry group. The draw comes
+    from ``generator`` (CPU), so it is deterministic under the run's seeding. dtype,
+    shape and item order are preserved, so the batch labels stay aligned. Applied to the
+    raw uint8 reals of the TRAINING loader only; square images are required.
+    """
+    assert images.shape[-1] == images.shape[-2], 'dihedral augmentation needs square images'
+    codes = torch.randint(8, [images.shape[0]], generator=generator).to(images.device)
+    out = images.clone()
+    for code in range(1, 8):  # code 0 is the identity
+        sel = codes == code
+        if sel.any():
+            x = torch.rot90(images[sel], code % 4, dims=(-2, -1))
+            out[sel] = x.flip(-1) if code >= 4 else x
+    return out
+
+
+def _combra_precompute_reference(training_set, device, rank, num_gpus, ref_count=None, seed=0, dihedral=False):
     """This rank's slice of the real reference, extracted and gathered by combra.
 
     ref_count caps the reference to a SEEDED RANDOM subset (§6) -- never the first N:
     dataset zips are class-sorted, so a first-N slice is class-biased. The same seed on
     every rank selects the same subset, then it is sharded by rank stride.
+
+    dihedral=True (set from --augment) has combra expand each selected image to its 8
+    dihedral transforms, so the reference matches the distribution G is trained on.
 
     Returns ``(reference, ok)``; ``ok`` is rank-uniform, so the caller can gate the
     per-tick eval on it (``reference`` is None on every non-zero rank regardless).
@@ -428,7 +451,7 @@ def _combra_precompute_reference(training_set, device, rank, num_gpus, ref_count
         print(f'[combra][rank {rank}] reference load failed: {e}', flush=True)
     if not all_ranks_ok(ok, device, num_gpus):
         return None, False
-    return precompute_reference(local_u8, device, rank, num_gpus)
+    return precompute_reference(local_u8, device, rank, num_gpus, dihedral=dihedral)
 
 
 def _combra_eval_distributed(G_ema, grid_z, grid_c, batch_gpu, num_gpus, rank, device,
@@ -545,6 +568,7 @@ def training_loop(
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
     snapshot_keep_last      = 1,        # How many newest inference snapshots to keep on top of the best-per-metric ones (0 = keep all).
+    augment                 = True,     # Random dihedral transform per item in the training loader; the combra reference gets all 8.
     combra_metrics          = True,     # Compute combra generative-quality metrics each snapshot tick.
     combra_num_gen          = 10000,    # Number of fakes for the combra metrics (0 disables eval).
     combra_ref_count        = None,     # Cap the combra reference to a seeded random subset.
@@ -598,6 +622,8 @@ def training_loop(
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
     training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
+    # --augment draws its per-item transforms from a dedicated per-rank stream.
+    augment_gen = torch.Generator().manual_seed(random_seed * num_gpus + rank)
     if rank == 0:
         print(f"conv2d_gradfix.enabled: {conv2d_gradfix.enabled}")
         print(f"torch.backends.cudnn.benchmark: {torch.backends.cudnn.benchmark}")
@@ -759,7 +785,8 @@ def training_loop(
         # an unusable combra never breaks training.
         try:
             combra_ref, combra_ref_ok = _combra_precompute_reference(
-                training_set, device, rank, num_gpus, ref_count=combra_ref_count, seed=random_seed)
+                training_set, device, rank, num_gpus, ref_count=combra_ref_count, seed=random_seed,
+                dihedral=augment)
         except Exception as e:
             combra_ref_ok = False
             print(f'[combra][rank {rank}] reference precompute failed, disabling combra '
@@ -900,7 +927,13 @@ def training_loop(
 
         with torch.autograd.profiler.record_function('data_fetch'):
             phase_real_img, phase_real_c = next(training_set_iterator)
-            phase_real_img = phase_real_img.to(device).to(torch.float32)
+            phase_real_img = phase_real_img.to(device)
+            # --augment: random dihedral transform of the raw uint8 reals, in the
+            # TRAINING loader only. The eval / combra-reference / grid loaders read the
+            # dataset directly and never augment.
+            if augment:
+                phase_real_img = dihedral_augment(phase_real_img, augment_gen)
+            phase_real_img = phase_real_img.to(torch.float32)
             phase_real_img = (phase_real_img / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)

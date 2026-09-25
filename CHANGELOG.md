@@ -5,6 +5,30 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-25
+
+### Added
+- **`--augment` (default `True`): on-the-fly dihedral augmentation.** Each real image
+  in the TRAINING loader gets one uniformly random dihedral transform: `rot90` by
+  k ∈ {0,1,2,3} and a horizontal flip with probability 0.5. It is applied to the raw
+  uint8 batch before normalisation (`training_loop.dihedral_augment`), drawn from a
+  dedicated CPU generator seeded `seed·gpus + rank`. Square images are required. The
+  snapshot grid, the combra reference and the eval loaders never augment. This
+  brings back a training-data augmentation option after 0.6.0 removed `--mirror`.
+  DiffAugment / ADA inside the discriminator are unchanged.
+- The combra reference follows `--augment`: `precompute_reference(..., dihedral=augment)`
+  expands every reference image to its 8 dihedral transforms, so the metrics compare
+  against the distribution G is trained on. `--combra-ref-count` selects originals
+  before that expansion.
+
+### Changed
+- **Training data is the 1080 original crops** (360 per class) instead of 8640 images,
+  which were the same crops stored in all 8 dihedral orientations. The orientations now
+  come from `--augment`. `sh/train_{16,…,1024}.sh` default `DATA` to
+  `./datasets/imagenet_9to4_orig_<r>x<r>.zip` and leave `--augment` at its default.
+  An epoch is now 1080 images. Batch sizes, `--kimg` and `ema_kimg` are unchanged.
+- **combra pinned to v0.19.0** (was v0.18.0) for `precompute_reference(dihedral=)`.
+
 ## [0.6.0] — 2026-09-25
 
 ### Changed

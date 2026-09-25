@@ -71,7 +71,7 @@ fi
 san-train \
     --outdir "${OUTDIR:-./runs}" \
     --cfg "${CFG:-stylegan3-r}" \
-    --data "${DATA:-./datasets/imagenet_9to4_1024x1024_64x64.zip}" \
+    --data "${DATA:-./datasets/imagenet_9to4_orig_64x64.zip}" \
     --gpus "${GPUS:-2}" \
     --batch-gpu "${BATCH_GPU:-120}" \
     --cond True --syn-layers "${SYN_LAYERS:-6}" \

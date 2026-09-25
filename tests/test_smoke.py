@@ -19,7 +19,7 @@ def test_train_cli_contract():
     from train import main
     out = _help(main)
     for flag in ["--precision", "--tf32", "--bench", "--snapshot-keep-last",
-                 "--num-fid-samples", "--combra-ref-count",
+                 "--num-fid-samples", "--combra-ref-count", "--augment",
                  "--path-stem", "--up-factor", "--syn-layers"]:
         assert flag in out, f"missing {flag} in san-train --help"
     # Removed flags must be gone.
@@ -148,3 +148,10 @@ def test_one_denorm_rounds_to_nearest():
             return x.expand(1, 3, 1, 7)
     img = gen_utils.w_to_img(_G(), torch.zeros([1, 2, 4]))
     assert np.array_equal(img[0, :, :, 0], want[0, 0])
+
+
+def test_augment_defaults_on_and_can_be_disabled(tmp_path):
+    c, _ = _config(tmp_path)
+    assert c.augment is True
+    c, _ = _config(tmp_path, "--augment", "False")
+    assert c.augment is False
