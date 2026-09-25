@@ -6,6 +6,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Changed
+- **combra pin `v0.15.3` → `v0.17.1`.** No change to training, eval, sampling or
+  checkpoints: every combra call this repo makes keeps its signature and values
+  (the test suite passes against 0.17.1). combra's plots no longer display
+  themselves, so `compare_samplers` only writes its PNG. combra 0.17 stopped
+  installing matplotlib; `matplotlib` was already a direct dependency here.
+
 - **Training logs follow the unified style shared by the four model repos (§7).**
   - Every console / `<run>.log` line carries one `[YYYY-MM-DD HH:MM:SS]` prefix,
     stamped by `dnnlib.util.Logger`; `[Stage]` lines no longer embed their own.
