@@ -117,8 +117,10 @@ def _make_cspresnet(model):
 
 def _make_efficientnet(model):
     pretrained = nn.Module()
+    # timm >= 0.6 folds the stem activation into bn1 (BatchNormAct2d) and has no act1;
+    # the Identity keeps the math and the layer0 indices of the old act1 layout.
     pretrained.layer0 = nn.Sequential(
-        model.conv_stem, model.bn1, model.act1, *model.blocks[0:2]
+        model.conv_stem, model.bn1, nn.Identity(), *model.blocks[0:2]
     )
     pretrained.layer1 = nn.Sequential(*model.blocks[2:3])
     pretrained.layer2 = nn.Sequential(*model.blocks[3:5])

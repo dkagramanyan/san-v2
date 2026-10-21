@@ -245,8 +245,39 @@ manifest. `--gpus N` self-spawns one worker per GPU (no `torchrun`). On the clus
 
 ## Quality Metrics
 
-Score a trained snapshot with the StyleGAN-XL metric runners (build the matching
-dataset zip first, per [Data preparation](#3-data-preparation)):
+### During training (combra)
+
+Every snapshot tick (`--snap`) scores `--num-fid-samples` fakes against the training
+set (`--combra-ref-count` caps the reference) with combra (pinned to `v0.25.0` by the
+`combra` extra). The results are logged in three sections, with the same names in
+`stats.jsonl` (keys; non-finite → `null`) and TensorBoard (tags; non-finite skipped):
+
+| Section | Keys | What |
+|---|---|---|
+| `Metrics/` | `combra_fid`, `combra_cmmd`, `combra_fd_dinov2`, `combra_num_fid_samples`, `combra_fid_best` | image-feature metrics, independent of the angle method; the sample count; the running best FID |
+| `Metrics_v1/` | `combra_w1`, `combra_w2`, `combra_circular_w1`, `combra_circular_w2`, `combra_mu1`, `combra_mu2`, `combra_sigma1`, `combra_sigma2`, `combra_amp1`, `combra_amp2` | vertex-angle metrics, v1 = P0 angles; the bimodal fit has two amplitudes |
+| `Metrics_v2/` | `combra_w1`, `combra_w2`, `combra_circular_w1`, `combra_circular_w2`, `combra_mu1`, `combra_mu2`, `combra_sigma1`, `combra_sigma2`, `combra_pi` | vertex-angle metrics, v2 = P6 angles; the bimodal fit has one mass share (`pi`, mode 1) |
+
+e.g. `Metrics/combra_fid`, `Metrics_v1/combra_w1`, `Metrics_v2/combra_mu1`. combra's
+`load_fid_by_kimg` reads `Metrics/combra_fid` from `stats.jsonl`, and the best snapshots
+are kept by `combra_fid` / `combra_fd_dinov2` / `combra_cmmd`
+([Checkpoints](#checkpoints)). The run's `.log` gets one line per section:
+
+```
+Metrics: combra_fid <v>  combra_cmmd <v>  combra_fd_dinov2 <v>  combra_num_fid_samples <v>  combra_fid_best <v>
+Metrics v1: combra_w1 <v>  combra_w2 <v>  …  combra_amp2 <v>
+Metrics v2: combra_w1 <v>  combra_w2 <v>  …  combra_pi <v>
+```
+
+The `[startup]` line records the combra version, and combra's own warnings (e.g. why
+an angle or Gaussian key is `nan`) are written to the `.log` as `WARNING:combra.…:…`.
+
+### After training (legacy FID)
+
+`calc_metrics.py` (`san-eval`) is the legacy StyleGAN-XL metric runner, not combra: its
+FID / IS are computed by the vendored `metrics/` code and are not comparable with
+`Metrics/combra_fid`. Score a trained snapshot with it (build the matching dataset zip
+first, per [Data preparation](#3-data-preparation)):
 
 ```bash
 python calc_metrics.py --metrics=fid50k_full --network=<path_to_checkpoint>
@@ -329,7 +360,9 @@ Training loop:
   plus the best by FID / FD-DINOv2 / CMMD ([Checkpoints](#checkpoints)).
 - **[contract]** combra evaluation each snapshot tick (`--combra-metrics`, independent
   of `--metrics`), logged per the shared spec: `stats.jsonl` + one TensorBoard event
-  file, step = `cur_nimg`, `Metrics/combra_*` keys.
+  file, step = `cur_nimg`, `Metrics/combra_*` (image metrics) plus
+  `Metrics_v1/combra_*` and `Metrics_v2/combra_*` (angle metrics) keys
+  ([Quality Metrics](#quality-metrics)).
 - **[adaptation]** Classifier guidance is off (`--cls-weight 0`): the guidance
   classifier is an ImageNet model, whose logits mean nothing for three WC-Co classes.
 - **[adaptation]** Dihedral data augmentation instead of upstream's x-flip. Upstream's

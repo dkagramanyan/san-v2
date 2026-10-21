@@ -29,6 +29,7 @@ REQUIRED = [
     ("combra.metrics.distributed", "precompute_reference"),
     ("combra.metrics", "self_test"),
     ("combra.io", "write_hparams"),
+    ("combra", "__version__"),  # the [startup] line in train.py
 ]
 
 combra_installed = importlib.util.find_spec("combra") is not None
@@ -68,29 +69,64 @@ def test_combra_import_block_resolves():
     )
 
 
+# The keys combra >= 0.25 returns from distributed_metrics, which the loop logs as
+# combra_<key>: v1 (P0 angles) has two fitted amplitudes, v2 (P6 angles) one mass
+# share (pi); then the image metrics.
+WASS_KEYS = ("w1", "w2", "circular_w1", "circular_w2")
+V1_KEYS = (*WASS_KEYS, "mu1", "mu2", "sigma1", "sigma2", "amp1", "amp2")
+V2_KEYS = (*WASS_KEYS, "mu1", "mu2", "sigma1", "sigma2", "pi")
+EXPECTED_KEYS = ({f"v1_{k}" for k in V1_KEYS} | {f"v2_{k}" for k in V2_KEYS}
+                 | {"fid", "cmmd", "fd_dinov2"})
+
+
 @requires_combra
-def test_angle_metrics_run_on_pooled_angles():
-    # Not just importable -- callable, and returning the keys the loop logs.
+def test_distributed_metrics_returns_the_logged_keys():
+    # Not just importable -- callable on the reference / gathered shapes the loop
+    # hands it, and returning the keys the loop logs.
     import numpy as np
-    from combra.metrics import angle_density_metrics_from_pooled
+    from combra.metrics.distributed import distributed_metrics
 
     # The sample must be genuinely BIMODAL. These are WC-Co vertex angles -- a
     # convex mode and a reflex one -- and the gauss half of this metric fits two
-    # Gaussians to them. A single normal (which is what this fixture used to pass)
-    # leaves the second Gaussian with nothing to sit on, so combra reports the
-    # relative errors as nan rather than dividing by a phantom mode.
+    # Gaussians to them. A single normal leaves the second Gaussian with nothing to
+    # sit on, so combra reports the relative errors as nan rather than dividing by a
+    # phantom mode.
     rng = np.random.default_rng(0)
 
     def angles(mu1, sigma1, mu2, sigma2, n=4000, share=0.7):
         k = int(n * share)
         both = [rng.normal(mu1, sigma1, k), rng.normal(mu2, sigma2, n - k)]
-        return np.concatenate(both) % 360
+        return (np.concatenate(both) % 360).astype(np.float32)
 
-    out = angle_density_metrics_from_pooled(
-        angles(100, 20, 240, 25), angles(104, 21, 236, 26)
-    )
-    for key in ("w1", "w2", "circular_w1", "circular_w2", "mu1", "sigma1", "pi"):
+    def feats():
+        return {name: rng.normal(size=(16, 8)).astype(np.float32) for name in ("fid", "cmmd", "fd_dinov2")}
+
+    ref_angles = angles(100, 20, 240, 25)
+    gen_angles = angles(104, 21, 236, 26)
+    reference = {"angles": {"v1": ref_angles, "v2": ref_angles}, "feat": feats()}
+    out = distributed_metrics(reference, {"v1": gen_angles, "v2": gen_angles}, feats(), device="cpu")
+
+    assert set(out) == EXPECTED_KEYS
+    for key in EXPECTED_KEYS:
         assert np.isfinite(out[key]), f"{key} is not finite"
+
+
+@requires_combra
+def test_logged_keys_map_to_three_sections():
+    # combra_<key> -> Metrics/ (image metrics), Metrics_v1/ (ten), Metrics_v2/ (nine).
+    pytest.importorskip("torch")
+    from training.training_loop import metric_tag
+
+    tags = [metric_tag(f"combra_{key}") for key in EXPECTED_KEYS]
+    sections = {}
+    for tag in tags:
+        section, name = tag.split("/")
+        sections.setdefault(section, set()).add(name)
+    assert sections == {
+        "Metrics": {"combra_fid", "combra_cmmd", "combra_fd_dinov2"},
+        "Metrics_v1": {f"combra_{k}" for k in V1_KEYS},
+        "Metrics_v2": {f"combra_{k}" for k in V2_KEYS},
+    }
 
 
 @requires_combra
@@ -129,3 +165,17 @@ def test_startup_smoke_test_uses_synthetic_grains():
     kwargs = {k.arg: k.value for k in calls[0].keywords}
     assert "images" not in kwargs and not calls[0].args
     assert kwargs["strict"].value is True and kwargs["image_metrics"].value is True
+
+
+@requires_combra
+def test_startup_line_records_combra_version():
+    # The [startup] line names the combra version right after cuda (all four model
+    # repos), so a run killed before the end-of-run HPARAMS still records it.
+    pytest.importorskip("torch")
+    import combra
+
+    from train import _startup_header
+
+    parts = _startup_header(1).split(" | ")
+    assert parts[0].startswith("torch ") and parts[1].startswith("cuda ")
+    assert parts[2] == f"combra {combra.__version__}" and parts[3] == "gpus 1"

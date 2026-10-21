@@ -5,6 +5,62 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-22
+
+### Changed
+- **combra pinned to v0.25.0** (was v0.19.1). combra now extracts both angle
+  versions on every side — v1 = P0 angles (`min_segment_len` 5 by default), v2 = P6
+  angles — and `distributed_metrics` returns the angle keys per version next to the
+  unprefixed `fid` / `cmmd` / `fd_dinov2`: v1 has ten (`v1_w1`, `v1_w2`,
+  `v1_circular_w1`, `v1_circular_w2`, `v1_mu1`, `v1_mu2`, `v1_sigma1`, `v1_sigma2`,
+  `v1_amp1`, `v1_amp2`), v2 nine, with one mass share (`v2_pi`, fitted by
+  `combra.fitting.fit_bimodal_share`) in place of the two amplitudes. The unprefixed
+  `pi` key of v0.19.1 is gone.
+- **Metrics are logged in three sections, in every sink.** combra's `vN_<k>` becomes
+  `Metrics_vN/combra_<k>` (TensorBoard sections `Metrics_v1` / `Metrics_v2`); the image
+  metrics and this repo's `combra_num_fid_samples` / `combra_fid_best` stay under
+  `Metrics/combra_<k>`, so `combra.metrics.load_fid_by_kimg` still reads
+  `Metrics/combra_fid`. `stats.jsonl` uses the same strings as keys (non-finite →
+  `null`), TensorBoard as tags (non-finite skipped), and the run HPARAMS name
+  `Metrics/combra_fid_best` the same way: one helper (`training_loop.metric_tag`) maps
+  every name. The `.log`'s single `Metrics:` line is now three, in this order:
+  `Metrics: combra_fid … combra_cmmd … combra_fd_dinov2 … combra_num_fid_samples …
+  combra_fid_best …`, `Metrics v1: combra_w1 … combra_amp2 …`,
+  `Metrics v2: combra_w1 … combra_pi …`.
+  Best-snapshot selection still uses `combra_fid` / `combra_fd_dinov2` / `combra_cmmd`.
+- **The `[startup]` line records the combra version**, right after `cuda`
+  (`torch … | cuda … | combra 0.25.0 | gpus …`; `combra not installed` when absent).
+  It was otherwise written only into the end-of-run HPARAMS, so a walltime-killed run
+  had no record of which angle method produced its numbers.
+
+### Fixed
+- **The discriminator builds on timm 1.x again.** `_make_efficientnet` used
+  `model.act1`, which timm >= 0.6 folded into `bn1` (`BatchNormAct2d`); with the
+  required `timm>=1.0` every fresh install died constructing D (`tf_efficientnet_lite0`)
+  before the first tick. An `nn.Identity` takes the old `act1` slot, so the math and
+  the `layer0` indices are unchanged. The other builders that read `act1` (ghostnet,
+  the timm resnets) still have it in timm 1.x.
+- **combra's warnings reach the `.log` deterministically.** combra logs through Python
+  logging with only a `NullHandler`, which also disables logging's last-resort output;
+  its warnings (e.g. why the Gaussian keys are `nan`) appeared in the `.log` only
+  because open_clip's first root-level `logging.info()` ran `basicConfig` after the
+  file Logger was installed. `train.py` now configures the root handler on the Logger
+  itself (`WARNING:combra.…:…` lines, as before).
+- **CI installs the combra version pinned in pyproject** (the tag of the `combra`
+  extra) instead of unpinned combra main, so the contract tests run against what a
+  fresh install gets. The `COMBRA_TOKEN` mechanism is unchanged.
+
+### Tests
+- `tests/test_feature_networks.py` builds the real discriminator with the backbones
+  `train.py` configures (CPU, random weights, no download) and runs it, and checks
+  the EfficientNet split against timm's own stem + blocks. No test built D before,
+  which is how the `act1` break went unnoticed.
+- `tests/test_combra_contract.py`: the `pi` assertion is replaced by a
+  `distributed_metrics` call that must return exactly the 22 logged keys, plus a
+  check that they map to the three sections; `combra.__version__` joins the
+  required symbols, and the `[startup]` field order is asserted. `tests/test_stats_contract.py` checks the `stats.jsonl` keys and
+  the three `.log` lines.
+
 ## [0.7.4] — 2026-09-25
 
 ### Changed

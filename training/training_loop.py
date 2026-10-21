@@ -510,6 +510,33 @@ def _write_run_hparams(run_dir, writer, metrics, step):
     write_hparams(writer, config, metrics, step=step)
 
 
+def metric_tag(name):
+    """The stats.jsonl key and TensorBoard tag of one ``stats_metrics`` entry (§7).
+
+    combra (>= 0.25) returns two angle sections next to one set of image metrics:
+    ``combra_vN_<k>`` (v1 = P0 angles, v2 = P6 angles) maps to ``Metrics_vN/combra_<k>``;
+    everything else (``combra_fid``, ``combra_cmmd``, ``combra_fd_dinov2``,
+    ``combra_num_fid_samples``, ``combra_fid_best``) to ``Metrics/<name>``. Every sink
+    -- stats.jsonl, TensorBoard, the .log and the HPARAMS -- names metrics through this.
+    """
+    for version in ('v1', 'v2'):
+        prefix = f'combra_{version}_'
+        if name.startswith(prefix):
+            return f'Metrics_{version}/combra_{name[len(prefix):]}'
+    return f'Metrics/{name}'
+
+
+def metrics_log_lines(stats_metrics):
+    """The .log lines of one eval tick, one per section: ``Metrics:``, ``Metrics v1:``,
+    ``Metrics v2:`` (keys without the section prefix, in the order combra returned them)."""
+    sections = {}
+    for name, value in stats_metrics.items():
+        section, key = metric_tag(name).split('/')
+        sections.setdefault(section, []).append(f'{key} {value:.4f}')
+    return [section.replace('_', ' ') + ': ' + '  '.join(items)
+            for section, items in sorted(sections.items())]
+
+
 def build_stats_row(stats_dict, stats_metrics, timestamp, start_time):
     """One scalar JSON row for ``stats.jsonl`` (§7).
 
@@ -531,7 +558,7 @@ def build_stats_row(stats_dict, stats_metrics, timestamp, start_time):
     """
     row = {name: value.mean for name, value in stats_dict.items() if value.num > 0}
     for name, value in stats_metrics.items():
-        row[f'Metrics/{name}'] = float(value)
+        row[metric_tag(name)] = float(value)
     row = {k: (v if math.isfinite(v) else None) for k, v in row.items()}
     if row.get('Progress/tick') is not None:
         row['Progress/tick'] = int(row['Progress/tick'])
@@ -1167,7 +1194,7 @@ def training_loop(
             # rank 0 ever reported makes that reduction disagree on shape.
             training_stats.report0('Timing/eval_sec', time.time() - eval_start)
             if rank == 0 and combra_results is not None:
-                # Cast to float so the scalar writers (Metrics/combra_*) accept every
+                # Cast to float so the scalar writers (Metrics*/combra_*) accept every
                 # value, including numpy scalars and NaNs. Keys are bare (combra_fid,
                 # not combra_fid10k): the old `10k` suffix was a literal that stayed
                 # 10k whatever --num-fid-samples said, so every chart built from it was
@@ -1178,8 +1205,8 @@ def training_loop(
                 if 'combra_fid' in stats_metrics:
                     best_fid = min(best_fid, stats_metrics['combra_fid'])
                     stats_metrics['combra_fid_best'] = best_fid
-                print('Metrics: ' + '  '.join(
-                    f'{k} {v:.4f}' for k, v in stats_metrics.items()), flush=True)
+                for line in metrics_log_lines(stats_metrics):
+                    print(line, flush=True)
 
         # Snapshot retention: the --snapshot-keep-last newest snapshots plus the best one
         # by each of checkpoint.BEST_METRICS (lower is better, nan ignored). The eval
@@ -1205,7 +1232,7 @@ def training_loop(
         stats_dict = stats_collector.as_dict()
 
         # Update logs. combra metrics are mirrored into stats.jsonl under the same
-        # Metrics/combra_* keys as TensorBoard (§6) -- stats.jsonl is the machine-
+        # Metrics*/combra_* keys as TensorBoard (§6) -- stats.jsonl is the machine-
         # readable source of truth, so losing the tfevents file no longer loses the
         # run's FID/CMMD/angle history (and it is what enables post-hoc snapshot
         # selection). wall_time / datetime columns are added per §7.
@@ -1239,7 +1266,7 @@ def training_loop(
     if rank == 0:
         if stats_tfevents is not None:
             _write_run_hparams(run_dir, stats_tfevents,
-                               {'Metrics/combra_fid_best': float(best_fid)}, step=cur_nimg)
+                               {metric_tag('combra_fid_best'): float(best_fid)}, step=cur_nimg)
             stats_tfevents.close()
         stats_jsonl.close()
         print('Training complete.', flush=True)

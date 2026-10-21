@@ -10,8 +10,10 @@
 "Alias-Free Generative Adversarial Networks"."""
 
 import json
+import logging
 import os
 import re
+import sys
 import tempfile
 
 import click
@@ -41,7 +43,15 @@ def _print_options(c):
 
 def _startup_header(num_gpus):
     # One line of torch / CUDA / device / env facts so the .log is self-sufficient (§7).
-    parts = [f'torch {torch.__version__}', f'cuda {torch.version.cuda}', f'gpus {num_gpus}']
+    parts = [f'torch {torch.__version__}', f'cuda {torch.version.cuda}']
+    # The combra version says which angle method / metric code produced the numbers;
+    # the end-of-run HPARAMS record it too, but a walltime-killed run never gets there.
+    try:
+        import combra
+        parts.append(f'combra {combra.__version__}')
+    except ImportError:
+        parts.append('combra not installed')
+    parts.append(f'gpus {num_gpus}')
     parts.append('device ' + (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'))
     for v in ('CUDA_VISIBLE_DEVICES', 'TORCH_CUDA_ARCH_LIST', 'HF_HUB_OFFLINE', 'TRANSFORMERS_OFFLINE'):
         if os.environ.get(v):
@@ -55,6 +65,12 @@ def subprocess_fn(rank, c, temp_dir):
     log_name = os.path.basename(c.run_dir) + '.log' if rank == 0 else None
     log_path = os.path.join(c.run_dir, log_name) if log_name is not None else None
     dnnlib.util.Logger(file_name=log_path, file_mode='a', should_flush=True)
+    # combra reports through Python logging (e.g. why an angle or Gaussian key is nan).
+    # As a library it attaches only a NullHandler, which also disables logging's
+    # last-resort output, so its warnings reached the .log only because open_clip's
+    # first root-level logging.info() happened to run basicConfig after the Logger was
+    # installed. Configure the root handler here, on the Logger (sys.stdout), instead.
+    logging.basicConfig(stream=sys.stdout, force=True)
     if rank == 0:
         _print_options(c)
         print('[startup] ' + _startup_header(c.num_gpus), flush=True)

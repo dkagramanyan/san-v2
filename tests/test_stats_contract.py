@@ -58,6 +58,30 @@ def test_row_types_and_eval_keys():
 
 
 
+def test_row_and_log_lines_have_three_metric_sections():
+    # combra >= 0.25: v1 / v2 angle keys go to Metrics_v1/ and Metrics_v2/, the image
+    # metrics and this repo's own scalars stay under Metrics/ (load_fid_by_kimg).
+    from types import SimpleNamespace
+
+    from training.training_loop import build_stats_row, metrics_log_lines
+
+    metrics = {"combra_v1_w1": 1.5, "combra_v1_amp2": float("nan"), "combra_v2_pi": 2.5,
+               "combra_fid": 12.5, "combra_cmmd": 0.25, "combra_fd_dinov2": 300.0,
+               "combra_num_fid_samples": 256.0, "combra_fid_best": 12.5}
+    row = build_stats_row({"Progress/kimg": SimpleNamespace(num=1, mean=4.0)}, metrics, 1000.0, 900.0)
+    assert {k for k in row if k.startswith("Metrics")} == {
+        "Metrics_v1/combra_w1", "Metrics_v1/combra_amp2", "Metrics_v2/combra_pi",
+        "Metrics/combra_fid", "Metrics/combra_cmmd", "Metrics/combra_fd_dinov2",
+        "Metrics/combra_num_fid_samples", "Metrics/combra_fid_best"}
+    assert row["Metrics_v1/combra_amp2"] is None
+    assert metrics_log_lines(metrics) == [
+        "Metrics: combra_fid 12.5000  combra_cmmd 0.2500  combra_fd_dinov2 300.0000  "
+        "combra_num_fid_samples 256.0000  combra_fid_best 12.5000",
+        "Metrics v1: combra_w1 1.5000  combra_amp2 nan",
+        "Metrics v2: combra_pi 2.5000",
+    ]
+
+
 def test_row_contains_only_json_scalars():
     for key, value in _row().items():
         assert value is None or isinstance(value, (int, float, str)), (
