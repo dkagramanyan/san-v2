@@ -7,6 +7,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.8.1] — 2026-10-22
 
+### Added
+- **Training starts by checking that the metric backbone weights are downloaded.**
+  When the combra metrics will run (`--combra-metrics True`, `--num-fid-samples` > 0),
+  `train.py` calls `combra.metrics.require_backbones()` before anything else: before
+  the dataset is read and before any GPU process is spawned. It checks only the local
+  caches (`TORCH_HOME` / `HF_HOME`) for the InceptionV3, CLIP and DINOv2 files
+  `download_models.sh` fetches; a missing file exits non-zero with the list of missing
+  files instead of training without metrics. On success it prints
+  `Backbone weights found (download_models.sh): fid, cmmd, fd_dinov2`. Skipped on
+  `--dry-run` and when combra is not installed (the training loop's warning applies).
+  The discriminator's timm backbones are not checked.
+
 ### Removed
 - **The startup combra smoke test.** Rank 0 alone ran
   `self_test(image_metrics=True, strict=True)`, loading the InceptionV3 / CLIP / DINOv2
@@ -23,7 +35,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ### Tests
 - `tests/test_combra_contract.py`: the synthetic-grains smoke-test check is replaced by
   one asserting the training loop calls no `self_test`; `combra.metrics.self_test`
-  leaves the required-symbol list, since this repo no longer imports it.
+  leaves the required-symbol list, since this repo no longer imports it, and
+  `combra.metrics.require_backbones` joins it.
+- `tests/test_backbone_check.py`: a failing `require_backbones` makes `san-train` exit
+  non-zero before the config is built or anything is launched; the check runs when the
+  metrics are on and not with `--combra-metrics False` or `--num-fid-samples 0`.
 
 ## [0.8.0] — 2026-10-22
 

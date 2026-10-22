@@ -27,6 +27,7 @@ REQUIRED = [
     ("combra.metrics.distributed", "distributed_metrics"),
     ("combra.metrics.distributed", "gather_generated"),
     ("combra.metrics.distributed", "precompute_reference"),
+    ("combra.metrics", "require_backbones"),  # the first check in train.py
     ("combra.io", "write_hparams"),
     ("combra", "__version__"),  # the [startup] line in train.py
 ]

@@ -9,6 +9,7 @@
 """Train a GAN using the techniques described in the paper
 "Alias-Free Generative Adversarial Networks"."""
 
+import importlib.util
 import json
 import logging
 import os
@@ -363,8 +364,26 @@ def build_config(opts):
     return c, desc
 
 
+def _require_backbones(opts):
+    """First check of a training start, before the dataset is read or any process is
+    spawned: when the combra metrics will run, the backbone weights download_models.sh
+    fetches must already be cached. combra reads only the local caches (no network),
+    so a missing file aborts here instead of stalling a download on an offline node.
+    Without combra installed the training loop's own warning applies, as before."""
+    if not (opts.combra_metrics and opts.num_fid_samples > 0) or importlib.util.find_spec('combra') is None:
+        return
+    from combra.metrics import require_backbones
+    try:
+        files = require_backbones()
+    except RuntimeError as e:
+        raise click.ClickException(str(e)) from e
+    print('Backbone weights found (download_models.sh): ' + ', '.join(files), flush=True)
+
+
 def launch_from_opts(opts):
     """Build the config from ``opts`` and launch training start-to-finish (§3: no resume)."""
+    if not opts.dry_run:
+        _require_backbones(opts)
     c, desc = build_config(opts)
     launch_training(c=c, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run)
 

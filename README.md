@@ -107,6 +107,10 @@ with `TORCH_HOME=$MODEL_CACHE/torch HF_HOME=$MODEL_CACHE/huggingface`. (A Python
 equivalent that always resolves the correct URLs is `python tests/test_san_modules.py`,
 for when you have a working interpreter.)
 
+With the combra metrics on, `san-train` first checks that the InceptionV3 / CLIP / DINOv2
+files are in these caches (`combra.metrics.require_backbones`, no network) and exits
+with the list of missing files before reading the dataset or starting any GPU process.
+
 
 ## 3. Data preparation
 
