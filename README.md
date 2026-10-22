@@ -248,7 +248,7 @@ manifest. `--gpus N` self-spawns one worker per GPU (no `torchrun`). On the clus
 ### During training (combra)
 
 Every snapshot tick (`--snap`) scores `--num-fid-samples` fakes against the training
-set (`--combra-ref-count` caps the reference) with combra (pinned to `v0.25.0` by the
+set (`--combra-ref-count` caps the reference) with combra (pinned to `v0.25.1` by the
 `combra` extra). The results are logged in three sections, with the same names in
 `stats.jsonl` (keys; non-finite → `null`) and TensorBoard (tags; non-finite skipped):
 

@@ -779,29 +779,6 @@ def training_loop(
     # batch). For an unconditional G, get_label returns a zero-length vector.
     combra_ref = None
     combra_ref_ok = True
-    if combra_enabled and (importlib.util.find_spec('combra') is not None):
-        # Startup smoke test (§6): fail fast if the combra backends are unusable, using
-        # combra's shared implementation. strict=True is the point -- the plain
-        # self_test() this used to call defaults to image_metrics=False, so it never
-        # touched InceptionV3 / CLIP / DINOv2 and a missing CLIP download surfaced only
-        # as a whole run logging nan for combra_fid / combra_cmmd / combra_fd_dinov2.
-        # It probes the backends on combra's synthetic grains, not on training images:
-        # at 16^2 a 4-image slice yields no vertex angles and at 64^2 the bimodal fit
-        # on 4 images is degenerate, so strict=True aborted every low-res run. Rank 0
-        # runs it; every rank (the gate above is rank-uniform) agrees on the outcome
-        # and raises together, so no rank is left waiting in a later collective.
-        from combra.metrics.distributed import all_ranks_ok
-        self_test_ok = True
-        if rank == 0:
-            try:
-                from combra.metrics import self_test
-                self_test(image_metrics=True, strict=True, device=device)
-            except Exception as e:  # noqa: BLE001 -- agreed across ranks below
-                self_test_ok = False
-                print(f'[combra] smoke test failed: {e}', flush=True)
-        if not all_ranks_ok(self_test_ok, device, num_gpus):
-            raise RuntimeError('combra startup smoke test failed (see the error above); fix the '
-                               'combra backends or pass --combra-metrics False')
     if combra_enabled:
         combra_label_idx = np.random.RandomState(random_seed).randint(0, len(training_set), size=combra_num)
         combra_labels = np.stack([training_set.get_label(i) for i in combra_label_idx])

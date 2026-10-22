@@ -5,6 +5,26 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-10-22
+
+### Removed
+- **The startup combra smoke test.** Rank 0 alone ran
+  `self_test(image_metrics=True, strict=True)`, loading the InceptionV3 / CLIP / DINOv2
+  backbones while the other ranks waited in a collective; on an offline node the load
+  stalled past the 10-minute NCCL watchdog and killed the run. The reference
+  precompute still loads the backbones on every rank together, and its failure
+  handling is unchanged (a broken backend disables the combra metrics).
+
+### Changed
+- **combra pinned to v0.25.1** (was v0.25.0). The backbones load from the
+  `download_models.sh` cache with no network access; a missing file fails fast when
+  `HF_HUB_OFFLINE=1`.
+
+### Tests
+- `tests/test_combra_contract.py`: the synthetic-grains smoke-test check is replaced by
+  one asserting the training loop calls no `self_test`; `combra.metrics.self_test`
+  leaves the required-symbol list, since this repo no longer imports it.
+
 ## [0.8.0] — 2026-10-22
 
 ### Changed

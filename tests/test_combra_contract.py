@@ -27,7 +27,6 @@ REQUIRED = [
     ("combra.metrics.distributed", "distributed_metrics"),
     ("combra.metrics.distributed", "gather_generated"),
     ("combra.metrics.distributed", "precompute_reference"),
-    ("combra.metrics", "self_test"),
     ("combra.io", "write_hparams"),
     ("combra", "__version__"),  # the [startup] line in train.py
 ]
@@ -60,7 +59,6 @@ def test_combra_exports_symbol(module, name):
 def test_combra_import_block_resolves():
     # The exact imports the training loop performs. Guarded there, unguarded here.
     from combra.io import write_hparams  # noqa: F401
-    from combra.metrics import self_test  # noqa: F401
     from combra.metrics.distributed import (  # noqa: F401
         all_ranks_ok,
         distributed_metrics,
@@ -151,20 +149,18 @@ def test_precompute_reference_accepts_dihedral():
     assert "dihedral" in inspect.signature(precompute_reference).parameters
 
 
-def test_startup_smoke_test_uses_synthetic_grains():
-    # The startup self_test must probe the backends on combra's synthetic grains:
-    # with images=<4 training images> it found no angles at 16^2 and a degenerate
-    # bimodal fit at 64^2, so strict=True aborted every low-res run before tick 0.
+def test_no_startup_smoke_test():
+    # v0.8.1 removed the rank-0 startup self_test: it loaded the backbones on rank 0
+    # alone while the other ranks waited in a collective, and a stalled load on an
+    # offline node tripped the NCCL watchdog. The reference precompute loads them on
+    # every rank together; nothing else may call self_test at startup.
     import ast
     import pathlib
 
     src = pathlib.Path(__file__).resolve().parents[1] / "training/training_loop.py"
     calls = [n for n in ast.walk(ast.parse(src.read_text()))
              if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "self_test"]
-    assert len(calls) == 1
-    kwargs = {k.arg: k.value for k in calls[0].keywords}
-    assert "images" not in kwargs and not calls[0].args
-    assert kwargs["strict"].value is True and kwargs["image_metrics"].value is True
+    assert calls == []
 
 
 @requires_combra
