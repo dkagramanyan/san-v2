@@ -107,6 +107,14 @@ with `TORCH_HOME=$MODEL_CACHE/torch HF_HOME=$MODEL_CACHE/huggingface`. (A Python
 equivalent that always resolves the correct URLs is `python tests/test_san_modules.py`,
 for when you have a working interpreter.)
 
+The downloader uses pinned Hugging Face safetensors for timm 1.x (both DeiT models
+and EfficientNet) and CLIP, including the snapshot links and `refs/main` required
+for offline loading. It verifies their SHA256 checksums and reuses valid cached
+files, including files previously downloaded through Python. Downloads are written
+to `.part` files before publication. Explicit `TORCH_HOME`, `HF_HOME`, and
+`HF_HUB_CACHE` overrides take precedence over the `MODEL_CACHE` defaults; use the
+same paths for downloading and training. No Python imports or GPU are needed.
+
 With the combra metrics on, `san-train` first checks that the InceptionV3 / CLIP / DINOv2
 files are in these caches (`combra.metrics.require_backbones`, no network) and exits
 with the list of missing files before reading the dataset or starting any GPU process.

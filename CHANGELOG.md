@@ -5,6 +5,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- `download_models.sh` now caches the DeiT and EfficientNet backbones as pinned
+  Hugging Face safetensors for timm 1.x, replacing the old Torch-cache downloads
+  that left offline training unable to load its discriminator. The downloader
+  remains Python-free, honors `TORCH_HOME`, `HF_HOME` and `HF_HUB_CACHE`, verifies
+  Hugging Face weight checksums, and publishes downloads only after completion.
+
 ## [0.8.1] — 2026-10-22
 
 ### Added
