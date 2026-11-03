@@ -6,6 +6,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- Oversized `upfirdn2d` CUDA calls are split along the batch dimension to stay
+  within the kernel's 32-bit indexing limit, including separable intermediate
+  passes and backward. This fixes `RuntimeError: output is too large` during
+  512x512 startup with 25 images per GPU without changing the training batch.
 - `download_models.sh` now caches the DeiT and EfficientNet backbones as pinned
   Hugging Face safetensors for timm 1.x, replacing the old Torch-cache downloads
   that left offline training unable to load its discriminator. The downloader

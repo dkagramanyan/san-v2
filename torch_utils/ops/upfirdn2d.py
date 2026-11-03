@@ -216,6 +216,35 @@ def _upfirdn2d_ref(x, f, up=1, down=1, padding=0, flip_filter=False, gain=1):
 #----------------------------------------------------------------------------
 
 _upfirdn2d_cuda_cache = dict()
+_CUDA_INDEX_LIMIT = (1 << 31) - 1
+
+
+def _upfirdn2d_cuda_call(x, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain):
+    """Keep each plugin call within its 32-bit input/output indexing limit.
+
+    Resampling is independent for each image. Split large batches before invoking
+    the plugin, including the intermediate passes of a separable filter and the
+    calls made by backward. The full result can exceed the plugin's index limit.
+    """
+    batch, channels, height, width = x.shape
+    out_width = (width * upx + padx0 + padx1 - f.shape[1] + downx) // downx
+    out_height = (height * upy + pady0 + pady1 - f.shape[0] + downy) // downy
+    args = (f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain)
+    # Leave validation of empty/invalid shapes to the plugin.
+    if min(batch, channels, height, width, out_height, out_width) <= 0:
+        return _plugin.upfirdn2d(x, *args)
+    elements_per_image = max(channels * height * width, channels * out_height * out_width)
+    chunk_size = _CUDA_INDEX_LIMIT // elements_per_image
+    if chunk_size < 1:
+        raise RuntimeError("upfirdn2d: a single image exceeds the CUDA kernel's 32-bit indexing limit")
+    footprint = sum((size - 1) * stride for size, stride in zip(x.shape, x.stride()))
+    if batch <= chunk_size and footprint <= _CUDA_INDEX_LIMIT:
+        return _plugin.upfirdn2d(x, *args)
+    # Compact strided views too: the kernel also checks their memory footprint.
+    return torch.cat([
+        _plugin.upfirdn2d(chunk.contiguous(), *args)
+        for chunk in x.split(chunk_size, dim=0)
+    ], dim=0)
 
 def _upfirdn2d_cuda(up=1, down=1, padding=0, flip_filter=False, gain=1):
     """Fast CUDA implementation of `upfirdn2d()` using custom ops.
@@ -242,10 +271,10 @@ def _upfirdn2d_cuda(up=1, down=1, padding=0, flip_filter=False, gain=1):
             assert isinstance(f, torch.Tensor) and f.ndim in [1, 2]
             y = x
             if f.ndim == 2:
-                y = _plugin.upfirdn2d(y, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain)
+                y = _upfirdn2d_cuda_call(y, f, upx, upy, downx, downy, padx0, padx1, pady0, pady1, flip_filter, gain)
             else:
-                y = _plugin.upfirdn2d(y, f.unsqueeze(0), upx, 1, downx, 1, padx0, padx1, 0, 0, flip_filter, 1.0)
-                y = _plugin.upfirdn2d(y, f.unsqueeze(1), 1, upy, 1, downy, 0, 0, pady0, pady1, flip_filter, gain)
+                y = _upfirdn2d_cuda_call(y, f.unsqueeze(0), upx, 1, downx, 1, padx0, padx1, 0, 0, flip_filter, 1.0)
+                y = _upfirdn2d_cuda_call(y, f.unsqueeze(1), 1, upy, 1, downy, 0, 0, pady0, pady1, flip_filter, gain)
             ctx.save_for_backward(f)
             ctx.x_shape = x.shape
             return y
