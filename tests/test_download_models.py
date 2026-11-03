@@ -2,13 +2,12 @@
 
 import hashlib
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
-
 
 SCRIPT = Path(__file__).resolve().parents[1] / "download_models.sh"
 PAYLOAD = b"test weights\n"
