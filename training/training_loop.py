@@ -23,7 +23,7 @@ import psutil
 import torch
 
 import dnnlib
-from torch_utils import checkpoint, misc, training_stats
+from torch_utils import checkpoint, misc, run_layout, training_stats
 from torch_utils.ops import conv2d_gradfix, grid_sample_gradfix
 from training import networks_stylegan3_resetting
 
@@ -601,7 +601,7 @@ def training_loop(
     kimg_per_tick           = 4,        # Progress snapshot interval.
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
-    snapshot_keep_last      = 1,        # How many newest inference snapshots to keep on top of the best-per-metric ones (0 = keep all).
+    snapshot_mode           = 'best',   # Checkpoints kept: run_layout.SNAPSHOT_MODES (best / best+last / all).
     augment                 = True,     # Random dihedral transform per item in the training loader; the combra reference gets all 8.
     combra_metrics          = True,     # Compute combra generative-quality metrics each snapshot tick.
     combra_num_gen          = 10000,    # Number of fakes for the combra metrics (0 disables eval).
@@ -748,11 +748,13 @@ def training_loop(
     grid_size = None
     grid_z = None
     grid_c = None
-    stage('Exporting sample images (reals.png, fakes_init.png)')
+    stage('Exporting sample images (samples/reals.png, samples/fakes-init.png)')
+    if rank == 0:
+        run_layout.make_run_dir(run_dir, exist_ok=True)   # checkpoints/ + samples/
     grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
     reals_images = images
     if rank == 0:
-        save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
+        save_image_grid(images, run_layout.reals_path(run_dir), drange=[0,255], grid_size=grid_size)
 
     # Grid/eval latents derive from --seed ALONE (§2), never scaled by the GPU count,
     # so the same seed draws the same latents at any --gpus.
@@ -761,7 +763,7 @@ def training_loop(
     images = generate_snapshot_grid_images(G_ema=G_ema, grid_z=grid_z, grid_c=grid_c, batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
 
     if rank == 0:
-        save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
+        save_image_grid(images, run_layout.fakes_path(run_dir), drange=[-1,1], grid_size=grid_size)
 
     # combra metric reference: the training set, scored against combra_num_gen
     # generated images (fid10k / cmmd10k / fd_dinov2_10k -> N fakes vs the reals;
@@ -819,7 +821,7 @@ def training_loop(
     stats_collector = training_stats.Collector(regex='.*', keep_previous=False)
     stats_metrics = dict()
     best_fid = float('inf')   # running best combra FID -> Metrics/combra_fid_best
-    best_snaps = {}           # rank 0: metric -> (value, snapshot path); never pruned
+    best_snaps = {}           # rank 0: metric -> (value, kimg) of the kept best checkpoints
     stats_jsonl = None
     stats_tfevents = None
     if rank == 0:
@@ -834,7 +836,7 @@ def training_loop(
         except ImportError as err:
             print('Skipping tfevents export:', err)
         if stats_tfevents is not None:
-            # §7: the same grids as reals.png / fakes_init.png, at step 0.
+            # §7: the same grids as samples/reals.png / fakes-init.png, at step 0.
             stats_tfevents.add_image('Reals', image_grid_array(reals_images, [0, 255], grid_size),
                                      global_step=0, dataformats='HWC')
             stats_tfevents.add_image('Fakes', image_grid_array(images, [-1, 1], grid_size),
@@ -1097,9 +1099,9 @@ def training_loop(
         if (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             images = generate_snapshot_grid_images(G_ema=G_ema, grid_z=grid_z, grid_c=grid_c, batch_gpu=batch_gpu, num_gpus=num_gpus, rank=rank, noise_mode='const')
             if rank == 0:
-                fakes_name = f'fakes{cur_nimg//1000:06d}.png'
-                save_image_grid(images, os.path.join(run_dir, fakes_name), drange=[-1,1], grid_size=grid_size)
-                print(f'Saved {fakes_name}', flush=True)
+                fakes_path = run_layout.fakes_path(run_dir, cur_nimg // 1000)
+                save_image_grid(images, fakes_path, drange=[-1,1], grid_size=grid_size)
+                print(f'Saved {run_layout.SAMPLES}/{os.path.basename(fakes_path)}', flush=True)
                 # §7 lists `Fakes` as a TensorBoard image every snapshot tick. This repo
                 # is the reference implementation for the sample grid, yet it was the one
                 # repo that only ever wrote the grid to disk.
@@ -1108,27 +1110,14 @@ def training_loop(
                         'Fakes', image_grid_array(images, [-1, 1], grid_size),
                         global_step=cur_nimg, dataformats='HWC')
 
-        # Save network snapshot (§3): EMA-only weights as a `.pt` state dict, written
-        # atomically every snapshot tick AND always at the last tick, so the newest
-        # snapshot IS the final model. No resume/full checkpoints exist. History is
-        # pruned after this snapshot's combra eval below, so its metrics count first.
+        # Network snapshot tick (§3): every --snap ticks AND always at the last tick.
+        # The combra eval below scores G_ema first; the checkpoint is saved after it.
         did_snapshot = (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0)
-        if did_snapshot:
+        if did_snapshot and num_gpus > 1:
             # DDP weight-consistency check before saving so silently diverged ranks
             # (which would otherwise persist rank 0's weights undetected) are caught.
             # Must run on every rank.
-            if num_gpus > 1:
-                misc.check_ddp_consistency(G_ema, ignore_regex=r'.*\.[^.]+_(avg|ema)')
-            if rank == 0:
-                metadata = dict(
-                    n_classes=int(training_set.label_dim),
-                    resolution=int(training_set.resolution),
-                    class_names=training_set.class_names,
-                    cur_nimg=int(cur_nimg),
-                )
-                snap_path = os.path.join(run_dir, f'san-snapshot-{cur_nimg//1000:06d}-inference.pt')
-                checkpoint.save_inference_snapshot(snap_path, G_ema, metadata)
-                print(f'Saved {os.path.basename(snap_path)}', flush=True)
+            misc.check_ddp_consistency(G_ema, ignore_regex=r'.*\.[^.]+_(avg|ema)')
 
         # combra in-memory generative-quality metrics (optional dependency), scored
         # over the reference vs combra_num_gen fakes. Both the image-feature extraction
@@ -1185,17 +1174,27 @@ def training_loop(
                 for line in metrics_log_lines(stats_metrics):
                     print(line, flush=True)
 
-        # Snapshot retention: the --snapshot-keep-last newest snapshots plus the best one
-        # by each of checkpoint.BEST_METRICS (lower is better, nan ignored). The eval
-        # above scored the snapshot saved at this same cur_nimg, so it competes for
-        # "best" before anything is pruned. At most keep_last + 3 files remain.
+        # Save the checkpoint (§3): EMA-only weights as a `.pt` state dict, written
+        # atomically under the names --snapshots keeps: checkpoints/san-best-<metric>.pt
+        # for every metric of run_layout.BEST_METRICS this eval improved (lower is
+        # better, nan ignored), san-last.pt while no best exists (or always with
+        # best+last), san-kimg<k>.pt with all. No resume/full checkpoints exist.
         if did_snapshot and rank == 0:
-            checkpoint.update_best_snapshots(best_snaps, snap_path, stats_metrics)
-            checkpoint.prune_snapshots(run_dir, snapshot_keep_last,
-                                       keep=[p for _, p in best_snaps.values()])
+            metadata = dict(
+                n_classes=int(training_set.label_dim),
+                resolution=int(training_set.resolution),
+                class_names=training_set.class_names,
+                cur_nimg=int(cur_nimg),
+                metrics=run_layout.best_metrics(stats_metrics),
+            )
+            saved = run_layout.save_snapshot(
+                run_layout.checkpoint_dir(run_dir), 'san', cur_nimg // 1000,
+                lambda path, _suffix: checkpoint.save_inference_snapshot(path, G_ema, metadata),
+                stats_metrics, best_snaps, snapshot_mode)
+            for name in saved:
+                print(f'Saved {run_layout.CHECKPOINTS}/{name}', flush=True)
             if best_snaps:
-                print('Best snapshots: ' + '  '.join(
-                    f'{k} {v:.4f} {os.path.basename(p)}' for k, (v, p) in best_snaps.items()), flush=True)
+                print(run_layout.best_line(best_snaps), flush=True)
 
         # Collect statistics.
         for phase in phases:

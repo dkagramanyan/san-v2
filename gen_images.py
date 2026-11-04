@@ -15,7 +15,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from tqdm import tqdm
 
-from torch_utils import checkpoint, gen_utils
+from torch_utils import checkpoint, gen_utils, run_layout
 
 # Unified h5 signature across all four v2 repos (§4): downstream code sniffs any
 # model's output identically.
@@ -598,7 +598,7 @@ def _generate_worker(
 @click.option("--batch-gpu", type=int, default=32, show_default=True, help="Samples per GPU pass")
 @click.option("--gpus", type=click.IntRange(min=1), help="GPUs to use (self-spawns one worker per GPU; defaults to all)")
 @click.option("--outdir", type=str, required=True, metavar="DIR", help="Where to save outputs")
-@click.option("--desc", type=str, metavar="STR", help="Merged filename stem (default: network stem)")
+@click.option("--desc", type=str, metavar="STR", help="Merged filename stem (default: <run>-<checkpoint role>, e.g. <run>-best-fid; else the network stem)")
 @click.option(
     "--save-mode",
     type=click.Choice(["hdf5", "dir"], case_sensitive=False),
@@ -655,7 +655,7 @@ def generate_images(
             "must stamp them (§5). Re-export the snapshot, or use --save-mode dir.")
     class_list = resolve_classes(classes, n_classes, class_names)
 
-    desc_full = desc or Path(network_pkl).stem
+    desc_full = desc or run_layout.checkpoint_desc(network_pkl)
     compression_norm = None if hdf5_compression.lower() == "none" else hdf5_compression.lower()
 
     cfg = dict(

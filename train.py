@@ -21,7 +21,7 @@ import click
 import torch
 
 import dnnlib
-from torch_utils import custom_ops, training_stats
+from torch_utils import custom_ops, run_layout, training_stats
 from training import training_loop
 
 #----------------------------------------------------------------------------
@@ -62,9 +62,8 @@ def _startup_header(num_gpus):
 #----------------------------------------------------------------------------
 
 def subprocess_fn(rank, c, temp_dir):
-    # Rank-0-only console transcript, named after the run directory (§7).
-    log_name = os.path.basename(c.run_dir) + '.log' if rank == 0 else None
-    log_path = os.path.join(c.run_dir, log_name) if log_name is not None else None
+    # Rank-0-only transcript <run>-train.log, named after the run directory (§7).
+    log_path = run_layout.train_log_path(c.run_dir) if rank == 0 else None
     dnnlib.util.Logger(file_name=log_path, file_mode='a', should_flush=True)
     # combra reports through Python logging (e.g. why an angle or Gaussian key is nan).
     # As a library it attaches only a NullHandler, which also disables logging's
@@ -122,9 +121,11 @@ def launch_training(c, desc, outdir, dry_run):
         print('Dry run; exiting.')
         return
 
-    # Create output directory.
+    # Create output directory (with checkpoints/ and samples/) and move the sh/
+    # launcher's console log into it (§7).
     print('Creating output directory...')
-    os.makedirs(c.run_dir)
+    run_layout.make_run_dir(c.run_dir)
+    run_layout.adopt_console_log(c.run_dir)
     with open(os.path.join(c.run_dir, 'training_options.json'), 'wt+') as f:
         json.dump(c, f, indent=2)
 
@@ -181,7 +182,7 @@ def init_dataset_kwargs(data):
 @click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=25000, show_default=True)
 @click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=4, show_default=True)
 @click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
-@click.option('--snapshot-keep-last', help='How many newest inference snapshots to keep; the best by combra_fid / combra_fd_dinov2 / combra_cmmd are always kept too (0 = keep all)', metavar='INT', type=click.IntRange(min=0), default=1, show_default=True)
+@click.option('--snapshots',    help='Checkpoints to keep: best = the best by combra_fid / combra_fd_dinov2 / combra_cmmd (the newest while no best exists); best+last = also the newest; all = also every snapshot', type=click.Choice(run_layout.SNAPSHOT_MODES), default='best', show_default=True)
 @click.option('--combra-metrics', help='Compute combra generative-quality metrics each snapshot tick', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--num-fid-samples', help='Number of fakes for the combra metrics (0 disables eval)', metavar='INT', type=click.IntRange(min=0), default=10000, show_default=True)
 @click.option('--combra-ref-count', help='Cap the combra reference to a seeded random subset (0 = whole set)', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
@@ -245,7 +246,7 @@ def build_config(opts):
     c.total_kimg = opts.kimg
     c.kimg_per_tick = opts.tick
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
-    c.snapshot_keep_last = opts.snapshot_keep_last
+    c.snapshot_mode = opts.snapshots
     c.augment = opts.augment
     c.combra_metrics = opts.combra_metrics
     c.combra_num_gen = opts.num_fid_samples
@@ -295,10 +296,8 @@ def build_config(opts):
         c.G_kwargs.num_fp16_res = 0
         c.G_kwargs.conv_clamp = None
 
-    # Description string (§2): <cfg>-gpus<G>-batch<B>[-desc]; no dataset name.
-    desc = f'{opts.cfg:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}'
-    if opts.desc is not None:
-        desc += f'-{opts.desc}'
+    # Description string (§2): san-<cfg>-<dataset>-gpus<G>-batch<B>[-desc].
+    desc = run_layout.run_desc('san', opts.cfg, opts.data, c.num_gpus, c.batch_size, opts.desc)
 
     ##################################
     ########## StyleGAN-XL ###########

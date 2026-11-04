@@ -150,24 +150,23 @@ original — was copied byte-for-byte with its label and the same `class_names`.
 
 Training is **progressive**: the 16² stem trains from scratch, and every higher
 resolution is a super-resolution stage that warm-starts its frozen stem from one of
-the previous stage's kept inference snapshots via `--path-stem` (weights only — there
-is no resume; see [Checkpoints](#checkpoints)). Use the previous stage's **best-FID**
-snapshot: its name is on the last `Best snapshots:` line of that run's log
-(`combra_fid <value> san-snapshot-<kimg>-inference.pt`). Pick it once the previous
-stage has finished — a running stage still replaces its best snapshots.
+the previous stage's checkpoints via `--path-stem` (weights only — there is no resume;
+see [Checkpoints](#checkpoints)). Use the previous stage's **best-FID** checkpoint,
+`<run>/checkpoints/san-best-fid.pt`. Pick it once the previous stage has finished — a
+running stage still replaces its best checkpoints.
 
 ```bash
 # Stage 0 — 16x16 stem (no superres)
-python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
+python train.py --outdir=./runs --cfg=stylegan3-r --cond True \
         --data=./datasets/imagenet_9to4_1024x1024_16x16.zip \
         --gpus=2 --snap 500 --batch-gpu 320 --kimg 20000 --syn-layers 6
 
-# Stage N — superres, warm-starting from the previous stage's snapshot
-python train.py --outdir=./runs/wc-cv_h200 --cfg=stylegan3-r --cond True \
+# Stage N — superres, warm-starting from the previous stage's best-FID checkpoint
+python train.py --outdir=./runs --cfg=stylegan3-r --cond True \
         --data=./datasets/imagenet_9to4_1024x1024_32x32.zip \
         --gpus=2 --snap 100 --batch-gpu 96 --kimg 20000 --syn-layers 6 \
         --superres True --up-factor 2 --head-layers 7 \
-        --path-stem ./runs/wc-cv_h200/00000-stylegan3-r-gpus2-batch640/san-snapshot-<best-FID kimg>-inference.pt
+        --path-stem ./runs/00000-san-stylegan3-r-imagenet_9to4_1024x1024_16x16-gpus2-batch640/checkpoints/san-best-fid.pt
 ```
 
 Per-stage tuned settings (resolution → per-GPU batch on 2× H200; `--batch-gpu` is
@@ -191,7 +190,7 @@ boundary.
 group to each real image in the training loader: `rot90` by k ∈ {0, 1, 2, 3} and a
 horizontal flip with probability 0.5 (8 equally likely transforms), on the raw uint8
 image, drawn from a per-rank stream seeded by `--seed`. Square images are required.
-The snapshot grid (`reals.png`), the combra reference and the eval loaders never
+The snapshot grid (`samples/reals.png`), the combra reference and the eval loaders never
 augment; instead the combra reference is expanded to all 8 transforms of every
 reference image (`precompute_reference(..., dihedral=True)`), so the metrics compare
 against the same distribution G is trained on. `--combra-ref-count` selects original
@@ -213,18 +212,19 @@ for a single launch with an env var.
 bash sh/train_16.sh                                       # stage 0 (16x16 stem), workstation: detaches
 FOREGROUND=1 bash sh/train_16.sh                          # workstation, stays attached
 sbatch --account=<proj> --partition=<part> --gpus=2 sh/train_16.sh    # cluster
-# every higher stage: superres on top of the previous stage's best-FID snapshot
-# (the combra_fid entry of the last "Best snapshots:" line in that run's log):
-PATH_STEM=./runs/00000-stylegan3-r-gpus2-batch640/san-snapshot-<best-FID kimg>-inference.pt \
+# every higher stage: superres on top of the previous stage's best-FID checkpoint
+PATH_STEM=./runs/00000-san-stylegan3-r-imagenet_9to4_1024x1024_16x16-gpus2-batch640/checkpoints/san-best-fid.pt \
     bash sh/train_32.sh
 DATA=./datasets/my.zip KIMG=200 SNAP=2 bash sh/train_256.sh   # smoke run
 ```
 
 On a workstation a train script re-launches itself in its own session and returns at
 once, so the run survives closing the terminal. Everything it prints goes to
-`logs/san-train_<res>-<date>-<time>.log`, with a `.pid` file beside it: follow the run with
-`tail -f <log>`, stop it (every rank) with `kill -- -<pid>`. `FOREGROUND=1` and SLURM jobs
-stay attached and copy the output to the same log. The log opens with a `Run settings:`
+`runs/.launch/san-train_<res>-<date>-<time>.log`, with a `.pid` file beside it; as soon as
+the run folder exists, `san-train` moves both into it as `<run>-console.log` /
+`<run>-console.pid` ([Run folder](#run-folder)). Follow the run with `tail -f <log>` (it
+keeps following after the move), stop it (every rank) with `kill -- -<pid>`.
+`FOREGROUND=1` and SLURM jobs stay attached and copy the output to the same log. The log opens with a `Run settings:`
 block — every setting, the git commit, host, date, `CUDA_VISIBLE_DEVICES` and the full
 command.
 
@@ -241,14 +241,14 @@ python gen_images.py \
   --classes 0,1,2 \
   --gpus 2 \
   --batch-gpu 60 \
-  --network=./runs/wc-cv_h200/00004-stylegan3-r-gpus2-batch84/san-snapshot-020000-inference.pt
+  --network=./runs/00004-san-stylegan3-r-imagenet_9to4_1024x1024_256x256-gpus2-batch84/checkpoints/san-best-fid.pt
 ```
 
 By default (`--save-mode hdf5`) each GPU writes a shard and rank 0 merges them into
 `<outdir>/<desc>.h5` — the angle-pipeline input — refusing to merge an incomplete run;
 `--save-mode dir` writes `class_<c>/idx_<i:06d>_seed_<s>.png` plus a `classes.json`
 manifest. `--gpus N` self-spawns one worker per GPU (no `torchrun`). On the cluster use
-`NETWORK=<snapshot> sbatch --account=<proj> --partition=<part> --gpus=2 sh/generate_256.sh`
+`NETWORK=<run>/checkpoints/san-best-fid.pt sbatch --account=<proj> --partition=<part> --gpus=2 sh/generate_256.sh`
 (or `_512` / `_1024`).
 
 > **Class index → grain morphology** is documented in the combra `san_v2` docs page;
@@ -271,9 +271,9 @@ set (`--combra-ref-count` caps the reference) with combra (pinned to `v0.25.1` b
 | `Metrics_v2/` | `combra_w1`, `combra_w2`, `combra_circular_w1`, `combra_circular_w2`, `combra_mu1`, `combra_mu2`, `combra_sigma1`, `combra_sigma2`, `combra_pi` | vertex-angle metrics, v2 = P6 angles; the bimodal fit has one mass share (`pi`, mode 1) |
 
 e.g. `Metrics/combra_fid`, `Metrics_v1/combra_w1`, `Metrics_v2/combra_mu1`. combra's
-`load_fid_by_kimg` reads `Metrics/combra_fid` from `stats.jsonl`, and the best snapshots
+`load_fid_by_kimg` reads `Metrics/combra_fid` from `stats.jsonl`, and the best checkpoints
 are kept by `combra_fid` / `combra_fd_dinov2` / `combra_cmmd`
-([Checkpoints](#checkpoints)). The run's `.log` gets one line per section:
+([Checkpoints](#checkpoints)). The run's `-train.log` gets one line per section:
 
 ```
 Metrics: combra_fid <v>  combra_cmmd <v>  combra_fd_dinov2 <v>  combra_num_fid_samples <v>  combra_fid_best <v>
@@ -303,29 +303,53 @@ size from the current run (capped between 32 and 512), keeping the detector queu
 full and cutting evaluation latency.
 
 
+## Run folder
+
+Every run writes one folder, `<outdir>/<id>-san-<cfg>-<dataset>-gpus<G>-batch<B>[-desc]`,
+e.g. `runs/00003-san-stylegan3-r-imagenet_9to4_1024x1024_256x256-gpus2-batch84`
+(`<dataset>` is the `--data` zip name without `.zip`, `<B>` the total batch). The same
+layout is used by all four model repos (combra_docs spec §7):
+
+| path | contents |
+|---|---|
+| `training_options.json` | the resolved launch config |
+| `<run>-train.log` | rank-0 training transcript, one `[YYYY-MM-DD HH:MM:SS]` per line |
+| `<run>-console.log`, `<run>-console.pid` | the whole raw output of the `sh/` launcher (run settings, every rank, tracebacks) and the pid of a detached launch; only for `sh/` launches |
+| `stats.jsonl` | one JSON row of scalars per tick |
+| `events.out.tfevents.*.<run>` | TensorBoard (`tensorboard --logdir runs`) |
+| `checkpoints/san-best-fid.pt`, `san-best-fd_dinov2.pt`, `san-best-cmmd.pt` | the best checkpoint by each combra metric ([Checkpoints](#checkpoints)) |
+| `samples/reals.png`, `samples/fakes-init.png`, `samples/fakes-kimg<k>.png` | sample grids: training images, the untrained generator, every snapshot tick |
+
+A launch that dies before its run folder exists leaves its console log in
+`runs/.launch/`.
+
 ## Checkpoints
 
-There is exactly one artifact kind: `san-snapshot-<kimg:06d>-inference.pt` — the EMA
-generator's weights plus self-describing metadata (`n_classes`, `resolution`,
-`class_names`, `cur_nimg`), as a plain `.pt` state dict. No discriminator, no
+A checkpoint is the EMA generator's weights plus self-describing metadata (`n_classes`,
+`resolution`, `class_names`, `cur_nimg`, and `metrics`: that snapshot's `combra_fid` /
+`combra_fd_dinov2` / `combra_cmmd`), as a plain `.pt` state dict. No discriminator, no
 optimizer state, no pickled modules, so loading never depends on `timm`.
 
-- Written every `--snap` ticks **and always at the last tick**, so the newest snapshot
-  is the final model; the write is atomic (temp file + `os.replace`).
-- **Retention.** After each snapshot's combra eval (same `cur_nimg`), the run keeps the
-  `--snapshot-keep-last` newest snapshots (default 1; `0` keeps all) **plus** the single
-  best snapshot by each of `combra_fid`, `combra_fd_dinov2` and `combra_cmmd` (lower is
-  better; `nan` never counts; one file can be best for several metrics). Best snapshots
-  are never pruned, so a default run holds at most 4 files. Each snapshot tick logs one
-  line naming them:
-  `Best snapshots: combra_fid <v> san-snapshot-…  combra_fd_dinov2 <v> …  combra_cmmd <v> …`.
-  Without combra metrics only the newest snapshots are kept. There is no `best_model.*`.
-- A superres snapshot re-reads its `--path-stem` file whenever it is loaded, so keep the
-  stem snapshot each stage was started from.
+- A snapshot is taken every `--snap` ticks **and always at the last tick**, scored by the
+  combra eval, then written atomically (temp file + `os.replace`) under the names
+  `--snapshots` keeps, in `<run>/checkpoints/`:
+
+  | `--snapshots` | kept |
+  |---|---|
+  | `best` (default) | `san-best-fid.pt`, `san-best-fd_dinov2.pt`, `san-best-cmmd.pt` — the best snapshot by each metric (lower is better; `nan` never counts). `san-last.pt` (the newest snapshot) only while no best exists: combra off, before the first eval, or every eval `nan` |
+  | `best+last` | the bests plus `san-last.pt`, always |
+  | `all` | the bests plus `san-kimg<k:06d>.pt` for every snapshot |
+
+  One snapshot that is best by several metrics is one file under several names (hard
+  links), so a `best` run holds at most 3 files. Each snapshot tick logs
+  `Saved checkpoints/<file>` for every name written and
+  `Best snapshots: combra_fid <v> kimg<k>  combra_fd_dinov2 <v> kimg<k>  combra_cmmd <v> kimg<k>`.
+- A superres checkpoint re-reads its `--path-stem` file whenever it is loaded, so keep the
+  stem checkpoint each stage was started from.
 - **There is no resume.** A run goes launch → `--kimg` → stop; size `--kimg` (or split
-  stages) to fit the job's walltime. `--path-stem <snapshot>` is a weights-only warm
+  stages) to fit the job's walltime. `--path-stem <checkpoint>` is a weights-only warm
   start of the frozen lower-resolution stem, not a resume.
-- `gen_images.py` and `calc_metrics.py` load these snapshots directly.
+- `gen_images.py` and `calc_metrics.py` load these checkpoints directly.
 
 
 ## Differences from the original Sony StyleSAN-XL
@@ -367,9 +391,9 @@ Training loop:
 - **[contract]** The class count comes from the dataset's `class_names`
   (`dataset.json`), not from the label array; `--cond True` refuses a zip without them.
 - **[contract]** Checkpoints are EMA-only `.pt` state dicts
-  (`san-snapshot-<kimg>-inference.pt`), loaded with `checkpoint.load_generator`. No
-  resume, no `--restart_every`, no `best_model.pkl`; snapshots are pruned to the newest
-  plus the best by FID / FD-DINOv2 / CMMD ([Checkpoints](#checkpoints)).
+  (`checkpoints/san-best-<metric>.pt`), loaded with `checkpoint.load_generator`. No
+  resume, no `--restart_every`; by default only the best by FID / FD-DINOv2 / CMMD are
+  kept ([Checkpoints](#checkpoints)).
 - **[contract]** combra evaluation each snapshot tick (`--combra-metrics`, independent
   of `--metrics`), logged per the shared spec: `stats.jsonl` + one TensorBoard event
   file, step = `cur_nimg`, `Metrics/combra_*` (image metrics) plus

@@ -18,7 +18,7 @@ import torch
 
 import dnnlib
 from metrics import metric_main, metric_utils
-from torch_utils import checkpoint, custom_ops, misc, training_stats
+from torch_utils import checkpoint, custom_ops, misc, run_layout, training_stats
 from torch_utils.ops import conv2d_gradfix
 
 #----------------------------------------------------------------------------
@@ -99,12 +99,12 @@ def calc_metrics(ctx, network_pkl, metrics, data, gpus, verbose, truncation, cen
     \b
     # Previous training run: look up options automatically, save result to JSONL file.
     python calc_metrics.py --metrics=eqt50k_int,eqr50k \\
-        --network=~/training-runs/00000-stylegan3-r-gpus2-batch640/san-snapshot-020000-inference.pt
+        --network=./runs/00000-san-stylegan3-r-imagenet_9to4_1024x1024_16x16-gpus2-batch640/checkpoints/san-best-fid.pt
 
     \b
     # Any inference snapshot: specify dataset explicitly, print result to stdout.
     python calc_metrics.py --metrics=fid50k_full --data=~/datasets/imagenet_9to4_1024x1024_256x256.zip \\
-        --network=./runs/wc-cv_h200/00004-stylegan3-r-gpus2-batch84/san-snapshot-020000-inference.pt
+        --network=./runs/00004-san-stylegan3-r-imagenet_9to4_1024x1024_256x256-gpus2-batch84/checkpoints/san-best-fid.pt
 
     \b
     Recommended metrics:
@@ -160,10 +160,12 @@ def calc_metrics(ctx, network_pkl, metrics, data, gpus, verbose, truncation, cen
     args.G_kwargs.truncation_psi = truncation
     args.G_kwargs.centroids_path = centroids_path
 
-    # Locate run dir.
+    # Locate run dir: the checkpoint sits in <run>/checkpoints/ (§7).
     args.run_dir = None
     if os.path.isfile(network_pkl):
-        pkl_dir = os.path.dirname(network_pkl)
+        pkl_dir = os.path.dirname(os.path.abspath(network_pkl))
+        if os.path.basename(pkl_dir) == run_layout.CHECKPOINTS:
+            pkl_dir = os.path.dirname(pkl_dir)
         if os.path.isfile(os.path.join(pkl_dir, 'training_options.json')):
             args.run_dir = pkl_dir
 

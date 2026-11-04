@@ -18,7 +18,7 @@ def _help(cmd):
 def test_train_cli_contract():
     from train import main
     out = _help(main)
-    for flag in ["--precision", "--tf32", "--bench", "--snapshot-keep-last",
+    for flag in ["--precision", "--tf32", "--bench", "--snapshots",
                  "--num-fid-samples", "--combra-ref-count", "--augment",
                  "--path-stem", "--up-factor", "--syn-layers"]:
         assert flag in out, f"missing {flag} in san-train --help"

@@ -5,6 +5,46 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-11-04
+
+One run-folder layout and one checkpoint scheme in all four model repos (san, DiffiT,
+edm2, StyleSwin; combra_docs spec §2, §3, §7). Breaking: folder, file and flag names
+change.
+
+### Changed
+- **Run folder name** `<id>-san-<cfg>-<dataset>-gpus<G>-batch<B>[-desc]`, e.g.
+  `00003-san-stylegan3-r-imagenet_9to4_1024x1024_256x256-gpus2-batch84`: the model and
+  the dataset (the `--data` zip name without `.zip`) are now part of it.
+- **Only the best checkpoints are kept by default.** `--snapshot-keep-last N` is replaced
+  by `--snapshots best|best+last|all` (default `best`). Checkpoints live in
+  `<run>/checkpoints/`: `san-best-fid.pt`, `san-best-fd_dinov2.pt`, `san-best-cmmd.pt`
+  (hard links when one snapshot is best by several metrics); `san-last.pt` only while no
+  best exists (combra off, before the first eval) or always with `best+last`;
+  `san-kimg<k>.pt` for every snapshot with `all`. `san-snapshot-<kimg>-inference.pt` is
+  gone. The snapshot is now saved after its combra eval, and its metadata gains
+  `metrics` (`combra_fid` / `combra_fd_dinov2` / `combra_cmmd`).
+- `PATH_STEM` / `--path-stem` of the next stage is `<run>/checkpoints/san-best-fid.pt`.
+- `Best snapshots:` names the kimg: `combra_fid <v> kimg<k> …`.
+- **Logs:** `<run>.log` is now `<run>-train.log`. The `sh/` launcher's console log moved
+  from `<repo>/logs/` to `runs/.launch/`, and `san-train` moves it (and the `.pid`) into
+  the run folder as `<run>-console.log` / `<run>-console.pid` once the folder exists.
+- **Sample grids** moved to `<run>/samples/`: `reals.png`, `fakes-init.png` (was
+  `fakes_init.png`), `fakes-kimg<k>.png` (was `fakes<k>.png`).
+- `sh/train_*.sh`: `KEEP_LAST` is replaced by `SNAPSHOTS` (default `best`); `LOG_DIR`
+  defaults to `$OUTDIR/.launch`.
+- Generated `.h5` files are named `<run>-<checkpoint role>` by default (e.g.
+  `<run>-best-fid.h5`), so files from different runs never share a name.
+- `calc_metrics.py` finds the run folder above `checkpoints/`.
+
+### Added
+- `torch_utils/run_layout.py`: run-folder names, paths, the console-log move and the
+  checkpoint retention, identical in all four model repos; `tests/test_run_layout.py`
+  replaces `tests/test_snapshot_retention.py`.
+
+### Removed
+- `checkpoint.BEST_METRICS`, `checkpoint.update_best_snapshots`,
+  `checkpoint.prune_snapshots` (now `run_layout`).
+
 ### Fixed
 - Oversized `upfirdn2d` CUDA calls are split along the batch dimension to stay
   within the kernel's 32-bit indexing limit, including separable intermediate

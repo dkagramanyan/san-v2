@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # san -- generate 512x512 samples per class into the merged <desc>.h5 the wc_cv angle pipeline consumes.
 #
-# Workstation:  NETWORK=<run_dir>/<snapshot>-inference.pt bash sh/generate_512.sh
+# Workstation:  NETWORK=<run_dir>/checkpoints/san-best-fid.pt bash sh/generate_512.sh
 # SLURM:        sbatch --account=<proj> --partition=<part> --nodes=1 --gpus=2 --cpus-per-task=8 --time=3-0:0 sh/generate_512.sh
 #
 # Defaults target the production allocation: 2x H200 (sm_90), 8 CPUs, fixed seed 42.
@@ -53,7 +53,7 @@ export PYTHONUNBUFFERED=1
 
 # --- One console-command call ------------------------------------------------
 san-gen-images \
-    --network "${NETWORK:?set NETWORK=<run_dir>/san-snapshot-<kimg>-inference.pt}" \
+    --network "${NETWORK:?set NETWORK=<run_dir>/checkpoints/san-best-fid.pt}" \
     --outdir "${OUTDIR:-./generated/512}" \
     --classes "${CLASSES:-0,1,2}" \
     --samples-per-class "${SAMPLES_PER_CLASS:-1000}" \

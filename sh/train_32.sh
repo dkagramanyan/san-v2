@@ -27,7 +27,7 @@ PRECISION="${PRECISION:-fp16}"
 KIMG="${KIMG:-20000}"
 TICK="${TICK:-4}"                     # kimg per tick
 SNAP="${SNAP:-100}"                   # ticks per snapshot + combra eval
-KEEP_LAST="${KEEP_LAST:-1}"           # newest snapshots kept (bests are never pruned)
+SNAPSHOTS="${SNAPSHOTS:-best}"        # checkpoints kept: best | best+last | all
 NUM_FID_SAMPLES="${NUM_FID_SAMPLES:-10000}"
 SEED="${SEED:-42}"
 WORKERS="${WORKERS:-3}"               # data-loader workers per rank
@@ -51,13 +51,16 @@ cd "$REPO_DIR"
 # --- Launch: detach and log ----------------------------------------------------
 # On a workstation the script re-launches itself in its own session (setsid nohup) and
 # returns at once: the run survives closing the terminal, and everything it prints
-# goes to logs/<name>-<date>.log (with a .pid file beside it). FOREGROUND=1 keeps it
-# attached; the output is still copied to the log. Under SLURM it never detaches (the
-# job already runs unattended); the output goes both to the slurm .out and to the log.
+# goes to $OUTDIR/.launch/<name>-<date>.log (with a .pid file beside it); once the run
+# folder exists, san-train moves both into it as <run>-console.log / <run>-console.pid.
+# FOREGROUND=1 keeps it attached; the output is still copied to the log. Under SLURM it
+# never detaches (the job already runs unattended); the output goes both to the slurm
+# .out and to the log.
 RUN_NAME=san-train_32
-LOG_DIR="${LOG_DIR:-$REPO_DIR/logs}"
+LOG_DIR="${LOG_DIR:-$OUTDIR/.launch}"
 if [[ -z "${RUN_LOG:-}" ]]; then
     mkdir -p "$LOG_DIR"
+    LOG_DIR="$(realpath "$LOG_DIR")"   # absolute: san-train moves the log into the run folder
     RUN_LOG="$LOG_DIR/$RUN_NAME-$(date +%Y%m%d-%H%M%S).log"
     export RUN_LOG
     if [[ -z "${SLURM_JOB_ID:-}" && "${FOREGROUND:-0}" != 1 ]]; then
@@ -107,13 +110,14 @@ export PYTHONUNBUFFERED=1
 
 # --- One console-command call ------------------------------------------------
 # Progressive recipe (README §4): train_16.sh trains the 16x16 stem from scratch; every
-# higher resolution is a superres stage -- set PATH_STEM to one of the previous stage's
-# kept snapshots, normally its best-FID one (named in that run's last "Best snapshots:"
-# log line; weights-only warm start of the frozen stem); leave it unset to train this
+# higher resolution is a superres stage -- set PATH_STEM to the previous stage's
+# best-FID checkpoint, <run>/checkpoints/san-best-fid.pt (weights-only warm start of the
+# frozen stem); leave it unset to train this
 # resolution from scratch instead. Defaults follow the README's per-stage table
 # (--syn-layers 6, --head-layers 7, per-GPU batch).
-# Retention: KEEP_LAST newest snapshots plus the best by combra_fid / combra_fd_dinov2 /
-# combra_cmmd, which are never pruned (at most 4 files with the default KEEP_LAST=1).
+# Checkpoints (SNAPSHOTS=best): <run>/checkpoints/san-best-fid.pt, san-best-fd_dinov2.pt,
+# san-best-cmmd.pt -- one file when one snapshot is best by all three; san-last.pt only
+# while no best exists. best+last also keeps san-last.pt; all keeps san-kimg<k>.pt too.
 STEM_ARGS=()
 if [[ -n "$PATH_STEM" ]]; then
     STEM_ARGS=(--superres True --up-factor "$UP_FACTOR" --head-layers "$HEAD_LAYERS" --path-stem "$PATH_STEM")
@@ -128,7 +132,7 @@ CMD=(
     --batch-gpu "$BATCH_GPU"
     --cond True --syn-layers "$SYN_LAYERS"
     --precision "$PRECISION"
-    --kimg "$KIMG" --tick "$TICK" --snap "$SNAP" --snapshot-keep-last "$KEEP_LAST"
+    --kimg "$KIMG" --tick "$TICK" --snap "$SNAP" --snapshots "$SNAPSHOTS"
     --combra-metrics True --num-fid-samples "$NUM_FID_SAMPLES"
     --seed "$SEED" --workers "$WORKERS"
     ${STEM_ARGS[@]+"${STEM_ARGS[@]}"}
@@ -139,7 +143,7 @@ CMD=(
 commit="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 [[ -z "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null)" ]] || commit+=-dirty
 echo "Run settings:"
-for name in CONDA_ENV OUTDIR CFG DATA GPUS BATCH_GPU SYN_LAYERS PRECISION KIMG TICK SNAP KEEP_LAST \
+for name in CONDA_ENV OUTDIR CFG DATA GPUS BATCH_GPU SYN_LAYERS PRECISION KIMG TICK SNAP SNAPSHOTS \
             NUM_FID_SAMPLES SEED WORKERS PATH_STEM UP_FACTOR HEAD_LAYERS; do
     echo "  $name=${!name}"
 done
